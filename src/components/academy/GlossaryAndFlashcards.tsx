@@ -1,6 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import { BookOpen, CheckCircle2, Layers, RotateCcw, Search } from 'lucide-react';
-import { ACADEMY_FLASHCARDS, ACADEMY_GLOSSARY, type GlossaryEntry } from '../../data/glossaryData';
+import { ACADEMY_FLASHCARDS, ACADEMY_GLOSSARY, type GlossaryEntry } from '../../lib/glossaryData';
 import { usePlatform } from '../../context/PlatformContext';
 import { apiFetch } from '../../lib/api';
 

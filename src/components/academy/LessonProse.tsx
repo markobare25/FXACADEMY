@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { BookOpen, Pause, Play, Square, Volume2, X } from 'lucide-react';
-import { ACADEMY_GLOSSARY, type GlossaryEntry } from '../../data/glossaryData';
+import { ACADEMY_GLOSSARY, type GlossaryEntry } from '../../lib/glossaryData';
 
 interface LessonProseProps {
   text: string;
