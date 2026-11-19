@@ -192,17 +192,23 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     }
   }, []);
 
-  const refreshAll = useCallback(async () => {
+  const refreshAll = useCallback(async (skipAuthCheck = false) => {
     try {
+      const mePromise = skipAuthCheck
+        ? Promise.resolve(null)
+        : apiFetch<{ user: User | null }>('/api/auth/me').catch(() => null);
+
       const [meRes, settingsRes, sigRes, updRes, acadRes] = await Promise.all([
-        apiFetch<{ user: User | null }>('/api/auth/me').catch(() => ({ user: null })),
+        mePromise,
         apiFetch<{ settings: PlatformSettings; stats: PublicStats }>('/api/settings'),
         apiFetch<{ signals: TradingSignal[] }>('/api/signals'),
         apiFetch<{ updates: MarketUpdate[] }>('/api/updates'),
         apiFetch<{ courses: Course[]; resume_state?: AcademyResumeState | null }>('/api/academy/courses'),
       ]);
 
-      setUser(meRes.user);
+      if (meRes !== null) {
+        setUser(meRes.user);
+      }
       setSettings(settingsRes.settings);
       setStats(settingsRes.stats);
       setSignals(sigRes.signals);
@@ -229,7 +235,7 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         // ignore quota limits
       }
 
-      if (meRes.user) {
+      if (meRes?.user) {
         await refreshNotifications();
       }
     } catch {
@@ -417,11 +423,11 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   const login = async (email: string, password: string): Promise<User> => {
     const res = await apiFetch<{ user: User; token: string }>('/api/auth/login', {
       method: 'POST',
-      body: JSON.stringify({ email, password }),
+      body: JSON.stringify({ email: email.trim().toLowerCase(), password }),
     });
     setStoredToken(res.token);
     setUser(res.user);
-    await refreshAll();
+    await Promise.all([refreshAll(true), refreshNotifications()]);
     return res.user;
   };
 
@@ -431,23 +437,33 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       '/api/auth/register',
       {
         method: 'POST',
-        body: JSON.stringify({ name, email, password, timezone }),
+        body: JSON.stringify({
+          name: name.trim(),
+          email: email.trim().toLowerCase(),
+          password,
+          timezone,
+        }),
       }
     );
     setStoredToken(res.token);
     setUser(res.user);
-    await refreshAll();
+    await Promise.all([refreshAll(true), refreshNotifications()]);
     return { user: res.user, verification_code: res.verification_code };
   };
 
   const logout = async () => {
     await apiFetch('/api/auth/logout', { method: 'POST' }).catch(() => undefined);
     setStoredToken(null);
+    try {
+      localStorage.removeItem('mfx_token');
+    } catch {
+      // ignore
+    }
     setUser(null);
     setResumeState(null);
     setNotifications([]);
     setUnreadCount(0);
-    navigate('/');
+    navigate('/login');
   };
 
   return (

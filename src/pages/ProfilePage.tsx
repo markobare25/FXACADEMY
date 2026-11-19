@@ -311,34 +311,40 @@ export const ProfilePage: React.FC = () => {
       <section className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-6">
         <div className="flex items-center gap-2 mb-4">
           <KeyRound className="w-4 h-4 text-[#881337] dark:text-rose-400" />
-          <h2 className="text-base font-bold text-slate-900 dark:text-white">Change Password</h2>
+          <h2 className="text-base font-bold text-slate-900 dark:text-white">Account Security</h2>
         </div>
 
-        <form onSubmit={handleChangePassword} className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-          <input
-            type="password"
-            required
-            value={currentPassword}
-            onChange={(e) => setCurrentPassword(e.target.value)}
-            placeholder="Current password"
-            className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3.5 py-2 text-sm text-slate-900 dark:text-white"
-          />
-          <input
-            type="password"
-            required
-            minLength={8}
-            value={newPassword}
-            onChange={(e) => setNewPassword(e.target.value)}
-            placeholder="New password (min 8 chars)"
-            className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3.5 py-2 text-sm text-slate-900 dark:text-white"
-          />
-          <button
-            type="submit"
-            className="rounded-lg bg-[#881337] px-4 py-2 text-xs font-semibold text-white hover:bg-[#6B0F2B] min-h-[40px]"
-          >
-            Update Password
-          </button>
-        </form>
+        {user.role === 'admin' ? (
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            This administrator account uses permanent credentials protected by server policy.
+          </p>
+        ) : (
+          <form onSubmit={handleChangePassword} className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <input
+              type="password"
+              required
+              value={currentPassword}
+              onChange={(e) => setCurrentPassword(e.target.value)}
+              placeholder="Current password"
+              className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3.5 py-2 text-base sm:text-sm text-slate-900 dark:text-white"
+            />
+            <input
+              type="password"
+              required
+              minLength={6}
+              value={newPassword}
+              onChange={(e) => setNewPassword(e.target.value)}
+              placeholder="New password (min 6 chars)"
+              className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3.5 py-2 text-base sm:text-sm text-slate-900 dark:text-white"
+            />
+            <button
+              type="submit"
+              className="rounded-lg bg-[#881337] px-4 py-2 text-xs font-semibold text-white hover:bg-[#6B0F2B] min-h-[40px]"
+            >
+              Update Password
+            </button>
+          </form>
+        )}
       </section>
 
       {/* Account Activity */}

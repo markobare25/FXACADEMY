@@ -37,6 +37,7 @@ initDatabase();
 ensureVapidKeys();
 
 const app = express();
+app.set('trust proxy', 1);
 const httpServer = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
@@ -120,12 +121,28 @@ const upload = multer({
   },
 });
 
-function setSessionCookie(res: Response, token: string): void {
+function isHttpsRequest(req: Request): boolean {
+  const proto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
+  return req.secure || proto === 'https' || process.env.NODE_ENV === 'production';
+}
+
+function setSessionCookie(req: Request, res: Response, token: string): void {
+  const isHttps = isHttpsRequest(req);
   res.cookie('mfx_session', token, {
     httpOnly: true,
-    sameSite: 'lax',
-    secure: process.env.NODE_ENV === 'production',
-    maxAge: 14 * 24 * 60 * 60 * 1000,
+    sameSite: isHttps ? 'none' : 'lax',
+    secure: isHttps,
+    maxAge: 30 * 24 * 60 * 60 * 1000,
+    path: '/',
+  });
+}
+
+function clearSessionCookie(req: Request, res: Response): void {
+  const isHttps = isHttpsRequest(req);
+  res.clearCookie('mfx_session', {
+    httpOnly: true,
+    sameSite: isHttps ? 'none' : 'lax',
+    secure: isHttps,
     path: '/',
   });
 }
@@ -218,14 +235,19 @@ app.post('/api/upload', requireAuth, upload.single('file'), (req: AuthRequest, r
 });
 
 // ---------- Authentication & Accounts ----------
+app.use('/api/auth', (_req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  next();
+});
+
 const registerSchema = z.object({
-  name: z.string().trim().min(2).max(80),
-  email: z.string().trim().email().max(160),
-  password: z.string().min(8).max(128),
+  name: z.string().trim().min(2, 'Full name must be at least 2 characters.').max(80),
+  email: z.string().trim().email('Please enter a valid email address.').max(160),
+  password: z.string().min(6, 'Password must be at least 6 characters.').max(128),
   timezone: z.string().max(64).optional(),
 });
 
-app.post('/api/auth/register', rateLimit(15, 60_000), (req: Request, res: Response) => {
+app.post('/api/auth/register', rateLimit(30, 60_000), (req: Request, res: Response) => {
   const parsed = registerSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid registration data.' });
@@ -233,189 +255,70 @@ app.post('/api/auth/register', rateLimit(15, 60_000), (req: Request, res: Respon
   }
 
   const email = parsed.data.email.trim().toLowerCase();
-  const existing = db
-    .prepare('SELECT id, needs_password_setup FROM users WHERE LOWER(email) = ?')
-    .get(email) as { id: string; needs_password_setup?: number } | undefined;
-
-  const now = new Date().toISOString();
-
-  // Complete activation if the designated admin record was pre-seeded awaiting initial password setup
-  if (existing && email === DESIGNATED_ADMIN_EMAIL && Number(existing.needs_password_setup || 0) === 1) {
-    db.prepare(
-      `UPDATE users SET
-        name = ?,
-        password_hash = ?,
-        role = 'admin',
-        status = 'active',
-        email_verified = 1,
-        needs_password_setup = 0,
-        timezone = ?,
-        last_login_at = ?
-       WHERE id = ?`
-    ).run(
-      parsed.data.name,
-      hashPassword(parsed.data.password),
-      parsed.data.timezone || 'UTC',
-      now,
-      existing.id
-    );
-    logUserActivity(existing.id, 'Admin Account Activated', 'Designated administrator completed initial password setup.', req.ip);
-
-    const adminRow = db.prepare('SELECT * FROM users WHERE id = ?').get(existing.id) as Record<string, unknown>;
-    const token = signToken({ sub: existing.id, role: 'admin' });
-    setSessionCookie(res, token);
-    res.status(201).json({
-      user: mapDbUser(adminRow),
-      token,
-    });
+  if (email === DESIGNATED_ADMIN_EMAIL) {
+    res.status(409).json({ error: 'An account with this email already exists. Please sign in.' });
     return;
   }
+
+  const existing = db
+    .prepare('SELECT id FROM users WHERE LOWER(email) = ?')
+    .get(email) as { id: string } | undefined;
 
   if (existing) {
-    res.status(409).json({ error: 'An account with this email already exists.' });
+    res.status(409).json({ error: 'An account with this email already exists. Please sign in.' });
     return;
   }
 
+  const now = new Date().toISOString();
   const userId = crypto.randomUUID();
-  const verifyToken = crypto.randomBytes(24).toString('hex');
-  const verifyCode = String(crypto.randomInt(100000, 999999));
-  const assignedRole = email === DESIGNATED_ADMIN_EMAIL ? 'admin' : 'user';
-  const initialVerified = email === DESIGNATED_ADMIN_EMAIL ? 1 : 0;
 
   db.prepare(
     `INSERT INTO users (id, name, email, password_hash, role, status, email_verified, needs_password_setup, timezone, created_at, last_login_at)
-     VALUES (?, ?, ?, ?, ?, 'active', ?, 0, ?, ?, ?)`
+     VALUES (?, ?, ?, ?, 'user', 'active', 1, 0, ?, ?, ?)`
   ).run(
     userId,
     parsed.data.name,
     email,
     hashPassword(parsed.data.password),
-    assignedRole,
-    initialVerified,
     parsed.data.timezone || 'UTC',
     now,
     now
   );
 
-  db.prepare(
-    `INSERT INTO email_verifications (id, user_id, token, code, expires_at, used)
-     VALUES (?, ?, ?, ?, ?, 0)`
-  ).run(
-    crypto.randomUUID(),
-    userId,
-    verifyToken,
-    verifyCode,
-    new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
-  );
-
   logUserActivity(userId, 'Account Registered', 'New MeridianFX trader account created.', req.ip);
 
   const userRow = db.prepare('SELECT * FROM users WHERE id = ?').get(userId) as Record<string, unknown>;
-  const token = signToken({ sub: userId, role: assignedRole });
-  setSessionCookie(res, token);
+  const token = signToken({ sub: userId, role: 'user' }, 60 * 60 * 24 * 30);
+  setSessionCookie(req, res, token);
 
   res.status(201).json({
     user: mapDbUser(userRow),
     token,
-    ...(initialVerified ? {} : { verification_code: verifyCode, verification_token: verifyToken }),
   });
 });
 
-app.get('/api/auth/admin-status', (req: Request, res: Response) => {
-  const email = String(req.query.email || '').trim().toLowerCase();
-  if (email !== DESIGNATED_ADMIN_EMAIL) {
-    res.json({ is_designated_admin: false, setup_required: false });
-    return;
-  }
-  const row = db
-    .prepare('SELECT needs_password_setup FROM users WHERE LOWER(email) = ?')
-    .get(DESIGNATED_ADMIN_EMAIL) as { needs_password_setup?: number } | undefined;
+app.get('/api/auth/admin-status', (_req: Request, res: Response) => {
   res.json({
-    is_designated_admin: true,
-    setup_required: !row || Number(row.needs_password_setup || 0) === 1,
+    is_designated_admin: false,
+    setup_required: false,
   });
 });
 
-app.post('/api/auth/admin-setup', rateLimit(10, 60_000), (req: Request, res: Response) => {
-  const schema = z.object({
-    email: z.string().trim().email(),
-    password: z.string().min(8, 'Password must be at least 8 characters.').max(128),
-    name: z.string().trim().min(2).max(80).optional(),
+app.post('/api/auth/admin-setup', (_req: Request, res: Response) => {
+  res.status(403).json({
+    error: 'Administrator account uses permanent credentials. Please sign in normally.',
   });
-  const parsed = schema.safeParse(req.body);
-  if (!parsed.success) {
-    res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid setup payload.' });
-    return;
-  }
-
-  const email = parsed.data.email.trim().toLowerCase();
-  if (email !== DESIGNATED_ADMIN_EMAIL) {
-    res.status(403).json({ error: 'Only the designated administrator account can use this activation flow.' });
-    return;
-  }
-
-  const row = db
-    .prepare('SELECT * FROM users WHERE LOWER(email) = ?')
-    .get(DESIGNATED_ADMIN_EMAIL) as Record<string, unknown> | undefined;
-
-  if (row && Number(row.needs_password_setup || 0) !== 1) {
-    res.status(403).json({
-      error: 'Administrator password is already set. Use Sign In or Forgot Password to recover credentials.',
-    });
-    return;
-  }
-
-  const now = new Date().toISOString();
-  let targetId = '';
-  if (row) {
-    targetId = String(row.id);
-    db.prepare(
-      `UPDATE users SET
-        name = COALESCE(?, name),
-        password_hash = ?,
-        role = 'admin',
-        status = 'active',
-        email_verified = 1,
-        needs_password_setup = 0,
-        last_login_at = ?
-       WHERE id = ?`
-    ).run(parsed.data.name || null, hashPassword(parsed.data.password), now, targetId);
-  } else {
-    targetId = crypto.randomUUID();
-    db.prepare(
-      `INSERT INTO users (
-        id, name, email, password_hash, role, status, email_verified,
-        needs_password_setup, bio, created_at, last_login_at
-      ) VALUES (?, ?, ?, ?, 'admin', 'active', 1, 0, ?, ?, ?)`
-    ).run(
-      targetId,
-      parsed.data.name || 'MeridianFX Admin',
-      DESIGNATED_ADMIN_EMAIL,
-      hashPassword(parsed.data.password),
-      'Head of Trading Desk & Signals Strategy at MeridianFX.',
-      now,
-      now
-    );
-  }
-
-  logUserActivity(targetId, 'Admin Activated', 'Designated administrator password established.', req.ip);
-  const updated = db.prepare('SELECT * FROM users WHERE id = ?').get(targetId) as Record<string, unknown>;
-  const user = mapDbUser(updated);
-  const token = signToken({ sub: user.id, role: 'admin' });
-  setSessionCookie(res, token);
-
-  res.status(200).json({ user, token });
 });
 
 const loginSchema = z.object({
-  email: z.string().trim().email(),
-  password: z.string().min(1),
+  email: z.string().trim().email('Please enter a valid email address.'),
+  password: z.string().min(1, 'Password is required.'),
 });
 
-app.post('/api/auth/login', rateLimit(20, 60_000), (req: Request, res: Response) => {
+app.post('/api/auth/login', rateLimit(40, 60_000), (req: Request, res: Response) => {
   const parsed = loginSchema.safeParse(req.body);
   if (!parsed.success) {
-    res.status(400).json({ error: 'Valid email and password are required.' });
+    res.status(400).json({ error: parsed.error.issues[0]?.message || 'Valid email and password are required.' });
     return;
   }
 
@@ -423,14 +326,6 @@ app.post('/api/auth/login', rateLimit(20, 60_000), (req: Request, res: Response)
   const row = db.prepare('SELECT * FROM users WHERE LOWER(email) = ?').get(email) as
     | Record<string, unknown>
     | undefined;
-
-  if (email === DESIGNATED_ADMIN_EMAIL && (!row || Number(row.needs_password_setup || 0) === 1)) {
-    res.status(403).json({
-      error: 'Administrator password setup is required for markobare25@gmail.com. Establish your password below.',
-      code: 'ADMIN_SETUP_REQUIRED',
-    });
-    return;
-  }
 
   if (!row || !verifyPassword(parsed.data.password, String(row.password_hash))) {
     res.status(401).json({ error: 'Invalid email or password.' });
@@ -445,19 +340,24 @@ app.post('/api/auth/login', rateLimit(20, 60_000), (req: Request, res: Response)
   const now = new Date().toISOString();
   if (email === DESIGNATED_ADMIN_EMAIL) {
     db.prepare(
-      "UPDATE users SET role = 'admin', status = 'active', email_verified = 1, last_login_at = ? WHERE id = ?"
+      "UPDATE users SET role = 'admin', status = 'active', email_verified = 1, needs_password_setup = 0, last_login_at = ? WHERE id = ?"
     ).run(now, String(row.id));
     row.role = 'admin';
     row.status = 'active';
     row.email_verified = 1;
   } else {
-    db.prepare('UPDATE users SET last_login_at = ? WHERE id = ?').run(now, String(row.id));
+    if (row.role === 'admin') {
+      db.prepare("UPDATE users SET role = 'user', last_login_at = ? WHERE id = ?").run(now, String(row.id));
+      row.role = 'user';
+    } else {
+      db.prepare('UPDATE users SET last_login_at = ? WHERE id = ?').run(now, String(row.id));
+    }
   }
   logUserActivity(String(row.id), 'Sign In', 'Authenticated session started.', req.ip);
 
   const user = mapDbUser({ ...row, last_login_at: now });
-  const token = signToken({ sub: user.id, role: user.role });
-  setSessionCookie(res, token);
+  const token = signToken({ sub: user.id, role: user.role }, 60 * 60 * 24 * 30);
+  setSessionCookie(req, res, token);
 
   res.json({ user, token });
 });
@@ -466,7 +366,7 @@ app.post('/api/auth/logout', optionalAuth, (req: AuthRequest, res: Response) => 
   if (req.user) {
     logUserActivity(req.user.id, 'Sign Out', 'Session terminated.', req.ip);
   }
-  res.clearCookie('mfx_session', { path: '/' });
+  clearSessionCookie(req, res);
   res.json({ ok: true });
 });
 
@@ -529,6 +429,13 @@ app.post('/api/auth/resend-verification', requireAuth, rateLimit(5, 60_000), (re
 
 app.post('/api/auth/forgot-password', rateLimit(10, 60_000), (req: Request, res: Response) => {
   const email = String(req.body?.email || '').trim().toLowerCase();
+  if (email === DESIGNATED_ADMIN_EMAIL) {
+    res.status(403).json({
+      error: 'Administrator login credentials are permanent and cannot be reset.',
+    });
+    return;
+  }
+
   const user = db.prepare('SELECT id, role FROM users WHERE LOWER(email) = ?').get(email) as
     | { id: string; role: string }
     | undefined;
@@ -552,18 +459,6 @@ app.post('/api/auth/forgot-password', rateLimit(10, 60_000), (req: Request, res:
   );
   logUserActivity(user.id, 'Password Reset Requested', 'Reset code issued.', req.ip);
 
-  // Never expose administrator reset codes in public HTTP responses or database logs
-  if (user.role === 'admin') {
-    console.info(`[MeridianFX Admin Recovery] One-time reset code generated for ${email}: ${resetCode}`);
-    res.json({
-      ok: true,
-      is_admin_account: true,
-      message:
-        'Administrator recovery initiated. Enter your server recovery key (ADMIN_RESET_KEY) or server-issued one-time code to reset credentials.',
-    });
-    return;
-  }
-
   res.json({
     ok: true,
     message: 'Password reset code generated.',
@@ -576,7 +471,7 @@ app.post('/api/auth/reset-password', rateLimit(10, 60_000), (req: Request, res: 
   const schema = z.object({
     email: z.string().trim().email(),
     code: z.string().trim().min(4),
-    new_password: z.string().min(8).max(128),
+    new_password: z.string().min(6, 'New password must be at least 6 characters.').max(128),
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
@@ -584,40 +479,35 @@ app.post('/api/auth/reset-password', rateLimit(10, 60_000), (req: Request, res: 
     return;
   }
 
+  const normalizedEmail = parsed.data.email.trim().toLowerCase();
+  if (normalizedEmail === DESIGNATED_ADMIN_EMAIL) {
+    res.status(403).json({
+      error: 'Administrator login credentials are permanent and cannot be modified.',
+    });
+    return;
+  }
+
   const user = db
     .prepare('SELECT id, role FROM users WHERE LOWER(email) = ?')
-    .get(parsed.data.email.trim().toLowerCase()) as { id: string; role: string } | undefined;
+    .get(normalizedEmail) as { id: string; role: string } | undefined;
   if (!user) {
     res.status(400).json({ error: 'Invalid reset code or email.' });
     return;
   }
 
-  // Allow server-configured ADMIN_RESET_KEY for designated admin credential recovery
-  let authorizedViaAdminKey = false;
-  const serverResetKey = process.env.ADMIN_RESET_KEY;
-  if (user.role === 'admin' && serverResetKey && serverResetKey.length >= 12) {
-    const providedBuf = Buffer.from(parsed.data.code);
-    const expectedBuf = Buffer.from(serverResetKey);
-    if (providedBuf.length === expectedBuf.length && crypto.timingSafeEqual(providedBuf, expectedBuf)) {
-      authorizedViaAdminKey = true;
-    }
-  }
+  const resetRow = db
+    .prepare(
+      'SELECT * FROM password_resets WHERE user_id = ? AND (code = ? OR token = ?) AND used = 0 ORDER BY expires_at DESC LIMIT 1'
+    )
+    .get(user.id, parsed.data.code, parsed.data.code) as
+    | { id: string; expires_at: string }
+    | undefined;
 
-  if (!authorizedViaAdminKey) {
-    const resetRow = db
-      .prepare(
-        'SELECT * FROM password_resets WHERE user_id = ? AND (code = ? OR token = ?) AND used = 0 ORDER BY expires_at DESC LIMIT 1'
-      )
-      .get(user.id, parsed.data.code, parsed.data.code) as
-      | { id: string; expires_at: string }
-      | undefined;
-
-    if (!resetRow || new Date(resetRow.expires_at).getTime() < Date.now()) {
-      res.status(400).json({ error: 'Invalid or expired reset code.' });
-      return;
-    }
-    db.prepare('UPDATE password_resets SET used = 1 WHERE id = ?').run(resetRow.id);
+  if (!resetRow || new Date(resetRow.expires_at).getTime() < Date.now()) {
+    res.status(400).json({ error: 'Invalid or expired reset code.' });
+    return;
   }
+  db.prepare('UPDATE password_resets SET used = 1 WHERE id = ?').run(resetRow.id);
 
   db.prepare("UPDATE users SET password_hash = ?, needs_password_setup = 0, status = 'active' WHERE id = ?").run(
     hashPassword(parsed.data.new_password),
@@ -656,13 +546,18 @@ app.patch('/api/users/profile', requireAuth, (req: AuthRequest, res: Response) =
 });
 
 app.patch('/api/users/password', requireAuth, (req: AuthRequest, res: Response) => {
+  if (req.user!.email.toLowerCase() === DESIGNATED_ADMIN_EMAIL) {
+    res.status(403).json({ error: 'The designated administrator password is permanent.' });
+    return;
+  }
+
   const schema = z.object({
     current_password: z.string().min(1),
-    new_password: z.string().min(8).max(128),
+    new_password: z.string().min(6, 'New password must be at least 6 characters.').max(128),
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
-    res.status(400).json({ error: 'New password must be at least 8 characters.' });
+    res.status(400).json({ error: parsed.error.issues[0]?.message || 'New password must be at least 6 characters.' });
     return;
   }
 
@@ -740,7 +635,7 @@ app.delete('/api/users/account', requireAuth, (req: AuthRequest, res: Response) 
     }
   }
   db.prepare('DELETE FROM users WHERE id = ?').run(req.user!.id);
-  res.clearCookie('mfx_session', { path: '/' });
+  clearSessionCookie(req, res);
   res.json({ ok: true });
 });
 
@@ -878,6 +773,10 @@ const signalMessageCreateSchema = z
   });
 
 app.post('/api/signals/messages', requireRole('admin'), async (req: AuthRequest, res: Response) => {
+  if (req.user!.email.toLowerCase() !== DESIGNATED_ADMIN_EMAIL) {
+    res.status(403).json({ error: 'Only the designated administrator can publish signal channel messages.' });
+    return;
+  }
   const parsed = signalMessageCreateSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid signal chat message.' });
@@ -951,6 +850,10 @@ const signalMessagePatchSchema = z.object({
 });
 
 app.patch('/api/signals/messages/:id', requireRole('admin'), (req: AuthRequest, res: Response) => {
+  if (req.user!.email.toLowerCase() !== DESIGNATED_ADMIN_EMAIL) {
+    res.status(403).json({ error: 'Only the designated administrator can modify signal channel messages.' });
+    return;
+  }
   const existing = db.prepare('SELECT * FROM signal_messages WHERE id = ?').get(req.params.id) as
     | Record<string, unknown>
     | undefined;
@@ -1023,7 +926,11 @@ app.patch('/api/signals/messages/:id', requireRole('admin'), (req: AuthRequest, 
   res.json({ message: hydrated });
 });
 
-app.delete('/api/signals/messages/:id', requireRole('admin'), (req: Request, res: Response) => {
+app.delete('/api/signals/messages/:id', requireRole('admin'), (req: AuthRequest, res: Response) => {
+  if (req.user!.email.toLowerCase() !== DESIGNATED_ADMIN_EMAIL) {
+    res.status(403).json({ error: 'Only the designated administrator can delete signal channel messages.' });
+    return;
+  }
   const info = db.prepare('DELETE FROM signal_messages WHERE id = ?').run(req.params.id);
   if (info.changes === 0) {
     res.status(404).json({ error: 'Message not found.' });
@@ -3010,6 +2917,11 @@ app.patch('/api/admin/users/:id', requireRole('admin'), (req: AuthRequest, res: 
     ((parsed.data.role && parsed.data.role !== 'admin') || parsed.data.status === 'suspended')
   ) {
     res.status(400).json({ error: 'Cannot revoke privileges from the designated primary administrator account.' });
+    return;
+  }
+
+  if (parsed.data.role === 'admin' && String(target.email).toLowerCase() !== DESIGNATED_ADMIN_EMAIL) {
+    res.status(400).json({ error: 'Only the designated administrator account can hold the admin role.' });
     return;
   }
 

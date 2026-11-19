@@ -1,80 +1,25 @@
-import React, { useEffect, useState } from 'react';
-import { CheckCircle2, KeyRound, MailCheck, ShieldAlert, ShieldCheck } from 'lucide-react';
+import React, { useState } from 'react';
+import { CheckCircle2, Eye, EyeOff, KeyRound, MailCheck, ShieldAlert } from 'lucide-react';
 import { usePlatform } from '../context/PlatformContext';
 import { apiFetch } from '../lib/api';
-import type { User } from '../types';
 
 export const LoginPage: React.FC = () => {
-  const { login, navigate, refreshAll } = usePlatform();
+  const { login, navigate } = usePlatform();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [confirmPassword, setConfirmPassword] = useState('');
-  const [setupMode, setSetupMode] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    const trimmed = email.trim().toLowerCase();
-    if (!trimmed.includes('@')) {
-      setSetupMode(false);
-      return;
-    }
-    let cancelled = false;
-    const timer = window.setTimeout(() => {
-      apiFetch<{ is_designated_admin: boolean; setup_required: boolean }>(
-        `/api/auth/admin-status?email=${encodeURIComponent(trimmed)}`
-      )
-        .then((res) => {
-          if (!cancelled) {
-            setSetupMode(Boolean(res.is_designated_admin && res.setup_required));
-          }
-        })
-        .catch(() => {
-          if (!cancelled) setSetupMode(false);
-        });
-    }, 250);
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timer);
-    };
-  }, [email]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
     setError(null);
     try {
-      if (setupMode) {
-        if (password.length < 8) {
-          setError('Administrator password must be at least 8 characters.');
-          setLoading(false);
-          return;
-        }
-        if (password !== confirmPassword) {
-          setError('Passwords do not match.');
-          setLoading(false);
-          return;
-        }
-        const res = await apiFetch<{ user: User; token: string }>('/api/auth/admin-setup', {
-          method: 'POST',
-          body: JSON.stringify({ email: email.trim(), password }),
-        });
-        if (res.token) {
-          localStorage.setItem('mfx_token', res.token);
-        }
-        await refreshAll();
-        navigate('/signals');
-        return;
-      }
-
       const loggedUser = await login(email.trim(), password);
       navigate(loggedUser.role === 'admin' ? '/signals' : '/dashboard');
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Unable to sign in.';
-      if (msg.toLowerCase().includes('setup is required') || msg.toLowerCase().includes('setup required')) {
-        setSetupMode(true);
-      }
-      setError(msg);
+      setError(err instanceof Error ? err.message : 'Unable to sign in.');
     } finally {
       setLoading(false);
     }
@@ -83,23 +28,10 @@ export const LoginPage: React.FC = () => {
   return (
     <div className="mx-auto max-w-md py-10">
       <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-6 sm:p-8">
-        <h1 className="text-2xl font-bold text-slate-900 dark:text-white">
-          {setupMode ? 'Activate Administrator Account' : 'Member Sign In'}
-        </h1>
+        <h1 className="text-2xl font-bold text-slate-900 dark:text-white">Member Sign In</h1>
         <p className="mt-1.5 text-sm text-slate-500 dark:text-slate-400">
-          {setupMode
-            ? 'Set your secure password to activate designated administrator privileges.'
-            : 'Access live trading signals, saved courses, and personalized alerts.'}
+          Access live trading signals, saved courses, and personalized alerts.
         </p>
-
-        {setupMode && (
-          <div className="mt-4 flex items-start gap-2.5 rounded-xl border border-emerald-200 dark:border-emerald-900/40 bg-emerald-50 dark:bg-emerald-950/20 px-3.5 py-2.5 text-xs text-emerald-800 dark:text-emerald-300">
-            <ShieldCheck className="w-4 h-4 text-[#15803D] dark:text-emerald-400 shrink-0 mt-0.5" />
-            <span>
-              Designated administrator account detected (<span className="font-mono font-semibold">{email.trim().toLowerCase()}</span>). Choose a strong password to complete initial setup.
-            </span>
-          </div>
-        )}
 
         <form onSubmit={handleSubmit} className="mt-6 space-y-4">
           <div>
@@ -109,6 +41,7 @@ export const LoginPage: React.FC = () => {
             <input
               type="email"
               required
+              autoComplete="email"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
               placeholder="you@domain.com"
@@ -119,45 +52,36 @@ export const LoginPage: React.FC = () => {
           <div>
             <div className="flex items-center justify-between mb-1">
               <label className="text-xs font-medium text-slate-700 dark:text-slate-300">
-                {setupMode ? 'Create Administrator Password (min 8 chars)' : 'Password'}
+                Password
               </label>
-              {!setupMode && (
-                <button
-                  type="button"
-                  onClick={() => navigate('/forgot-password')}
-                  className="text-xs font-medium text-[#881337] dark:text-rose-400 hover:underline"
-                >
-                  Forgot password?
-                </button>
-              )}
+              <button
+                type="button"
+                onClick={() => navigate('/forgot-password')}
+                className="text-xs font-medium text-[#881337] dark:text-rose-400 hover:underline"
+              >
+                Forgot password?
+              </button>
             </div>
-            <input
-              type="password"
-              required
-              minLength={setupMode ? 8 : 1}
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              placeholder={setupMode ? 'Choose a strong password' : 'Enter your password'}
-              className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3.5 py-2.5 text-base sm:text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-[#881337]"
-            />
-          </div>
-
-          {setupMode && (
-            <div>
-              <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
-                Confirm Administrator Password
-              </label>
+            <div className="relative">
               <input
-                type="password"
+                type={showPassword ? 'text' : 'password'}
                 required
-                minLength={8}
-                value={confirmPassword}
-                onChange={(e) => setConfirmPassword(e.target.value)}
-                placeholder="Re-enter your password"
-                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3.5 py-2.5 text-base sm:text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-[#881337]"
+                autoComplete="current-password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="Enter your password"
+                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 pl-3.5 pr-10 py-2.5 text-base sm:text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-[#881337]"
               />
+              <button
+                type="button"
+                onClick={() => setShowPassword((v) => !v)}
+                aria-label={showPassword ? 'Hide password' : 'Show password'}
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
+              >
+                {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+              </button>
             </div>
-          )}
+          </div>
 
           {error && (
             <div className="flex items-center gap-2 rounded-lg bg-rose-50 border border-rose-200 dark:bg-red-500/10 dark:border-red-500/30 px-3 py-2 text-xs font-medium text-[#9F1239] dark:text-red-400">
@@ -171,13 +95,7 @@ export const LoginPage: React.FC = () => {
             disabled={loading}
             className="w-full rounded-lg bg-[#881337] py-2.5 text-sm font-semibold text-white hover:bg-[#6B0F2B] disabled:opacity-60 transition-colors min-h-[44px]"
           >
-            {loading
-              ? setupMode
-                ? 'Activating Admin...'
-                : 'Signing In...'
-              : setupMode
-                ? 'Activate & Sign In as Admin'
-                : 'Sign In'}
+            {loading ? 'Signing In...' : 'Sign In'}
           </button>
         </form>
 
@@ -197,13 +115,13 @@ export const LoginPage: React.FC = () => {
 };
 
 export const RegisterPage: React.FC = () => {
-  const { register, navigate, setShowNotifModal } = usePlatform();
+  const { register, navigate } = usePlatform();
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [issuedCode, setIssuedCode] = useState<string | null>(null);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -211,15 +129,7 @@ export const RegisterPage: React.FC = () => {
     setError(null);
     try {
       const res = await register(name, email, password);
-      if (res.verification_code) {
-        setIssuedCode(res.verification_code);
-      }
-      setShowNotifModal(true);
-      if (res.user.email_verified) {
-        navigate(res.user.role === 'admin' ? '/signals' : '/dashboard');
-      } else {
-        navigate('/verify-email');
-      }
+      navigate(res.user.role === 'admin' ? '/signals' : '/dashboard');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Registration failed.');
     } finally {
@@ -232,7 +142,7 @@ export const RegisterPage: React.FC = () => {
       <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-6 sm:p-8">
         <h1 className="text-2xl font-bold text-slate-900 dark:text-white">Create Trader Account</h1>
         <p className="mt-1.5 text-sm text-slate-500 dark:text-slate-400">
-          Register to track live signals, study Academy modules, and activate push notifications.
+          Register once to access live signals, study Academy modules, and sign in from any device.
         </p>
 
         <form onSubmit={handleSubmit} className="mt-6 space-y-4">
@@ -244,10 +154,11 @@ export const RegisterPage: React.FC = () => {
               type="text"
               required
               minLength={2}
+              autoComplete="name"
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="Jordan Vance"
-              className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3.5 py-2.5 text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-[#881337]"
+              className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3.5 py-2.5 text-base sm:text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-[#881337]"
             />
           </div>
 
@@ -258,26 +169,38 @@ export const RegisterPage: React.FC = () => {
             <input
               type="email"
               required
+              autoComplete="email"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
               placeholder="jordan@domain.com"
-              className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3.5 py-2.5 text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-[#881337]"
+              className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3.5 py-2.5 text-base sm:text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-[#881337]"
             />
           </div>
 
           <div>
             <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
-              Password (minimum 8 characters)
+              Password (minimum 6 characters)
             </label>
-            <input
-              type="password"
-              required
-              minLength={8}
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              placeholder="Create a strong password"
-              className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3.5 py-2.5 text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-[#881337]"
-            />
+            <div className="relative">
+              <input
+                type={showPassword ? 'text' : 'password'}
+                required
+                minLength={6}
+                autoComplete="new-password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="Create a password"
+                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 pl-3.5 pr-10 py-2.5 text-base sm:text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-[#881337]"
+              />
+              <button
+                type="button"
+                onClick={() => setShowPassword((v) => !v)}
+                aria-label={showPassword ? 'Hide password' : 'Show password'}
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
+              >
+                {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+              </button>
+            </div>
           </div>
 
           {error && (
@@ -285,10 +208,6 @@ export const RegisterPage: React.FC = () => {
               <ShieldAlert className="w-4 h-4 shrink-0" />
               <span>{error}</span>
             </div>
-          )}
-
-          {issuedCode && (
-            <p className="text-xs text-slate-500">Verification code issued: {issuedCode}</p>
           )}
 
           <button
@@ -392,7 +311,7 @@ export const VerifyEmailPage: React.FC = () => {
                 required
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
-                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3.5 py-2.5 text-sm text-slate-900 dark:text-white"
+                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3.5 py-2.5 text-base sm:text-sm text-slate-900 dark:text-white"
               />
             </div>
 
@@ -406,7 +325,7 @@ export const VerifyEmailPage: React.FC = () => {
                 value={code}
                 onChange={(e) => setCode(e.target.value)}
                 placeholder="123456"
-                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3.5 py-2.5 text-sm font-mono text-slate-900 dark:text-white"
+                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3.5 py-2.5 text-base sm:text-sm font-mono text-slate-900 dark:text-white"
               />
             </div>
 
@@ -459,7 +378,6 @@ export const ForgotPasswordPage: React.FC = () => {
   const [code, setCode] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [issuedCode, setIssuedCode] = useState<string | null>(null);
-  const [isAdminRecovery, setIsAdminRecovery] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -468,18 +386,15 @@ export const ForgotPasswordPage: React.FC = () => {
     setLoading(true);
     setError(null);
     setIssuedCode(null);
-    setIsAdminRecovery(false);
     try {
-      const res = await apiFetch<{ reset_code?: string; is_admin_account?: boolean }>(
+      const res = await apiFetch<{ reset_code?: string }>(
         '/api/auth/forgot-password',
         {
           method: 'POST',
-          body: JSON.stringify({ email }),
+          body: JSON.stringify({ email: email.trim() }),
         }
       );
-      if (res.is_admin_account) {
-        setIsAdminRecovery(true);
-      } else if (res.reset_code) {
+      if (res.reset_code) {
         setIssuedCode(res.reset_code);
       }
       setStep('reset');
@@ -497,7 +412,7 @@ export const ForgotPasswordPage: React.FC = () => {
     try {
       await apiFetch('/api/auth/reset-password', {
         method: 'POST',
-        body: JSON.stringify({ email, code, new_password: newPassword }),
+        body: JSON.stringify({ email: email.trim(), code, new_password: newPassword }),
       });
       setStep('done');
     } catch (err) {
@@ -545,11 +460,6 @@ export const ForgotPasswordPage: React.FC = () => {
 
         {step === 'reset' && (
           <form onSubmit={handleReset} className="mt-6 space-y-4">
-            {isAdminRecovery && (
-              <div className="rounded-lg border border-emerald-200 dark:border-emerald-900/40 bg-emerald-50 dark:bg-emerald-950/20 px-3 py-2.5 text-xs text-emerald-800 dark:text-emerald-300 leading-relaxed">
-                Administrator credentials are never exposed in browser responses. Enter your server recovery key (<span className="font-mono font-semibold">ADMIN_RESET_KEY</span>) or the one-time recovery code recorded in your server console logs.
-              </div>
-            )}
             {issuedCode && (
               <div className="rounded-lg border border-rose-200 dark:border-rose-900/40 bg-rose-50 dark:bg-rose-950/20 px-3 py-2 text-xs text-[#881337] dark:text-rose-400">
                 Recovery code issued: <span className="font-mono font-bold">{issuedCode}</span>
@@ -557,25 +467,25 @@ export const ForgotPasswordPage: React.FC = () => {
             )}
             <div>
               <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
-                {isAdminRecovery ? 'Admin Recovery Key or Server Code' : 'Reset Code'}
+                Reset Code
               </label>
               <input
                 type="text"
                 required
                 value={code}
                 onChange={(e) => setCode(e.target.value)}
-                placeholder={isAdminRecovery ? 'Enter ADMIN_RESET_KEY or 6-digit code' : 'Enter 6-digit code'}
+                placeholder="Enter 6-digit code"
                 className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3.5 py-2.5 text-base sm:text-sm font-mono text-slate-900 dark:text-white"
               />
             </div>
             <div>
               <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
-                New Password (min 8 characters)
+                New Password (min 6 characters)
               </label>
               <input
                 type="password"
                 required
-                minLength={8}
+                minLength={6}
                 value={newPassword}
                 onChange={(e) => setNewPassword(e.target.value)}
                 className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3.5 py-2.5 text-base sm:text-sm text-slate-900 dark:text-white"
