@@ -2630,90 +2630,95 @@ app.use('/api', (err: Error, _req: Request, res: Response, _next: NextFunction) 
 
 // Background Scheduler: Scheduled Market Updates, Scheduled Push Notifications, Periodic Backups
 let lastAutoBackupDay = '';
-setInterval(async () => {
-  const nowIso = new Date().toISOString();
+if (!process.env.VERCEL) {
+  setInterval(async () => {
+    const nowIso = new Date().toISOString();
 
-  try {
-    // 1. Publish due scheduled market updates
-    const dueUpdates = db
-      .prepare('SELECT * FROM market_updates WHERE published = 0 AND scheduled_at IS NOT NULL AND scheduled_at <= ?')
-      .all(nowIso) as Array<Record<string, unknown>>;
+    try {
+      // 1. Publish due scheduled market updates
+      const dueUpdates = db
+        .prepare('SELECT * FROM market_updates WHERE published = 0 AND scheduled_at IS NOT NULL AND scheduled_at <= ?')
+        .all(nowIso) as Array<Record<string, unknown>>;
 
-    for (const u of dueUpdates) {
-      db.prepare('UPDATE market_updates SET published = 1, updated_at = ? WHERE id = ?').run(nowIso, String(u.id));
-      const hydrated = { ...u, pinned: Boolean(u.pinned), published: true, reactions: {}, user_reacted: [], bookmarked: false };
-      broadcastWs('update:created', hydrated);
-      await dispatchNotification({
-        title: `${String(u.category)}: ${String(u.title)}`,
-        body: String(u.content).slice(0, 140),
-        category: 'market_updates',
-        linkUrl: '/updates',
-        broadcastWs,
-      });
+      for (const u of dueUpdates) {
+        db.prepare('UPDATE market_updates SET published = 1, updated_at = ? WHERE id = ?').run(nowIso, String(u.id));
+        const hydrated = { ...u, pinned: Boolean(u.pinned), published: true, reactions: {}, user_reacted: [], bookmarked: false };
+        broadcastWs('update:created', hydrated);
+        await dispatchNotification({
+          title: `${String(u.category)}: ${String(u.title)}`,
+          body: String(u.content).slice(0, 140),
+          category: 'market_updates',
+          linkUrl: '/updates',
+          broadcastWs,
+        });
+      }
+
+      // 2. Dispatch due scheduled push notifications
+      const dueNotifs = db
+        .prepare('SELECT * FROM scheduled_notifications WHERE sent = 0 AND scheduled_at <= ?')
+        .all(nowIso) as Array<{
+        id: string;
+        title: string;
+        body: string;
+        category: string;
+        link_url: string;
+        target_user_ids: string | null;
+      }>;
+
+      for (const n of dueNotifs) {
+        db.prepare('UPDATE scheduled_notifications SET sent = 1 WHERE id = ?').run(n.id);
+        await dispatchNotification({
+          title: n.title,
+          body: n.body,
+          category: n.category as keyof NotificationPreferences,
+          linkUrl: n.link_url,
+          targetUserIds: n.target_user_ids ? (JSON.parse(n.target_user_ids) as string[]) : null,
+          broadcastWs,
+        });
+      }
+
+      // 2.5 Publish due scheduled Academy lessons
+      const dueLessons = db
+        .prepare("SELECT * FROM lessons WHERE status = 'scheduled' AND scheduled_at IS NOT NULL AND scheduled_at <= ?")
+        .all(nowIso) as Array<Record<string, unknown>>;
+
+      for (const l of dueLessons) {
+        db.prepare("UPDATE lessons SET status = 'published', published_at = ?, updated_at = ? WHERE id = ?").run(
+          nowIso,
+          nowIso,
+          String(l.id)
+        );
+        broadcastWs('academy:updated', { type: 'lesson_published', id: String(l.id) });
+        await dispatchNotification({
+          title: `New Academy Lesson: ${String(l.title)}`,
+          body: `${String(l.category)} lesson is now available in the Trading Academy.`,
+          category: 'academy',
+          linkUrl: '/academy',
+          broadcastWs,
+        });
+      }
+
+      // 3. Automated daily backup snapshot
+      const today = nowIso.slice(0, 10);
+      if (today !== lastAutoBackupDay) {
+        createDatabaseBackup();
+        lastAutoBackupDay = today;
+      }
+    } catch (err) {
+      logSystemEvent('error', 'scheduler', String(err));
     }
-
-    // 2. Dispatch due scheduled push notifications
-    const dueNotifs = db
-      .prepare('SELECT * FROM scheduled_notifications WHERE sent = 0 AND scheduled_at <= ?')
-      .all(nowIso) as Array<{
-      id: string;
-      title: string;
-      body: string;
-      category: string;
-      link_url: string;
-      target_user_ids: string | null;
-    }>;
-
-    for (const n of dueNotifs) {
-      db.prepare('UPDATE scheduled_notifications SET sent = 1 WHERE id = ?').run(n.id);
-      await dispatchNotification({
-        title: n.title,
-        body: n.body,
-        category: n.category as keyof NotificationPreferences,
-        linkUrl: n.link_url,
-        targetUserIds: n.target_user_ids ? (JSON.parse(n.target_user_ids) as string[]) : null,
-        broadcastWs,
-      });
-    }
-
-    // 2.5 Publish due scheduled Academy lessons
-    const dueLessons = db
-      .prepare("SELECT * FROM lessons WHERE status = 'scheduled' AND scheduled_at IS NOT NULL AND scheduled_at <= ?")
-      .all(nowIso) as Array<Record<string, unknown>>;
-
-    for (const l of dueLessons) {
-      db.prepare("UPDATE lessons SET status = 'published', published_at = ?, updated_at = ? WHERE id = ?").run(
-        nowIso,
-        nowIso,
-        String(l.id)
-      );
-      broadcastWs('academy:updated', { type: 'lesson_published', id: String(l.id) });
-      await dispatchNotification({
-        title: `New Academy Lesson: ${String(l.title)}`,
-        body: `${String(l.category)} lesson is now available in the Trading Academy.`,
-        category: 'academy',
-        linkUrl: '/academy',
-        broadcastWs,
-      });
-    }
-
-    // 3. Automated daily backup snapshot
-    const today = nowIso.slice(0, 10);
-    if (today !== lastAutoBackupDay) {
-      createDatabaseBackup();
-      lastAutoBackupDay = today;
-    }
-  } catch (err) {
-    logSystemEvent('error', 'scheduler', String(err));
-  }
-}, 30_000);
+  }, 30_000);
+}
 
 // ---------- Frontend Serving (Vite Dev Middleware vs Production Static) ----------
-const isProduction = process.env.NODE_ENV === 'production';
+const isProduction = process.env.NODE_ENV === 'production' || Boolean(process.env.VERCEL);
 
 async function startServer() {
   if (!isProduction) {
-    const { createServer: createViteServer } = await import('vite');
+    const viteModuleName = 'vite';
+    const { createServer: createViteServer } = (await import(
+      /* @vite-ignore */ viteModuleName
+    )) as typeof import('vite');
     const hmrDisabled = process.env.DISABLE_HMR === 'true';
     const vite = await createViteServer({
       server: {
@@ -2728,16 +2733,22 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distDir = path.resolve(process.cwd(), 'dist');
-    app.use(express.static(distDir));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(distDir, 'index.html'));
-    });
+    if (fs.existsSync(distDir)) {
+      app.use(express.static(distDir));
+      app.get('*', (_req, res) => {
+        res.sendFile(path.join(distDir, 'index.html'));
+      });
+    }
   }
 
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
   httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`MeridianFX server running on http://0.0.0.0:${PORT} (${isProduction ? 'production' : 'development'})`);
   });
 }
 
-startServer();
+if (!process.env.VERCEL) {
+  startServer();
+}
+
+export default app;

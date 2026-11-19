@@ -1,10 +1,24 @@
 import Database from 'better-sqlite3';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { ALL_CURRICULUM_COURSES } from './curriculum/index.ts';
 
-const DATA_DIR = path.resolve(process.cwd(), 'data');
+function resolveDataDir(): string {
+  if (process.env.VERCEL) {
+    return path.join(os.tmpdir(), 'meridianfx-data');
+  }
+  const localDir = path.resolve(process.cwd(), 'data');
+  try {
+    fs.mkdirSync(localDir, { recursive: true });
+    return localDir;
+  } catch {
+    return path.join(os.tmpdir(), 'meridianfx-data');
+  }
+}
+
+const DATA_DIR = resolveDataDir();
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
 const BACKUPS_DIR = path.join(DATA_DIR, 'backups');
 
