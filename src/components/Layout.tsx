@@ -37,6 +37,7 @@ export const Layout: React.FC<LayoutProps> = ({ children }) => {
   const isOnline = useOnlineStatus();
 
   const isLanding = route === '/' && !user;
+  const isSignalsRoute = route === '/signals';
 
   const navItems = [
     { path: user ? '/dashboard' : '/', label: user ? 'Dashboard' : 'Home', icon: user ? LayoutDashboard : Home },
@@ -192,7 +193,11 @@ export const Layout: React.FC<LayoutProps> = ({ children }) => {
   }
 
   return (
-    <div className="min-h-screen flex bg-[#F8F9FA] dark:bg-[#090D16] text-slate-900 dark:text-slate-100">
+    <div
+      className={`flex bg-[#F8F9FA] dark:bg-[#090D16] text-slate-900 dark:text-slate-100 ${
+        isSignalsRoute ? 'h-[100dvh] overflow-hidden' : 'min-h-screen'
+      }`}
+    >
       {/* Desktop Sidebar */}
       <aside className="hidden lg:flex lg:w-64 lg:flex-col lg:fixed lg:inset-y-0 border-r border-slate-200 dark:border-slate-800/80 bg-white dark:bg-[#0B101B]">
         <div className="h-16 flex items-center justify-between px-5 border-b border-slate-200 dark:border-slate-800/80">
@@ -327,7 +332,11 @@ export const Layout: React.FC<LayoutProps> = ({ children }) => {
       </aside>
 
       {/* Main Content Area */}
-      <div className="flex-1 lg:pl-64 flex flex-col min-w-0">
+      <div
+        className={`flex-1 lg:pl-64 flex flex-col min-w-0 ${
+          isSignalsRoute ? 'h-full min-h-0 overflow-hidden' : ''
+        }`}
+      >
         {/* Desktop Top Utility Header */}
         <header className="hidden lg:flex sticky top-0 z-30 h-14 border-b border-slate-200 dark:border-slate-800/80 bg-white/95 dark:bg-[#0B101B]/90 backdrop-blur-md px-8 items-center justify-between gap-4">
           <div className="flex items-center gap-3 text-xs text-slate-500 dark:text-slate-400">
@@ -361,55 +370,63 @@ export const Layout: React.FC<LayoutProps> = ({ children }) => {
           </div>
         </header>
 
-        {/* Compact Mobile Top Bar */}
-        <header className="lg:hidden sticky top-0 z-30 h-14 border-b border-slate-200 dark:border-slate-800/80 bg-white/95 dark:bg-[#0B101B]/90 backdrop-blur-md px-3.5 flex items-center justify-between gap-2">
-          <button
-            type="button"
-            onClick={() => navigate('/')}
-            className="text-base font-bold tracking-tight text-[#881337] dark:text-white whitespace-nowrap shrink-0"
-          >
-            {settings.brand_name}
-          </button>
-
-          <div className="flex items-center gap-1.5 shrink-0">
-            <PWAInstallButton variant="header" label="INSTALL APP" />
-            {user?.role === 'admin' && (
-              <button
-                type="button"
-                onClick={() => navigate('/admin')}
-                className="min-h-[40px] min-w-[40px] flex items-center justify-center text-emerald-700 dark:text-emerald-400"
-                aria-label="Admin Desk"
-              >
-                <Shield className="w-5 h-5" />
-              </button>
-            )}
-            {user && (
-              <button
-                type="button"
-                onClick={() => navigate('/notifications')}
-                className="relative min-h-[40px] min-w-[40px] flex items-center justify-center text-slate-600 dark:text-slate-300"
-                aria-label="Notifications"
-              >
-                <Bell className="w-5 h-5" />
-                {unreadCount > 0 && (
-                  <span className="absolute top-2 right-2 text-[10px] font-mono font-bold text-[#881337]">
-                    {unreadCount}
-                  </span>
-                )}
-              </button>
-            )}
+        {/* Compact Mobile Top Bar (hidden on /signals so the Telegram channel header sits cleanly at top) */}
+        {!isSignalsRoute && (
+          <header className="lg:hidden sticky top-0 z-30 h-14 border-b border-slate-200 dark:border-slate-800/80 bg-white/95 dark:bg-[#0B101B]/90 backdrop-blur-md px-3.5 flex items-center justify-between gap-2">
             <button
               type="button"
-              onClick={toggleTheme}
-              className="min-h-[40px] min-w-[40px] flex items-center justify-center text-slate-600 dark:text-slate-300"
-              aria-label="Toggle theme"
+              onClick={() => navigate('/')}
+              className="text-base font-bold tracking-tight text-[#881337] dark:text-white whitespace-nowrap shrink-0"
             >
-              {theme === 'dark' ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
+              {settings.brand_name}
             </button>
-          </div>
-        </header>
 
-        <main className="flex-1 p-4 sm:p-6 lg:p-8 pb-24 lg:pb-10 max-w-7xl w-full mx-auto">
+            <div className="flex items-center gap-1.5 shrink-0">
+              <PWAInstallButton variant="header" label="INSTALL APP" />
+              {user?.role === 'admin' && (
+                <button
+                  type="button"
+                  onClick={() => navigate('/admin')}
+                  className="min-h-[40px] min-w-[40px] flex items-center justify-center text-emerald-700 dark:text-emerald-400"
+                  aria-label="Admin Desk"
+                >
+                  <Shield className="w-5 h-5" />
+                </button>
+              )}
+              {user && (
+                <button
+                  type="button"
+                  onClick={() => navigate('/notifications')}
+                  className="relative min-h-[40px] min-w-[40px] flex items-center justify-center text-slate-600 dark:text-slate-300"
+                  aria-label="Notifications"
+                >
+                  <Bell className="w-5 h-5" />
+                  {unreadCount > 0 && (
+                    <span className="absolute top-2 right-2 text-[10px] font-mono font-bold text-[#881337]">
+                      {unreadCount}
+                    </span>
+                  )}
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={toggleTheme}
+                className="min-h-[40px] min-w-[40px] flex items-center justify-center text-slate-600 dark:text-slate-300"
+                aria-label="Toggle theme"
+              >
+                {theme === 'dark' ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
+              </button>
+            </div>
+          </header>
+        )}
+
+        <main
+          className={
+            isSignalsRoute
+              ? 'flex-1 min-h-0 flex flex-col p-0 pb-16 lg:pb-0 w-full overflow-hidden'
+              : 'flex-1 p-4 sm:p-6 lg:p-8 pb-24 lg:pb-10 max-w-7xl w-full mx-auto'
+          }
+        >
           {children}
         </main>
       </div>

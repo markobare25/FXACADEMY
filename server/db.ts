@@ -68,6 +68,7 @@ export function initDatabase(): void {
       timezone TEXT DEFAULT 'UTC',
       notification_prefs TEXT NOT NULL DEFAULT '{"signals":true,"signal_updates":true,"market_updates":true,"academy":true,"economic_calendar":true,"announcements":true}',
       watchlist TEXT NOT NULL DEFAULT '["EURUSD","GBPUSD","XAUUSD","BTCUSD"]',
+      needs_password_setup INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
       last_login_at TEXT
     );
@@ -492,6 +493,7 @@ export function initDatabase(): void {
   ensureColumn('lesson_progress', 'scroll_pct', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('lesson_progress', 'needs_review', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('lesson_progress', 'needs_review_note', 'TEXT');
+  ensureColumn('users', 'needs_password_setup', 'INTEGER NOT NULL DEFAULT 0');
 
   // Migrate legacy dark hero image references to the bright daylight desk asset
   db.prepare(
@@ -546,28 +548,47 @@ function seedInitialData(): void {
     upsertSetting.run('jwt_secret', crypto.randomBytes(48).toString('hex'));
   }
 
-  // Ensure designated administrator account (markobare25@gmail.com) has admin privileges if present or configured
+  // Ensure designated administrator account (markobare25@gmail.com) is always registered with admin privileges
   const designatedUser = db
-    .prepare('SELECT id, role, status, email_verified FROM users WHERE LOWER(email) = ?')
+    .prepare('SELECT id, role, status, email_verified, needs_password_setup FROM users WHERE LOWER(email) = ?')
     .get(DESIGNATED_ADMIN_EMAIL) as
-    | { id: string; role: string; status: string; email_verified: number }
+    | { id: string; role: string; status: string; email_verified: number; needs_password_setup: number }
     | undefined;
 
+  const envAdminPassword =
+    process.env.ADMIN_PASSWORD && process.env.ADMIN_PASSWORD.length >= 8
+      ? process.env.ADMIN_PASSWORD
+      : null;
+
   if (designatedUser) {
-    if (designatedUser.role !== 'admin' || designatedUser.status !== 'active' || !designatedUser.email_verified) {
+    if (
+      designatedUser.role !== 'admin' ||
+      designatedUser.status !== 'active' ||
+      !designatedUser.email_verified
+    ) {
       db.prepare("UPDATE users SET role = 'admin', status = 'active', email_verified = 1 WHERE id = ?").run(
         designatedUser.id
       );
     }
-  } else if (process.env.ADMIN_PASSWORD && process.env.ADMIN_PASSWORD.length >= 8) {
+    if (envAdminPassword && Number(designatedUser.needs_password_setup || 0) === 1) {
+      db.prepare(
+        "UPDATE users SET password_hash = ?, needs_password_setup = 0, role = 'admin', status = 'active', email_verified = 1 WHERE id = ?"
+      ).run(hashPassword(envAdminPassword), designatedUser.id);
+    }
+  } else {
+    const initialSecret = envAdminPassword || crypto.randomBytes(32).toString('hex');
+    const needsSetup = envAdminPassword ? 0 : 1;
     db.prepare(
-      `INSERT INTO users (id, name, email, password_hash, role, status, email_verified, bio, created_at)
-       VALUES (?, ?, ?, ?, 'admin', 'active', 1, ?, ?)`
+      `INSERT INTO users (
+        id, name, email, password_hash, role, status, email_verified,
+        needs_password_setup, bio, created_at
+      ) VALUES (?, ?, ?, ?, 'admin', 'active', 1, ?, ?, ?)`
     ).run(
       crypto.randomUUID(),
       'MeridianFX Admin',
       DESIGNATED_ADMIN_EMAIL,
-      hashPassword(process.env.ADMIN_PASSWORD),
+      hashPassword(initialSecret),
+      needsSetup,
       'Head of Trading Desk & Signals Strategy at MeridianFX.',
       now
     );

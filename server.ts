@@ -232,23 +232,59 @@ app.post('/api/auth/register', rateLimit(15, 60_000), (req: Request, res: Respon
     return;
   }
 
-  const email = parsed.data.email.toLowerCase();
-  const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
+  const email = parsed.data.email.trim().toLowerCase();
+  const existing = db
+    .prepare('SELECT id, needs_password_setup FROM users WHERE LOWER(email) = ?')
+    .get(email) as { id: string; needs_password_setup?: number } | undefined;
+
+  const now = new Date().toISOString();
+
+  // Complete activation if the designated admin record was pre-seeded awaiting initial password setup
+  if (existing && email === DESIGNATED_ADMIN_EMAIL && Number(existing.needs_password_setup || 0) === 1) {
+    db.prepare(
+      `UPDATE users SET
+        name = ?,
+        password_hash = ?,
+        role = 'admin',
+        status = 'active',
+        email_verified = 1,
+        needs_password_setup = 0,
+        timezone = ?,
+        last_login_at = ?
+       WHERE id = ?`
+    ).run(
+      parsed.data.name,
+      hashPassword(parsed.data.password),
+      parsed.data.timezone || 'UTC',
+      now,
+      existing.id
+    );
+    logUserActivity(existing.id, 'Admin Account Activated', 'Designated administrator completed initial password setup.', req.ip);
+
+    const adminRow = db.prepare('SELECT * FROM users WHERE id = ?').get(existing.id) as Record<string, unknown>;
+    const token = signToken({ sub: existing.id, role: 'admin' });
+    setSessionCookie(res, token);
+    res.status(201).json({
+      user: mapDbUser(adminRow),
+      token,
+    });
+    return;
+  }
+
   if (existing) {
     res.status(409).json({ error: 'An account with this email already exists.' });
     return;
   }
 
   const userId = crypto.randomUUID();
-  const now = new Date().toISOString();
   const verifyToken = crypto.randomBytes(24).toString('hex');
   const verifyCode = String(crypto.randomInt(100000, 999999));
   const assignedRole = email === DESIGNATED_ADMIN_EMAIL ? 'admin' : 'user';
   const initialVerified = email === DESIGNATED_ADMIN_EMAIL ? 1 : 0;
 
   db.prepare(
-    `INSERT INTO users (id, name, email, password_hash, role, status, email_verified, timezone, created_at, last_login_at)
-     VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)`
+    `INSERT INTO users (id, name, email, password_hash, role, status, email_verified, needs_password_setup, timezone, created_at, last_login_at)
+     VALUES (?, ?, ?, ?, ?, 'active', ?, 0, ?, ?, ?)`
   ).run(
     userId,
     parsed.data.name,
@@ -285,6 +321,92 @@ app.post('/api/auth/register', rateLimit(15, 60_000), (req: Request, res: Respon
   });
 });
 
+app.get('/api/auth/admin-status', (req: Request, res: Response) => {
+  const email = String(req.query.email || '').trim().toLowerCase();
+  if (email !== DESIGNATED_ADMIN_EMAIL) {
+    res.json({ is_designated_admin: false, setup_required: false });
+    return;
+  }
+  const row = db
+    .prepare('SELECT needs_password_setup FROM users WHERE LOWER(email) = ?')
+    .get(DESIGNATED_ADMIN_EMAIL) as { needs_password_setup?: number } | undefined;
+  res.json({
+    is_designated_admin: true,
+    setup_required: !row || Number(row.needs_password_setup || 0) === 1,
+  });
+});
+
+app.post('/api/auth/admin-setup', rateLimit(10, 60_000), (req: Request, res: Response) => {
+  const schema = z.object({
+    email: z.string().trim().email(),
+    password: z.string().min(8, 'Password must be at least 8 characters.').max(128),
+    name: z.string().trim().min(2).max(80).optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid setup payload.' });
+    return;
+  }
+
+  const email = parsed.data.email.trim().toLowerCase();
+  if (email !== DESIGNATED_ADMIN_EMAIL) {
+    res.status(403).json({ error: 'Only the designated administrator account can use this activation flow.' });
+    return;
+  }
+
+  const row = db
+    .prepare('SELECT * FROM users WHERE LOWER(email) = ?')
+    .get(DESIGNATED_ADMIN_EMAIL) as Record<string, unknown> | undefined;
+
+  if (row && Number(row.needs_password_setup || 0) !== 1) {
+    res.status(403).json({
+      error: 'Administrator password is already set. Use Sign In or Forgot Password to recover credentials.',
+    });
+    return;
+  }
+
+  const now = new Date().toISOString();
+  let targetId = '';
+  if (row) {
+    targetId = String(row.id);
+    db.prepare(
+      `UPDATE users SET
+        name = COALESCE(?, name),
+        password_hash = ?,
+        role = 'admin',
+        status = 'active',
+        email_verified = 1,
+        needs_password_setup = 0,
+        last_login_at = ?
+       WHERE id = ?`
+    ).run(parsed.data.name || null, hashPassword(parsed.data.password), now, targetId);
+  } else {
+    targetId = crypto.randomUUID();
+    db.prepare(
+      `INSERT INTO users (
+        id, name, email, password_hash, role, status, email_verified,
+        needs_password_setup, bio, created_at, last_login_at
+      ) VALUES (?, ?, ?, ?, 'admin', 'active', 1, 0, ?, ?, ?)`
+    ).run(
+      targetId,
+      parsed.data.name || 'MeridianFX Admin',
+      DESIGNATED_ADMIN_EMAIL,
+      hashPassword(parsed.data.password),
+      'Head of Trading Desk & Signals Strategy at MeridianFX.',
+      now,
+      now
+    );
+  }
+
+  logUserActivity(targetId, 'Admin Activated', 'Designated administrator password established.', req.ip);
+  const updated = db.prepare('SELECT * FROM users WHERE id = ?').get(targetId) as Record<string, unknown>;
+  const user = mapDbUser(updated);
+  const token = signToken({ sub: user.id, role: 'admin' });
+  setSessionCookie(res, token);
+
+  res.status(200).json({ user, token });
+});
+
 const loginSchema = z.object({
   email: z.string().trim().email(),
   password: z.string().min(1),
@@ -297,22 +419,40 @@ app.post('/api/auth/login', rateLimit(20, 60_000), (req: Request, res: Response)
     return;
   }
 
-  const email = parsed.data.email.toLowerCase();
-  const row = db.prepare('SELECT * FROM users WHERE email = ?').get(email) as
+  const email = parsed.data.email.trim().toLowerCase();
+  const row = db.prepare('SELECT * FROM users WHERE LOWER(email) = ?').get(email) as
     | Record<string, unknown>
     | undefined;
+
+  if (email === DESIGNATED_ADMIN_EMAIL && (!row || Number(row.needs_password_setup || 0) === 1)) {
+    res.status(403).json({
+      error: 'Administrator password setup is required for markobare25@gmail.com. Establish your password below.',
+      code: 'ADMIN_SETUP_REQUIRED',
+    });
+    return;
+  }
+
   if (!row || !verifyPassword(parsed.data.password, String(row.password_hash))) {
     res.status(401).json({ error: 'Invalid email or password.' });
     return;
   }
 
-  if (row.status === 'suspended') {
+  if (row.status === 'suspended' && email !== DESIGNATED_ADMIN_EMAIL) {
     res.status(403).json({ error: 'Your account has been suspended. Contact platform support.' });
     return;
   }
 
   const now = new Date().toISOString();
-  db.prepare('UPDATE users SET last_login_at = ? WHERE id = ?').run(now, String(row.id));
+  if (email === DESIGNATED_ADMIN_EMAIL) {
+    db.prepare(
+      "UPDATE users SET role = 'admin', status = 'active', email_verified = 1, last_login_at = ? WHERE id = ?"
+    ).run(now, String(row.id));
+    row.role = 'admin';
+    row.status = 'active';
+    row.email_verified = 1;
+  } else {
+    db.prepare('UPDATE users SET last_login_at = ? WHERE id = ?').run(now, String(row.id));
+  }
   logUserActivity(String(row.id), 'Sign In', 'Authenticated session started.', req.ip);
 
   const user = mapDbUser({ ...row, last_login_at: now });
@@ -389,7 +529,7 @@ app.post('/api/auth/resend-verification', requireAuth, rateLimit(5, 60_000), (re
 
 app.post('/api/auth/forgot-password', rateLimit(10, 60_000), (req: Request, res: Response) => {
   const email = String(req.body?.email || '').trim().toLowerCase();
-  const user = db.prepare('SELECT id, role FROM users WHERE email = ?').get(email) as
+  const user = db.prepare('SELECT id, role FROM users WHERE LOWER(email) = ?').get(email) as
     | { id: string; role: string }
     | undefined;
 
@@ -445,8 +585,8 @@ app.post('/api/auth/reset-password', rateLimit(10, 60_000), (req: Request, res: 
   }
 
   const user = db
-    .prepare('SELECT id, role FROM users WHERE email = ?')
-    .get(parsed.data.email.toLowerCase()) as { id: string; role: string } | undefined;
+    .prepare('SELECT id, role FROM users WHERE LOWER(email) = ?')
+    .get(parsed.data.email.trim().toLowerCase()) as { id: string; role: string } | undefined;
   if (!user) {
     res.status(400).json({ error: 'Invalid reset code or email.' });
     return;
@@ -479,7 +619,7 @@ app.post('/api/auth/reset-password', rateLimit(10, 60_000), (req: Request, res: 
     db.prepare('UPDATE password_resets SET used = 1 WHERE id = ?').run(resetRow.id);
   }
 
-  db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(
+  db.prepare("UPDATE users SET password_hash = ?, needs_password_setup = 0, status = 'active' WHERE id = ?").run(
     hashPassword(parsed.data.new_password),
     user.id
   );
@@ -534,7 +674,7 @@ app.patch('/api/users/password', requireAuth, (req: AuthRequest, res: Response) 
     return;
   }
 
-  db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(
+  db.prepare('UPDATE users SET password_hash = ?, needs_password_setup = 0 WHERE id = ?').run(
     hashPassword(parsed.data.new_password),
     req.user!.id
   );
@@ -787,12 +927,12 @@ app.post('/api/signals/messages', requireRole('admin'), async (req: AuthRequest,
   if (d.send_push !== false) {
     const preview = trimmedContent
       ? trimmedContent.replace(/\s+/g, ' ').slice(0, 140)
-      : 'New chart image shared in Active Signals Chat.';
+      : 'New chart image shared in MeridianFX Signal Channel.';
     await dispatchNotification({
       title: 'MeridianFX',
       body: preview,
       category: 'signals',
-      linkUrl: '/signals?tab=active',
+      linkUrl: '/signals',
       broadcastWs,
     });
   }
