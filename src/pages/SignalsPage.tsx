@@ -792,17 +792,8 @@ export const SignalsPage: React.FC = () => {
               </div>
             </div>
 
-            {/* Channel Header Toolbar: COMPLETED UPDATES + Info */}
+            {/* Channel Header Toolbar: Info */}
             <div className="flex items-center gap-1.5 shrink-0">
-              <button
-                type="button"
-                onClick={() => setView('completed')}
-                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/80 hover:border-[#881337]/50 hover:text-[#881337] dark:hover:text-rose-300 px-2.5 sm:px-3 py-1.5 text-[11px] font-bold tracking-wide text-slate-700 dark:text-slate-200 transition-colors min-h-[36px] whitespace-nowrap"
-              >
-                <Archive className="w-3.5 h-3.5 text-[#881337] dark:text-rose-400 shrink-0" />
-                <span>COMPLETED UPDATES</span>
-              </button>
-
               <button
                 type="button"
                 onClick={() => setShowChannelInfo(true)}
