@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import {
+  BarChart3,
   Bell,
   BookOpen,
   Database,
@@ -21,10 +22,12 @@ import {
 import { usePlatform } from '../context/PlatformContext';
 import { apiFetch, formatLocalDateTime, uploadMediaFile } from '../lib/api';
 import { AdminAcademyManager } from '../components/admin/AdminAcademyManager';
+import { AdminRegistrationsPanel } from '../components/admin/AdminRegistrationsPanel';
 import type {
   MarketUpdate,
   MarketUpdateCategory,
   PlatformSettings,
+  RegistrationAnalyticsPayload,
   SignalDirection,
   SignalStatus,
   TradingSignal,
@@ -34,6 +37,7 @@ import type {
 
 type AdminTab =
   | 'overview'
+  | 'registrations'
   | 'signals'
   | 'updates'
   | 'notifications'
@@ -81,9 +85,10 @@ interface OverviewPayload {
 }
 
 export const AdminPage: React.FC = () => {
-  const { user, settings, signals, refreshAll, navigate } = usePlatform();
+  const { user, authLoading, settings, signals, refreshAll, navigate } = usePlatform();
   const [tab, setTab] = useState<AdminTab>('overview');
   const [overview, setOverview] = useState<OverviewPayload | null>(null);
+  const [registrations, setRegistrations] = useState<RegistrationAnalyticsPayload | null>(null);
   const [allUpdates, setAllUpdates] = useState<MarketUpdate[]>([]);
   const [usersList, setUsersList] = useState<User[]>([]);
   const [reports, setReports] = useState<
@@ -174,14 +179,16 @@ export const AdminPage: React.FC = () => {
   const loadAdminData = useCallback(async () => {
     if (user?.role !== 'admin') return;
     try {
-      const [ov, upd, usr, rep, cnt] = await Promise.all([
+      const [ov, reg, upd, usr, rep, cnt] = await Promise.all([
         apiFetch<OverviewPayload>('/api/admin/overview'),
+        apiFetch<RegistrationAnalyticsPayload>('/api/admin/registrations'),
         apiFetch<{ updates: MarketUpdate[] }>('/api/updates?includeAll=true'),
         apiFetch<{ users: User[] }>('/api/admin/users'),
         apiFetch<{ reports: typeof reports }>('/api/admin/reports'),
         apiFetch<{ messages: typeof contacts }>('/api/admin/contacts'),
       ]);
       setOverview(ov);
+      setRegistrations(reg);
       setAllUpdates(upd.updates);
       setUsersList(usr.users);
       setReports(rep.reports);
@@ -200,6 +207,16 @@ export const AdminPage: React.FC = () => {
     setToast(msg);
     setTimeout(() => setToast(null), 3500);
   };
+
+  if (authLoading && !user) {
+    return (
+      <div className="mx-auto max-w-lg py-12">
+        <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-8 text-center text-sm text-slate-500">
+          Verifying administrator session...
+        </div>
+      </div>
+    );
+  }
 
   if (!user || user.role !== 'admin') {
     return (
@@ -472,6 +489,7 @@ export const AdminPage: React.FC = () => {
 
   const tabs: Array<{ key: AdminTab; label: string; icon: React.ComponentType<{ className?: string }> }> = [
     { key: 'overview', label: 'Overview', icon: LayoutDashboard },
+    { key: 'registrations', label: 'Registrations', icon: BarChart3 },
     { key: 'signals', label: 'Signals', icon: TrendingUp },
     { key: 'updates', label: 'Updates', icon: Radio },
     { key: 'notifications', label: 'Push Alerts', icon: Bell },
@@ -1295,6 +1313,15 @@ export const AdminPage: React.FC = () => {
           onGlobalRefresh={async () => {
             await Promise.all([refreshAll(), loadAdminData()]);
           }}
+        />
+      )}
+
+      {/* A2. REGISTRATION ANALYTICS */}
+      {tab === 'registrations' && (
+        <AdminRegistrationsPanel
+          analytics={registrations}
+          onRefresh={loadAdminData}
+          onError={setErrorMsg}
         />
       )}
 

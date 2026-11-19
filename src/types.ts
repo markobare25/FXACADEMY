@@ -63,7 +63,15 @@ export interface TradingSignal {
 
 export type SignalChatMessageType = 'signal' | 'update' | 'analysis' | 'announcement';
 export type SignalChatStatus = 'active' | 'completed';
-export type SignalReactionType = 'love' | 'like';
+export type SignalReactionType = 'love' | 'like' | 'fire' | 'hundred' | 'dislike';
+
+export interface SignalReactionsMap {
+  love: number;
+  like: number;
+  fire: number;
+  hundred: number;
+  dislike: number;
+}
 
 export interface SignalChatMessage {
   id: string;
@@ -79,11 +87,33 @@ export interface SignalChatMessage {
   completed_at?: string | null;
   completed_summary?: string | null;
   created_at: string;
-  reactions: {
-    love: number;
-    like: number;
-  };
+  reactions: SignalReactionsMap;
   user_reaction: SignalReactionType | null;
+}
+
+export interface RegistrationTrendPoint {
+  key: string;
+  label: string;
+  count: number;
+}
+
+export interface RegistrationAnalyticsPayload {
+  summary: {
+    total_users: number;
+    active_users: number;
+    suspended_users: number;
+    verified_users: number;
+    unverified_users: number;
+    new_today: number;
+    new_7d: number;
+    new_30d: number;
+  };
+  trends: {
+    daily: RegistrationTrendPoint[];
+    weekly: RegistrationTrendPoint[];
+    monthly: RegistrationTrendPoint[];
+  };
+  records: User[];
 }
 
 export type MarketUpdateCategory =

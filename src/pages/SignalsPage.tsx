@@ -5,10 +5,10 @@ import {
   ArrowLeft,
   BadgeCheck,
   Bell,
+  BellRing,
   Check,
   CheckCircle2,
   Edit3,
-  Heart,
   ImagePlus,
   Info,
   Loader2,
@@ -21,19 +21,36 @@ import {
   Send,
   Shield,
   Sun,
-  ThumbsUp,
   Trash2,
   X,
 } from 'lucide-react';
 import { usePlatform, type SignalChatWsEvent } from '../context/PlatformContext';
-import { apiFetch, formatLocalDateTime, uploadMediaFile } from '../lib/api';
+import { apiFetch, formatLocalDateTime, getOrCreateVisitorId, uploadMediaFile } from '../lib/api';
 import type {
   SignalChatMessage,
   SignalChatMessageType,
   SignalReactionType,
+  SignalReactionsMap,
 } from '../types';
 
 type ChannelView = 'chat' | 'completed';
+
+const REACTION_OPTIONS: Array<{
+  key: SignalReactionType;
+  emoji: string;
+  label: string;
+  activeClass: string;
+}> = [
+  { key: 'love', emoji: '❤️', label: 'Love', activeClass: 'bg-[#881337] text-white' },
+  { key: 'like', emoji: '👍', label: 'Like', activeClass: 'bg-[#15803D] text-white' },
+  { key: 'fire', emoji: '💥', label: 'Fire', activeClass: 'bg-amber-600 text-white' },
+  { key: 'hundred', emoji: '💯', label: '100', activeClass: 'bg-indigo-600 text-white' },
+  { key: 'dislike', emoji: '👎', label: 'Dislike', activeClass: 'bg-slate-700 text-white' },
+];
+
+function emptyReactions(): SignalReactionsMap {
+  return { love: 0, like: 0, fire: 0, hundred: 0, dislike: 0 };
+}
 
 const MESSAGE_TYPE_LABELS: Record<SignalChatMessageType, string> = {
   signal: 'Trading Signal',
@@ -146,6 +163,7 @@ export const SignalsPage: React.FC = () => {
     onlineCount,
     wsConnected,
     unreadCount,
+    setShowNotifModal,
     subscribeSignalChatEvents,
   } = usePlatform();
   const isAdmin = user?.role === 'admin';
@@ -205,13 +223,15 @@ export const SignalsPage: React.FC = () => {
 
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
-  const [authHintMsg, setAuthHintMsg] = useState<string | null>(null);
+  const [reactionNotice, setReactionNotice] = useState<string | null>(null);
   const [avatarFailed, setAvatarFailed] = useState(false);
 
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
   const isNearBottomRef = useRef<boolean>(true);
+  const viewerKeyRef = useRef<string | null>(null);
+  const prevUserIdRef = useRef<string | null | undefined>(undefined);
   const messageRefs = useRef<Map<string, HTMLDivElement>>(new Map());
 
   useEffect(() => {
@@ -267,6 +287,11 @@ export const SignalsPage: React.FC = () => {
     setShowScrollBottomBtn(false);
   }, []);
 
+  // Ensure persistent anonymous visitor identifier is initialized on open
+  useEffect(() => {
+    getOrCreateVisitorId();
+  }, []);
+
   // Load initial Active chat messages
   const fetchActiveMessages = useCallback(
     async (keepScrollPosition = false) => {
@@ -277,7 +302,9 @@ export const SignalsPage: React.FC = () => {
           has_more: boolean;
           counts: { active: number; completed: number };
           online_count: number;
+          viewer_key?: string | null;
         }>('/api/signals/messages?status=active&limit=40');
+        if (res.viewer_key) viewerKeyRef.current = res.viewer_key;
         setActiveMessages(res.messages);
         setPinnedMessages(res.pinned);
         setActiveHasMore(res.has_more);
@@ -307,7 +334,9 @@ export const SignalsPage: React.FC = () => {
         messages: SignalChatMessage[];
         has_more: boolean;
         counts: { active: number; completed: number };
+        viewer_key?: string | null;
       }>(`/api/signals/messages?${qs.toString()}`);
+      if (res.viewer_key) viewerKeyRef.current = res.viewer_key;
       setCompletedMessages(res.messages);
       setCompletedHasMore(res.has_more);
       setCompletedCount(res.counts.completed);
@@ -320,13 +349,26 @@ export const SignalsPage: React.FC = () => {
 
   useEffect(() => {
     fetchActiveMessages(false);
-  }, [fetchActiveMessages, user?.id]);
+  }, [fetchActiveMessages]);
+
+  useEffect(() => {
+    const curId = user?.id ?? null;
+    if (prevUserIdRef.current === undefined) {
+      prevUserIdRef.current = curId;
+      return;
+    }
+    if (prevUserIdRef.current !== curId) {
+      prevUserIdRef.current = curId;
+      fetchActiveMessages(true);
+      if (view === 'completed') fetchCompletedMessages(completedSearch);
+    }
+  }, [user?.id, view, completedSearch, fetchActiveMessages, fetchCompletedMessages]);
 
   useEffect(() => {
     if (view === 'completed') {
       fetchCompletedMessages(completedSearch);
     }
-  }, [view, completedSearch, fetchCompletedMessages, user?.id]);
+  }, [view, completedSearch, fetchCompletedMessages]);
 
   // Real-time WebSocket subscription for Signal Chat
   useEffect(() => {
@@ -391,12 +433,13 @@ export const SignalsPage: React.FC = () => {
           break;
         }
         case 'reacted': {
+          const isSelfActor = Boolean(viewerKeyRef.current && event.viewer_key === viewerKeyRef.current);
           const applyReaction = (m: SignalChatMessage): SignalChatMessage => {
             if (m.id !== event.message_id) return m;
             return {
               ...m,
               reactions: event.reactions,
-              user_reaction: user && event.actor_id === user.id ? event.reaction : m.user_reaction,
+              user_reaction: isSelfActor ? event.reaction : m.user_reaction,
             };
           };
           setActiveMessages((prev) => prev.map(applyReaction));
@@ -415,7 +458,6 @@ export const SignalsPage: React.FC = () => {
     completedSearch,
     view,
     scrollToBottom,
-    user,
   ]);
 
   const handleLoadOlderActive = useCallback(async () => {
@@ -582,22 +624,18 @@ export const SignalsPage: React.FC = () => {
   };
 
   const handleReact = async (msg: SignalChatMessage, reaction: SignalReactionType) => {
-    if (!user) {
-      setAuthHintMsg('Sign in to react with ❤️ or 👍 to MeridianFX channel messages.');
-      setTimeout(() => setAuthHintMsg(null), 4000);
-      return;
-    }
-
     const previousReaction = msg.user_reaction;
     const nextReaction: SignalReactionType | null = previousReaction === reaction ? null : reaction;
 
     const applyOptimistic = (m: SignalChatMessage): SignalChatMessage => {
       if (m.id !== msg.id) return m;
-      const counts = { ...m.reactions };
-      if (previousReaction === 'love') counts.love = Math.max(0, counts.love - 1);
-      if (previousReaction === 'like') counts.like = Math.max(0, counts.like - 1);
-      if (nextReaction === 'love') counts.love += 1;
-      if (nextReaction === 'like') counts.like += 1;
+      const counts = { ...emptyReactions(), ...m.reactions };
+      if (previousReaction && counts[previousReaction] !== undefined) {
+        counts[previousReaction] = Math.max(0, counts[previousReaction] - 1);
+      }
+      if (nextReaction && counts[nextReaction] !== undefined) {
+        counts[nextReaction] += 1;
+      }
       return { ...m, reactions: counts, user_reaction: nextReaction };
     };
 
@@ -608,12 +646,15 @@ export const SignalsPage: React.FC = () => {
     try {
       const res = await apiFetch<{
         message_id: string;
-        reactions: { love: number; like: number };
+        reactions: SignalReactionsMap;
         user_reaction: SignalReactionType | null;
+        viewer_key?: string;
       }>(`/api/signals/messages/${msg.id}/react`, {
         method: 'POST',
         body: JSON.stringify({ reaction }),
       });
+
+      if (res.viewer_key) viewerKeyRef.current = res.viewer_key;
 
       const reconcile = (m: SignalChatMessage): SignalChatMessage =>
         m.id === res.message_id
@@ -622,9 +663,14 @@ export const SignalsPage: React.FC = () => {
       setActiveMessages((prev) => prev.map(reconcile));
       setCompletedMessages((prev) => prev.map(reconcile));
       setSelectedCompleted((cur) => (cur ? reconcile(cur) : cur));
-    } catch {
+    } catch (err) {
       setActiveMessages((prev) => prev.map((m) => (m.id === msg.id ? msg : m)));
       setCompletedMessages((prev) => prev.map((m) => (m.id === msg.id ? msg : m)));
+      setSelectedCompleted((cur) => (cur?.id === msg.id ? msg : cur));
+      if (err instanceof Error && err.message) {
+        setReactionNotice(err.message);
+        setTimeout(() => setReactionNotice(null), 3000);
+      }
     }
   };
 
@@ -837,16 +883,16 @@ export const SignalsPage: React.FC = () => {
             </button>
           )}
 
-          {/* Auth Hint for Unauthenticated Reactions */}
-          {authHintMsg && (
-            <div className="px-4 py-2 bg-rose-50 dark:bg-rose-950/40 border-b border-rose-200 dark:border-rose-900/40 flex items-center justify-between gap-3 text-xs text-[#881337] dark:text-rose-300 shrink-0">
-              <span>{authHintMsg}</span>
+          {/* Rate limit / transient reaction notice */}
+          {reactionNotice && (
+            <div className="px-4 py-2 bg-amber-50 dark:bg-amber-950/40 border-b border-amber-200 dark:border-amber-900/40 flex items-center justify-between gap-3 text-xs text-amber-800 dark:text-amber-300 shrink-0">
+              <span>{reactionNotice}</span>
               <button
                 type="button"
-                onClick={() => navigate('/login')}
+                onClick={() => setReactionNotice(null)}
                 className="font-bold underline shrink-0"
               >
-                Sign In
+                Dismiss
               </button>
             </div>
           )}
@@ -1105,43 +1151,34 @@ export const SignalsPage: React.FC = () => {
                             </>
                           )}
 
-                          {/* Telegram-Style Reaction Row + Timestamp */}
-                          <div className="mt-2 flex items-center justify-between gap-2 pt-1">
-                            <div className="flex items-center gap-1.5">
-                              <button
-                                type="button"
-                                onClick={() => handleReact(msg, 'love')}
-                                aria-pressed={msg.user_reaction === 'love'}
-                                className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-semibold transition-colors min-h-[30px] ${
-                                  msg.user_reaction === 'love'
-                                    ? 'bg-[#881337] text-white'
-                                    : 'bg-slate-100 dark:bg-slate-800/90 text-slate-700 dark:text-slate-200 hover:bg-slate-200/80 dark:hover:bg-slate-700'
-                                }`}
-                              >
-                                <span aria-hidden="true">❤️</span>
-                                <span className="font-mono text-[11px] tabular-nums">
-                                  {msg.reactions.love}
-                                </span>
-                              </button>
-
-                              <button
-                                type="button"
-                                onClick={() => handleReact(msg, 'like')}
-                                aria-pressed={msg.user_reaction === 'like'}
-                                className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-semibold transition-colors min-h-[30px] ${
-                                  msg.user_reaction === 'like'
-                                    ? 'bg-[#15803D] text-white'
-                                    : 'bg-slate-100 dark:bg-slate-800/90 text-slate-700 dark:text-slate-200 hover:bg-slate-200/80 dark:hover:bg-slate-700'
-                                }`}
-                              >
-                                <span aria-hidden="true">👍</span>
-                                <span className="font-mono text-[11px] tabular-nums">
-                                  {msg.reactions.like}
-                                </span>
-                              </button>
+                          {/* Telegram-Style 5-Emoji Reaction Row + Timestamp */}
+                          <div className="mt-2 flex flex-wrap items-center justify-between gap-2 pt-1">
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              {REACTION_OPTIONS.map((opt) => {
+                                const count = msg.reactions?.[opt.key] ?? 0;
+                                const active = msg.user_reaction === opt.key;
+                                return (
+                                  <button
+                                    key={opt.key}
+                                    type="button"
+                                    onClick={() => handleReact(msg, opt.key)}
+                                    aria-pressed={active}
+                                    aria-label={`${opt.label} (${count})`}
+                                    title={opt.label}
+                                    className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-semibold transition-colors min-h-[30px] ${
+                                      active
+                                        ? opt.activeClass
+                                        : 'bg-slate-100 dark:bg-slate-800/90 text-slate-700 dark:text-slate-200 hover:bg-slate-200/80 dark:hover:bg-slate-700'
+                                    }`}
+                                  >
+                                    <span aria-hidden="true">{opt.emoji}</span>
+                                    <span className="font-mono text-[11px] tabular-nums">{count}</span>
+                                  </button>
+                                );
+                              })}
                             </div>
 
-                            <div className="flex items-center gap-1 text-[11px] font-mono text-slate-400 dark:text-slate-500 tabular-nums shrink-0">
+                            <div className="flex items-center gap-1 text-[11px] font-mono text-slate-400 dark:text-slate-500 tabular-nums shrink-0 ml-auto">
                               {msg.edited_at && <span className="font-sans">edited</span>}
                               <time dateTime={msg.created_at}>{formatChatTime(msg.created_at)}</time>
                             </div>
@@ -1420,12 +1457,15 @@ export const SignalsPage: React.FC = () => {
                         )}
                       </div>
 
-                      <div className="pt-2 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between text-xs text-slate-500">
-                        <div className="flex items-center gap-3 font-mono tabular-nums">
-                          <span>❤️ {msg.reactions.love}</span>
-                          <span>👍 {msg.reactions.like}</span>
+                      <div className="pt-2 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between gap-2 text-xs text-slate-500">
+                        <div className="flex flex-wrap items-center gap-2 font-mono tabular-nums">
+                          {REACTION_OPTIONS.map((opt) => (
+                            <span key={opt.key} title={opt.label}>
+                              {opt.emoji} {msg.reactions?.[opt.key] ?? 0}
+                            </span>
+                          ))}
                         </div>
-                        <span className="font-semibold text-[#881337] dark:text-rose-400">
+                        <span className="font-semibold text-[#881337] dark:text-rose-400 shrink-0">
                           Open details
                         </span>
                       </div>
@@ -1535,6 +1575,18 @@ export const SignalsPage: React.FC = () => {
                 <span>{theme === 'dark' ? 'Light Theme' : 'Dark Theme'}</span>
               </button>
 
+              <button
+                type="button"
+                onClick={() => {
+                  setShowChannelInfo(false);
+                  setShowNotifModal(true);
+                }}
+                className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-slate-200 dark:border-slate-700 py-2.5 font-semibold text-slate-700 dark:text-slate-200 hover:border-[#15803D]/50"
+              >
+                <BellRing className="w-3.5 h-3.5 text-[#15803D] dark:text-emerald-400" />
+                <span>Push Alerts Setup</span>
+              </button>
+
               {user && (
                 <button
                   type="button"
@@ -1621,31 +1673,28 @@ export const SignalsPage: React.FC = () => {
             )}
 
             <div className="pt-3 border-t border-slate-100 dark:border-slate-800 flex flex-wrap items-center justify-between gap-3">
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => handleReact(selectedCompleted, 'love')}
-                  className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-semibold ${
-                    selectedCompleted.user_reaction === 'love'
-                      ? 'bg-[#881337] text-white'
-                      : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200'
-                  }`}
-                >
-                  <Heart className="w-3.5 h-3.5" />
-                  <span className="font-mono tabular-nums">{selectedCompleted.reactions.love}</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => handleReact(selectedCompleted, 'like')}
-                  className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-semibold ${
-                    selectedCompleted.user_reaction === 'like'
-                      ? 'bg-[#15803D] text-white'
-                      : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200'
-                  }`}
-                >
-                  <ThumbsUp className="w-3.5 h-3.5" />
-                  <span className="font-mono tabular-nums">{selectedCompleted.reactions.like}</span>
-                </button>
+              <div className="flex flex-wrap items-center gap-1.5">
+                {REACTION_OPTIONS.map((opt) => {
+                  const count = selectedCompleted.reactions?.[opt.key] ?? 0;
+                  const active = selectedCompleted.user_reaction === opt.key;
+                  return (
+                    <button
+                      key={opt.key}
+                      type="button"
+                      onClick={() => handleReact(selectedCompleted, opt.key)}
+                      aria-pressed={active}
+                      aria-label={`${opt.label} (${count})`}
+                      className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-semibold transition-colors ${
+                        active
+                          ? opt.activeClass
+                          : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 hover:bg-slate-200/80 dark:hover:bg-slate-700'
+                      }`}
+                    >
+                      <span aria-hidden="true">{opt.emoji}</span>
+                      <span className="font-mono tabular-nums">{count}</span>
+                    </button>
+                  );
+                })}
               </div>
 
               {isAdmin && (

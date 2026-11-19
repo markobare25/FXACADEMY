@@ -104,23 +104,81 @@ export function mapDbUser(row: Record<string, unknown>): User {
   };
 }
 
-function extractUserFromRequest(req: Request): User | undefined {
+export interface AuthContext {
+  user?: User;
+  token?: string;
+  source?: 'bearer' | 'cookie';
+  expiresAt?: number;
+}
+
+export function signVisitorCookie(visitorId: string): string {
+  const sig = base64UrlEncode(
+    crypto.createHmac('sha256', getJwtSecret()).update(`vid:${visitorId}`).digest()
+  );
+  return `${visitorId}.${sig}`;
+}
+
+export function verifyVisitorCookie(cookieValue?: string): string | null {
+  if (!cookieValue) return null;
+  const parts = cookieValue.split('.');
+  if (parts.length !== 2) return null;
+  const [visitorId, sig] = parts;
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(visitorId)) {
+    return null;
+  }
+  const expected = base64UrlEncode(
+    crypto.createHmac('sha256', getJwtSecret()).update(`vid:${visitorId}`).digest()
+  );
+  const sigBuf = Buffer.from(sig);
+  const expBuf = Buffer.from(expected);
+  if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+    return null;
+  }
+  return visitorId;
+}
+
+export function extractAuthContext(req: Request): AuthContext {
   const cookies = parseCookies(req.headers.cookie);
   const authHeader = req.headers.authorization;
-  const token =
-    authHeader && authHeader.startsWith('Bearer ')
-      ? authHeader.slice(7).trim()
-      : cookies['mfx_session'];
-  if (!token) return undefined;
+  const rawBearer =
+    authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+  const bearerToken =
+    rawBearer && rawBearer !== 'null' && rawBearer !== 'undefined' ? rawBearer : '';
+  const cookieToken =
+    cookies['mfx_session'] &&
+    cookies['mfx_session'] !== 'null' &&
+    cookies['mfx_session'] !== 'undefined'
+      ? cookies['mfx_session']
+      : '';
 
-  const claims = verifyToken(token);
-  if (!claims) return undefined;
+  const candidates: Array<{ token: string; source: 'bearer' | 'cookie' }> = [];
+  if (bearerToken) candidates.push({ token: bearerToken, source: 'bearer' });
+  if (cookieToken && cookieToken !== bearerToken) {
+    candidates.push({ token: cookieToken, source: 'cookie' });
+  }
 
-  const row = db
-    .prepare('SELECT * FROM users WHERE id = ?')
-    .get(claims.sub) as Record<string, unknown> | undefined;
-  if (!row || row.status === 'suspended') return undefined;
-  return mapDbUser(row);
+  for (const candidate of candidates) {
+    const claims = verifyToken(candidate.token);
+    if (!claims) continue;
+
+    const row = db
+      .prepare('SELECT * FROM users WHERE id = ?')
+      .get(claims.sub) as Record<string, unknown> | undefined;
+    if (!row || row.status === 'suspended') continue;
+
+    return {
+      user: mapDbUser(row),
+      token: candidate.token,
+      source: candidate.source,
+      expiresAt: claims.exp,
+    };
+  }
+
+  return {};
+}
+
+function extractUserFromRequest(req: Request): User | undefined {
+  return extractAuthContext(req).user;
 }
 
 export function optionalAuth(req: AuthRequest, _res: Response, next: NextFunction): void {

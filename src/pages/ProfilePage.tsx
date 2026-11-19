@@ -11,7 +11,7 @@ import { PWAInstallButton } from '../components/PWAInstallButton';
 import type { NotificationPreferences } from '../types';
 
 export const ProfilePage: React.FC = () => {
-  const { user, setUser, navigate, logout, theme, toggleTheme } = usePlatform();
+  const { user, authLoading, setUser, navigate, logout, theme, toggleTheme } = usePlatform();
   const [name, setName] = useState(user?.name || '');
   const [bio, setBio] = useState(user?.bio || '');
   const [timezone, setTimezone] = useState(user?.timezone || 'UTC');
@@ -46,6 +46,14 @@ export const ProfilePage: React.FC = () => {
       .catch(() => undefined);
     getCurrentPushSubscription().then((s) => setPushSubscribed(Boolean(s)));
   }, [user]);
+
+  if (authLoading && !user) {
+    return (
+      <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-8 text-center text-sm text-slate-500">
+        Loading profile...
+      </div>
+    );
+  }
 
   if (!user) {
     return (

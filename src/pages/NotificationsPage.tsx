@@ -6,6 +6,7 @@ import { apiFetch, formatLocalDateTime } from '../lib/api';
 export const NotificationsPage: React.FC = () => {
   const {
     user,
+    authLoading,
     notifications,
     unreadCount,
     refreshNotifications,
@@ -13,6 +14,14 @@ export const NotificationsPage: React.FC = () => {
     setShowNotifModal,
   } = usePlatform();
   const [filter, setFilter] = useState<'all' | 'unread'>('all');
+
+  if (authLoading && !user) {
+    return (
+      <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-8 text-center text-sm text-slate-500">
+        Loading notifications...
+      </div>
+    );
+  }
 
   if (!user) {
     return (

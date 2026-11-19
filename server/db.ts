@@ -162,13 +162,17 @@ export function initDatabase(): void {
 
     CREATE TABLE IF NOT EXISTS signal_message_reactions (
       message_id TEXT NOT NULL,
-      user_id TEXT NOT NULL,
-      reaction TEXT NOT NULL CHECK (reaction IN ('love', 'like')),
+      actor_key TEXT NOT NULL,
+      user_id TEXT,
+      visitor_id TEXT,
+      reaction TEXT NOT NULL CHECK (reaction IN ('love', 'like', 'fire', 'hundred', 'dislike')),
       created_at TEXT NOT NULL,
-      PRIMARY KEY (message_id, user_id),
-      FOREIGN KEY (message_id) REFERENCES signal_messages(id) ON DELETE CASCADE,
-      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      PRIMARY KEY (message_id, actor_key),
+      FOREIGN KEY (message_id) REFERENCES signal_messages(id) ON DELETE CASCADE
     );
+
+    CREATE INDEX IF NOT EXISTS idx_signal_reactions_msg
+      ON signal_message_reactions(message_id);
 
     CREATE TABLE IF NOT EXISTS market_updates (
       id TEXT PRIMARY KEY,
@@ -499,6 +503,39 @@ export function initDatabase(): void {
   ensureColumn('lesson_progress', 'needs_review', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('lesson_progress', 'needs_review_note', 'TEXT');
   ensureColumn('users', 'needs_password_setup', 'INTEGER NOT NULL DEFAULT 0');
+
+  // Migrate legacy signal_message_reactions table (2 reactions + user_id PK) to 5-reaction public actor_key schema
+  const reactionTableMeta = db
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'signal_message_reactions'")
+    .get() as { sql?: string } | undefined;
+
+  if (
+    reactionTableMeta?.sql &&
+    (!reactionTableMeta.sql.includes('actor_key') || !reactionTableMeta.sql.includes("'fire'"))
+  ) {
+    const migrateReactions = db.transaction(() => {
+      db.exec(`
+        CREATE TABLE signal_message_reactions_migrated (
+          message_id TEXT NOT NULL,
+          actor_key TEXT NOT NULL,
+          user_id TEXT,
+          visitor_id TEXT,
+          reaction TEXT NOT NULL CHECK (reaction IN ('love', 'like', 'fire', 'hundred', 'dislike')),
+          created_at TEXT NOT NULL,
+          PRIMARY KEY (message_id, actor_key),
+          FOREIGN KEY (message_id) REFERENCES signal_messages(id) ON DELETE CASCADE
+        );
+        INSERT INTO signal_message_reactions_migrated (message_id, actor_key, user_id, visitor_id, reaction, created_at)
+        SELECT message_id, 'user:' || user_id, user_id, NULL, reaction, created_at
+        FROM signal_message_reactions
+        WHERE reaction IN ('love', 'like', 'fire', 'hundred', 'dislike');
+        DROP TABLE signal_message_reactions;
+        ALTER TABLE signal_message_reactions_migrated RENAME TO signal_message_reactions;
+        CREATE INDEX IF NOT EXISTS idx_signal_reactions_msg ON signal_message_reactions(message_id);
+      `);
+    });
+    migrateReactions();
+  }
 
   // Migrate legacy dark hero image references to the bright daylight desk asset
   db.prepare(

@@ -4,12 +4,51 @@ import { usePlatform } from '../context/PlatformContext';
 import { apiFetch } from '../lib/api';
 
 export const LoginPage: React.FC = () => {
-  const { login, navigate } = usePlatform();
+  const { user, authLoading, login, logout, navigate } = usePlatform();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  if (!authLoading && user) {
+    return (
+      <div className="mx-auto max-w-md py-10">
+        <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-6 sm:p-8 space-y-4 text-center">
+          <CheckCircle2 className="w-10 h-10 text-[#15803D] dark:text-emerald-400 mx-auto" />
+          <div>
+            <h1 className="text-xl font-bold text-slate-900 dark:text-white">Already Signed In</h1>
+            <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+              Signed in as <span className="font-semibold text-slate-800 dark:text-slate-200">{user.name}</span> ({user.email})
+            </p>
+          </div>
+          <div className="flex flex-col gap-2.5 pt-2">
+            <button
+              type="button"
+              onClick={() => navigate('/signals')}
+              className="w-full rounded-lg bg-[#881337] py-2.5 text-sm font-semibold text-white hover:bg-[#6B0F2B] min-h-[44px]"
+            >
+              Open Signals Channel
+            </button>
+            <button
+              type="button"
+              onClick={() => navigate(user.role === 'admin' ? '/admin' : '/dashboard')}
+              className="w-full rounded-lg border border-slate-300 dark:border-slate-700 py-2.5 text-sm font-medium text-slate-800 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 min-h-[44px]"
+            >
+              {user.role === 'admin' ? 'Open Admin Desk' : 'Open Dashboard'}
+            </button>
+            <button
+              type="button"
+              onClick={() => logout()}
+              className="text-xs font-medium text-slate-500 hover:text-red-600 py-1.5"
+            >
+              Sign Out & Switch Account
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -115,13 +154,52 @@ export const LoginPage: React.FC = () => {
 };
 
 export const RegisterPage: React.FC = () => {
-  const { register, navigate } = usePlatform();
+  const { user, authLoading, register, logout, navigate } = usePlatform();
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  if (!authLoading && user) {
+    return (
+      <div className="mx-auto max-w-md py-10">
+        <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-6 sm:p-8 space-y-4 text-center">
+          <CheckCircle2 className="w-10 h-10 text-[#15803D] dark:text-emerald-400 mx-auto" />
+          <div>
+            <h1 className="text-xl font-bold text-slate-900 dark:text-white">Account Active</h1>
+            <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+              You are already signed in as <span className="font-semibold text-slate-800 dark:text-slate-200">{user.name}</span>.
+            </p>
+          </div>
+          <div className="flex flex-col gap-2.5 pt-2">
+            <button
+              type="button"
+              onClick={() => navigate('/signals')}
+              className="w-full rounded-lg bg-[#881337] py-2.5 text-sm font-semibold text-white hover:bg-[#6B0F2B] min-h-[44px]"
+            >
+              Open Signals Channel
+            </button>
+            <button
+              type="button"
+              onClick={() => navigate('/dashboard')}
+              className="w-full rounded-lg border border-slate-300 dark:border-slate-700 py-2.5 text-sm font-medium text-slate-800 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 min-h-[44px]"
+            >
+              Open Dashboard
+            </button>
+            <button
+              type="button"
+              onClick={() => logout()}
+              className="text-xs font-medium text-slate-500 hover:text-red-600 py-1.5"
+            >
+              Sign Out to Register Another Account
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -142,7 +220,7 @@ export const RegisterPage: React.FC = () => {
       <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-6 sm:p-8">
         <h1 className="text-2xl font-bold text-slate-900 dark:text-white">Create Trader Account</h1>
         <p className="mt-1.5 text-sm text-slate-500 dark:text-slate-400">
-          Register once to access live signals, study Academy modules, and sign in from any device.
+          Optional free membership to track Academy progress, save watchlists, and sync alerts across devices. Signals are open to everyone without registration.
         </p>
 
         <form onSubmit={handleSubmit} className="mt-6 space-y-4">

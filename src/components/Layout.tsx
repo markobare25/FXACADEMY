@@ -26,6 +26,7 @@ interface LayoutProps {
 export const Layout: React.FC<LayoutProps> = ({ children }) => {
   const {
     user,
+    authLoading,
     theme,
     toggleTheme,
     route,
@@ -36,7 +37,7 @@ export const Layout: React.FC<LayoutProps> = ({ children }) => {
   } = usePlatform();
   const isOnline = useOnlineStatus();
 
-  const isLanding = route === '/' && !user;
+  const isLanding = route === '/' && !user && !authLoading;
   const isSignalsRoute = route === '/signals';
 
   const navItems = [

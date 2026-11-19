@@ -1,5 +1,12 @@
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
-import { apiFetch, setStoredToken } from '../lib/api';
+import {
+  TOKEN_KEY,
+  apiFetch,
+  getCachedUser,
+  getStoredToken,
+  setCachedUser,
+  setStoredToken,
+} from '../lib/api';
 import type {
   AcademyResumeState,
   AppNotification,
@@ -9,6 +16,7 @@ import type {
   PublicStats,
   SignalChatMessage,
   SignalReactionType,
+  SignalReactionsMap,
   TradingSignal,
   User,
 } from '../types';
@@ -20,8 +28,8 @@ export type SignalChatWsEvent =
   | {
       type: 'reacted';
       message_id: string;
-      reactions: { love: number; like: number };
-      actor_id: string;
+      reactions: SignalReactionsMap;
+      viewer_key: string;
       reaction: SignalReactionType | null;
     }
   | { type: 'reconnected' };
@@ -98,7 +106,7 @@ export function usePlatform(): PlatformContextValue {
 const OFFLINE_CACHE_KEY = 'mfx_offline_snapshot_v1';
 
 export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [user, setUser] = useState<User | null>(null);
+  const [user, setUser] = useState<User | null>(() => (getStoredToken() ? getCachedUser() : null));
   const [authLoading, setAuthLoading] = useState(true);
   const [theme, setTheme] = useState<'dark' | 'light'>(() => {
     try {
@@ -124,6 +132,7 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<number | null>(null);
   const hasConnectedOnceRef = useRef<boolean>(false);
+  const authEpochRef = useRef<number>(0);
   const signalChatListenersRef = useRef<Set<(event: SignalChatWsEvent) => void>>(new Set());
 
   const subscribeSignalChatEvents = useCallback((listener: (event: SignalChatWsEvent) => void) => {
@@ -159,6 +168,13 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     }
   }, [theme]);
 
+  // Keep cached user profile aligned after initial auth check resolves
+  useEffect(() => {
+    if (!authLoading) {
+      setCachedUser(user);
+    }
+  }, [user, authLoading]);
+
   const toggleTheme = useCallback(() => {
     setTheme((t) => (t === 'dark' ? 'light' : 'dark'));
   }, []);
@@ -192,23 +208,15 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     }
   }, []);
 
-  const refreshAll = useCallback(async (skipAuthCheck = false) => {
+  const refreshPublicData = useCallback(async () => {
     try {
-      const mePromise = skipAuthCheck
-        ? Promise.resolve(null)
-        : apiFetch<{ user: User | null }>('/api/auth/me').catch(() => null);
-
-      const [meRes, settingsRes, sigRes, updRes, acadRes] = await Promise.all([
-        mePromise,
+      const [settingsRes, sigRes, updRes, acadRes] = await Promise.all([
         apiFetch<{ settings: PlatformSettings; stats: PublicStats }>('/api/settings'),
         apiFetch<{ signals: TradingSignal[] }>('/api/signals'),
         apiFetch<{ updates: MarketUpdate[] }>('/api/updates'),
         apiFetch<{ courses: Course[]; resume_state?: AcademyResumeState | null }>('/api/academy/courses'),
       ]);
 
-      if (meRes !== null) {
-        setUser(meRes.user);
-      }
       setSettings(settingsRes.settings);
       setStats(settingsRes.stats);
       setSignals(sigRes.signals);
@@ -234,12 +242,7 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       } catch {
         // ignore quota limits
       }
-
-      if (meRes?.user) {
-        await refreshNotifications();
-      }
     } catch {
-      // Load cached snapshot if offline
       try {
         const cached = localStorage.getItem(OFFLINE_CACHE_KEY);
         if (cached) {
@@ -259,16 +262,74 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       } catch {
         // ignore
       }
+    }
+  }, []);
+
+  const initializeAuth = useCallback(async () => {
+    const epoch = authEpochRef.current;
+    try {
+      const meRes = await apiFetch<{ user: User | null; session_token?: string }>('/api/auth/me');
+      if (authEpochRef.current !== epoch) return;
+
+      if (meRes.user) {
+        if (meRes.session_token) {
+          setStoredToken(meRes.session_token);
+        }
+        setUser(meRes.user);
+        setCachedUser(meRes.user);
+        await refreshNotifications();
+      } else {
+        setStoredToken(null);
+        setCachedUser(null);
+        setUser(null);
+        setNotifications([]);
+        setUnreadCount(0);
+      }
+    } catch {
+      // Network or transient server error: preserve cached user if token still exists
+      if (authEpochRef.current === epoch) {
+        const cached = getStoredToken() ? getCachedUser() : null;
+        if (cached) {
+          setUser(cached);
+        }
+      }
     } finally {
-      setAuthLoading(false);
+      if (authEpochRef.current === epoch) {
+        setAuthLoading(false);
+      }
     }
   }, [refreshNotifications]);
 
-  useEffect(() => {
-    refreshAll();
-  }, [refreshAll]);
+  const refreshAll = useCallback(async () => {
+    await refreshPublicData();
+  }, [refreshPublicData]);
 
-  // Real-Time WebSocket Sync with auto-reconnect
+  useEffect(() => {
+    initializeAuth();
+    refreshPublicData();
+  }, [initializeAuth, refreshPublicData]);
+
+  // Synchronize auth state across open browser tabs without redirect loops
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key !== TOKEN_KEY || e.newValue === e.oldValue) return;
+      if (!e.newValue) {
+        authEpochRef.current += 1;
+        setCachedUser(null);
+        setUser(null);
+        setResumeState(null);
+        setNotifications([]);
+        setUnreadCount(0);
+        setAuthLoading(false);
+      } else {
+        initializeAuth();
+      }
+    };
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, [initializeAuth]);
+
+  // Real-Time WebSocket Sync with auto-reconnect (never resets auth state)
   useEffect(() => {
     let active = true;
 
@@ -321,8 +382,8 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
             case 'signals_chat:reacted': {
               const payload = msg.data as {
                 message_id: string;
-                reactions: { love: number; like: number };
-                actor_id: string;
+                reactions: SignalReactionsMap;
+                viewer_key: string;
                 reaction: SignalReactionType | null;
               };
               emitSignalChatEvent({ type: 'reacted', ...payload });
@@ -407,7 +468,7 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         if (!active) return;
         reconnectTimer.current = window.setTimeout(() => {
           connect();
-          refreshAll();
+          refreshPublicData();
         }, 3000);
       };
     };
@@ -418,20 +479,24 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
       wsRef.current?.close();
     };
-  }, [refreshAll, refreshNotifications, emitSignalChatEvent]);
+  }, [refreshPublicData, refreshNotifications, emitSignalChatEvent]);
 
   const login = async (email: string, password: string): Promise<User> => {
+    authEpochRef.current += 1;
     const res = await apiFetch<{ user: User; token: string }>('/api/auth/login', {
       method: 'POST',
       body: JSON.stringify({ email: email.trim().toLowerCase(), password }),
     });
     setStoredToken(res.token);
+    setCachedUser(res.user);
     setUser(res.user);
-    await Promise.all([refreshAll(true), refreshNotifications()]);
+    setAuthLoading(false);
+    await Promise.all([refreshPublicData(), refreshNotifications()]);
     return res.user;
   };
 
   const register = async (name: string, email: string, password: string) => {
+    authEpochRef.current += 1;
     const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
     const res = await apiFetch<{ user: User; token: string; verification_code?: string }>(
       '/api/auth/register',
@@ -446,20 +511,25 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       }
     );
     setStoredToken(res.token);
+    setCachedUser(res.user);
     setUser(res.user);
-    await Promise.all([refreshAll(true), refreshNotifications()]);
+    setAuthLoading(false);
+    await Promise.all([refreshPublicData(), refreshNotifications()]);
     return { user: res.user, verification_code: res.verification_code };
   };
 
   const logout = async () => {
+    authEpochRef.current += 1;
     await apiFetch('/api/auth/logout', { method: 'POST' }).catch(() => undefined);
     setStoredToken(null);
+    setCachedUser(null);
     try {
       localStorage.removeItem('mfx_token');
     } catch {
       // ignore
     }
     setUser(null);
+    setAuthLoading(false);
     setResumeState(null);
     setNotifications([]);
     setUnreadCount(0);

@@ -21,17 +21,27 @@ import {
 } from './server/db.ts';
 import {
   type AuthRequest,
+  extractAuthContext,
   logUserActivity,
   mapDbUser,
   optionalAuth,
+  parseCookies,
   rateLimit,
   requireAuth,
   requireRole,
   signToken,
+  signVisitorCookie,
+  verifyVisitorCookie,
 } from './server/auth.ts';
 import { dispatchNotification, ensureVapidKeys } from './server/push.ts';
 import { getEconomicCalendar, getMarketCandles, getMarketQuotes } from './server/markets.ts';
-import type { NotificationPreferences, PlatformSettings, PublicStats } from './src/types.ts';
+import type {
+  NotificationPreferences,
+  PlatformSettings,
+  PublicStats,
+  SignalReactionType,
+  SignalReactionsMap,
+} from './src/types.ts';
 
 initDatabase();
 ensureVapidKeys();
@@ -123,7 +133,7 @@ const upload = multer({
 
 function isHttpsRequest(req: Request): boolean {
   const proto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
-  return req.secure || proto === 'https' || process.env.NODE_ENV === 'production';
+  return Boolean(req.secure || proto === 'https');
 }
 
 function setSessionCookie(req: Request, res: Response, token: string): void {
@@ -370,8 +380,34 @@ app.post('/api/auth/logout', optionalAuth, (req: AuthRequest, res: Response) => 
   res.json({ ok: true });
 });
 
-app.get('/api/auth/me', optionalAuth, (req: AuthRequest, res: Response) => {
-  res.json({ user: req.user || null });
+app.get('/api/auth/me', (req: Request, res: Response) => {
+  const ctx = extractAuthContext(req);
+  if (!ctx.user) {
+    res.json({ user: null });
+    return;
+  }
+
+  let syncToken: string | undefined;
+  const nowSec = Math.floor(Date.now() / 1000);
+  const needsSlidingRefresh = Boolean(ctx.expiresAt && ctx.expiresAt - nowSec < 7 * 24 * 60 * 60);
+
+  if (needsSlidingRefresh) {
+    syncToken = signToken({ sub: ctx.user.id, role: ctx.user.role }, 60 * 60 * 24 * 30);
+    setSessionCookie(req, res, syncToken);
+  } else if (ctx.source === 'bearer' && ctx.token) {
+    const cookies = parseCookies(req.headers.cookie);
+    if (!cookies['mfx_session']) {
+      setSessionCookie(req, res, ctx.token);
+    }
+  } else if (ctx.source === 'cookie' && ctx.token) {
+    // Provide token so clients whose localStorage was cleared (e.g. PWA restart) re-sync cleanly
+    syncToken = ctx.token;
+  }
+
+  res.json({
+    user: ctx.user,
+    ...(syncToken ? { session_token: syncToken } : {}),
+  });
 });
 
 app.post('/api/auth/verify-email', (req: Request, res: Response) => {
@@ -641,8 +677,81 @@ app.delete('/api/users/account', requireAuth, (req: AuthRequest, res: Response) 
 
 // ---------- Signals Community Chat (Active Live Stream & Completed Archive) ----------
 const recentSignalChatDedup = new Map<string, number>();
+const reactionBurstBuckets = new Map<string, number[]>();
+const REACTION_TYPES: readonly SignalReactionType[] = ['love', 'like', 'fire', 'hundred', 'dislike'];
+const UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-function hydrateSignalMessages(rows: Array<Record<string, unknown>>, userId?: string) {
+function emptyReactions(): SignalReactionsMap {
+  return { love: 0, like: 0, fire: 0, hundred: 0, dislike: 0 };
+}
+
+function hashActorKey(actorKey: string): string {
+  return crypto.createHash('sha256').update(actorKey).digest('hex').slice(0, 24);
+}
+
+function resolveReactionActor(
+  req: AuthRequest,
+  res: Response,
+  issueCookieIfMissing: boolean
+): { actorKey: string; userId: string | null; visitorId: string | null } | null {
+  if (req.user) {
+    return {
+      actorKey: `user:${req.user.id}`,
+      userId: req.user.id,
+      visitorId: null,
+    };
+  }
+
+  const cookies = parseCookies(req.headers.cookie);
+  const signedVisitorId = verifyVisitorCookie(cookies['mfx_vid']);
+  const headerVisitorRaw = String(req.headers['x-visitor-id'] || '').trim();
+  const validHeaderVisitor = UUID_V4_RE.test(headerVisitorRaw) ? headerVisitorRaw.toLowerCase() : null;
+
+  let visitorId = signedVisitorId || validHeaderVisitor;
+  if (!visitorId && issueCookieIfMissing) {
+    visitorId = crypto.randomUUID();
+  }
+  if (!visitorId) {
+    return null;
+  }
+
+  if (issueCookieIfMissing && signedVisitorId !== visitorId) {
+    const isHttps = isHttpsRequest(req);
+    res.cookie('mfx_vid', signVisitorCookie(visitorId), {
+      httpOnly: true,
+      sameSite: isHttps ? 'none' : 'lax',
+      secure: isHttps,
+      maxAge: 365 * 24 * 60 * 60 * 1000,
+      path: '/',
+    });
+  }
+
+  return {
+    actorKey: `visitor:${visitorId}`,
+    userId: null,
+    visitorId,
+  };
+}
+
+function checkReactionBurst(actorKey: string, ip: string): boolean {
+  const now = Date.now();
+  const bucketKey = `${actorKey}|${ip}`;
+  const recent = (reactionBurstBuckets.get(bucketKey) || []).filter((ts) => now - ts < 15_000);
+  if (recent.length >= 15) {
+    reactionBurstBuckets.set(bucketKey, recent);
+    return false;
+  }
+  recent.push(now);
+  reactionBurstBuckets.set(bucketKey, recent);
+  if (reactionBurstBuckets.size > 5000) {
+    for (const [k, list] of reactionBurstBuckets.entries()) {
+      if (list.every((ts) => now - ts >= 15_000)) reactionBurstBuckets.delete(k);
+    }
+  }
+  return true;
+}
+
+function hydrateSignalMessages(rows: Array<Record<string, unknown>>, actorKey?: string | null) {
   if (rows.length === 0) return [];
 
   const messageIds = rows.map((r) => String(r.id));
@@ -655,27 +764,30 @@ function hydrateSignalMessages(rows: Array<Record<string, unknown>>, userId?: st
        WHERE message_id IN (${placeholders})
        GROUP BY message_id, reaction`
     )
-    .all(...messageIds) as Array<{ message_id: string; reaction: 'love' | 'like'; cnt: number }>;
+    .all(...messageIds) as Array<{ message_id: string; reaction: SignalReactionType; cnt: number }>;
 
-  const reactMap = new Map<string, { love: number; like: number }>();
+  const reactMap = new Map<string, SignalReactionsMap>();
   for (const r of reactRows) {
-    const cur = reactMap.get(r.message_id) || { love: 0, like: 0 };
-    if (r.reaction === 'love') cur.love = r.cnt;
-    if (r.reaction === 'like') cur.like = r.cnt;
+    const cur = reactMap.get(r.message_id) || emptyReactions();
+    if (REACTION_TYPES.includes(r.reaction)) {
+      cur[r.reaction] = r.cnt;
+    }
     reactMap.set(r.message_id, cur);
   }
 
-  const userReactMap = new Map<string, 'love' | 'like'>();
-  if (userId) {
+  const userReactMap = new Map<string, SignalReactionType>();
+  if (actorKey) {
     const uRows = db
       .prepare(
         `SELECT message_id, reaction
          FROM signal_message_reactions
-         WHERE user_id = ? AND message_id IN (${placeholders})`
+         WHERE actor_key = ? AND message_id IN (${placeholders})`
       )
-      .all(userId, ...messageIds) as Array<{ message_id: string; reaction: 'love' | 'like' }>;
+      .all(actorKey, ...messageIds) as Array<{ message_id: string; reaction: SignalReactionType }>;
     for (const ur of uRows) {
-      userReactMap.set(ur.message_id, ur.reaction);
+      if (REACTION_TYPES.includes(ur.reaction)) {
+        userReactMap.set(ur.message_id, ur.reaction);
+      }
     }
   }
 
@@ -693,7 +805,7 @@ function hydrateSignalMessages(rows: Array<Record<string, unknown>>, userId?: st
     completed_at: row.completed_at ? String(row.completed_at) : null,
     completed_summary: row.completed_summary ? String(row.completed_summary) : null,
     created_at: String(row.created_at),
-    reactions: reactMap.get(String(row.id)) || { love: 0, like: 0 },
+    reactions: reactMap.get(String(row.id)) || emptyReactions(),
     user_reaction: userReactMap.get(String(row.id)) || null,
   }));
 }
@@ -746,15 +858,18 @@ app.get('/api/signals/messages', optionalAuth, (req: AuthRequest, res: Response)
     db.prepare("SELECT COUNT(*) as c FROM signal_messages WHERE status = 'completed'").get() as { c: number }
   ).c;
 
+  const actor = resolveReactionActor(req, res, false);
+
   res.json({
-    messages: hydrateSignalMessages(ordered, req.user?.id),
-    pinned: hydrateSignalMessages(pinnedRows, req.user?.id),
+    messages: hydrateSignalMessages(ordered, actor?.actorKey),
+    pinned: hydrateSignalMessages(pinnedRows, actor?.actorKey),
     has_more: hasMore,
     counts: {
       active: activeCount,
       completed: completedCount,
     },
     online_count: wsClients.size,
+    viewer_key: actor ? hashActorKey(actor.actorKey) : null,
   });
 });
 
@@ -819,7 +934,7 @@ app.post('/api/signals/messages', requireRole('admin'), async (req: AuthRequest,
   );
 
   const row = db.prepare('SELECT * FROM signal_messages WHERE id = ?').get(id) as Record<string, unknown>;
-  const hydrated = hydrateSignalMessages([row], req.user!.id)[0];
+  const hydrated = hydrateSignalMessages([row], `user:${req.user!.id}`)[0];
 
   broadcastWs('signals_chat:created', hydrated);
 
@@ -920,7 +1035,7 @@ app.patch('/api/signals/messages/:id', requireRole('admin'), (req: AuthRequest, 
     string,
     unknown
   >;
-  const hydrated = hydrateSignalMessages([updatedRow], req.user!.id)[0];
+  const hydrated = hydrateSignalMessages([updatedRow], `user:${req.user!.id}`)[0];
 
   broadcastWs('signals_chat:updated', hydrated);
   res.json({ message: hydrated });
@@ -940,74 +1055,102 @@ app.delete('/api/signals/messages/:id', requireRole('admin'), (req: AuthRequest,
   res.json({ ok: true });
 });
 
-app.post('/api/signals/messages/:id/react', requireAuth, (req: AuthRequest, res: Response) => {
-  const schema = z.object({
-    reaction: z.enum(['love', 'like']).nullable(),
-  });
-  const parsed = schema.safeParse(req.body);
-  if (!parsed.success) {
-    res.status(400).json({ error: 'Valid reaction (love or like) is required.' });
-    return;
+app.post(
+  '/api/signals/messages/:id/react',
+  optionalAuth,
+  rateLimit(45, 60_000),
+  (req: AuthRequest, res: Response) => {
+    const schema = z.object({
+      reaction: z.enum(['love', 'like', 'fire', 'hundred', 'dislike']).nullable(),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: 'Valid reaction (love, like, fire, hundred, or dislike) is required.' });
+      return;
+    }
+
+    const msg = db.prepare('SELECT id FROM signal_messages WHERE id = ?').get(req.params.id) as
+      | { id: string }
+      | undefined;
+    if (!msg) {
+      res.status(404).json({ error: 'Message not found.' });
+      return;
+    }
+
+    const actor = resolveReactionActor(req, res, true);
+    if (!actor) {
+      res.status(400).json({ error: 'Unable to establish visitor session.' });
+      return;
+    }
+
+    if (!checkReactionBurst(actor.actorKey, req.ip || 'unknown')) {
+      res.status(429).json({ error: 'Too many reaction updates. Please wait a few seconds.' });
+      return;
+    }
+
+    const existing = db
+      .prepare('SELECT reaction FROM signal_message_reactions WHERE message_id = ? AND actor_key = ?')
+      .get(req.params.id, actor.actorKey) as { reaction: SignalReactionType } | undefined;
+
+    let nextUserReaction: SignalReactionType | null = null;
+    if (parsed.data.reaction === null || (existing && existing.reaction === parsed.data.reaction)) {
+      db.prepare('DELETE FROM signal_message_reactions WHERE message_id = ? AND actor_key = ?').run(
+        req.params.id,
+        actor.actorKey
+      );
+      nextUserReaction = null;
+    } else {
+      db.prepare(
+        `INSERT INTO signal_message_reactions (message_id, actor_key, user_id, visitor_id, reaction, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(message_id, actor_key) DO UPDATE SET
+           user_id = COALESCE(excluded.user_id, signal_message_reactions.user_id),
+           visitor_id = COALESCE(excluded.visitor_id, signal_message_reactions.visitor_id),
+           reaction = excluded.reaction,
+           created_at = excluded.created_at`
+      ).run(
+        req.params.id,
+        actor.actorKey,
+        actor.userId,
+        actor.visitorId,
+        parsed.data.reaction,
+        new Date().toISOString()
+      );
+      nextUserReaction = parsed.data.reaction;
+    }
+
+    const counts = db
+      .prepare(
+        `SELECT reaction, COUNT(*) as cnt
+         FROM signal_message_reactions
+         WHERE message_id = ?
+         GROUP BY reaction`
+      )
+      .all(req.params.id) as Array<{ reaction: SignalReactionType; cnt: number }>;
+
+    const reactions = emptyReactions();
+    for (const c of counts) {
+      if (REACTION_TYPES.includes(c.reaction)) {
+        reactions[c.reaction] = c.cnt;
+      }
+    }
+
+    const viewerKey = hashActorKey(actor.actorKey);
+    broadcastWs('signals_chat:reacted', {
+      message_id: String(req.params.id),
+      reactions,
+      viewer_key: viewerKey,
+      reaction: nextUserReaction,
+    });
+
+    res.json({
+      message_id: String(req.params.id),
+      reactions,
+      user_reaction: nextUserReaction,
+      viewer_key: viewerKey,
+    });
   }
-
-  const msg = db.prepare('SELECT id FROM signal_messages WHERE id = ?').get(req.params.id) as
-    | { id: string }
-    | undefined;
-  if (!msg) {
-    res.status(404).json({ error: 'Message not found.' });
-    return;
-  }
-
-  const existing = db
-    .prepare('SELECT reaction FROM signal_message_reactions WHERE message_id = ? AND user_id = ?')
-    .get(req.params.id, req.user!.id) as { reaction: 'love' | 'like' } | undefined;
-
-  let nextUserReaction: 'love' | 'like' | null = null;
-  if (parsed.data.reaction === null || (existing && existing.reaction === parsed.data.reaction)) {
-    db.prepare('DELETE FROM signal_message_reactions WHERE message_id = ? AND user_id = ?').run(
-      req.params.id,
-      req.user!.id
-    );
-    nextUserReaction = null;
-  } else {
-    db.prepare(
-      `INSERT INTO signal_message_reactions (message_id, user_id, reaction, created_at)
-       VALUES (?, ?, ?, ?)
-       ON CONFLICT(message_id, user_id) DO UPDATE SET
-         reaction = excluded.reaction,
-         created_at = excluded.created_at`
-    ).run(req.params.id, req.user!.id, parsed.data.reaction, new Date().toISOString());
-    nextUserReaction = parsed.data.reaction;
-  }
-
-  const counts = db
-    .prepare(
-      `SELECT reaction, COUNT(*) as cnt
-       FROM signal_message_reactions
-       WHERE message_id = ?
-       GROUP BY reaction`
-    )
-    .all(req.params.id) as Array<{ reaction: 'love' | 'like'; cnt: number }>;
-
-  const reactions = { love: 0, like: 0 };
-  for (const c of counts) {
-    if (c.reaction === 'love') reactions.love = c.cnt;
-    if (c.reaction === 'like') reactions.like = c.cnt;
-  }
-
-  broadcastWs('signals_chat:reacted', {
-    message_id: String(req.params.id),
-    reactions,
-    actor_id: req.user!.id,
-    reaction: nextUserReaction,
-  });
-
-  res.json({
-    message_id: String(req.params.id),
-    reactions,
-    user_reaction: nextUserReaction,
-  });
-});
+);
 
 // ---------- Legacy Structured Trading Signals (Home / Dashboard summary compatibility) ----------
 function hydrateSignals(rows: Array<Record<string, unknown>>) {
@@ -2885,6 +3028,150 @@ app.get('/api/admin/users', requireRole('admin'), (_req: Request, res: Response)
     Record<string, unknown>
   >;
   res.json({ users: rows.map(mapDbUser) });
+});
+
+function buildRegistrationAnalytics() {
+  const rows = db
+    .prepare('SELECT * FROM users WHERE LOWER(email) != ? ORDER BY created_at DESC')
+    .all(DESIGNATED_ADMIN_EMAIL) as Array<Record<string, unknown>>;
+
+  const records = rows.map(mapDbUser);
+  const now = new Date();
+  const todayUtcKey = now.toISOString().slice(0, 10);
+  const ms7d = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const ms30d = Date.now() - 30 * 24 * 60 * 60 * 1000;
+
+  let activeUsers = 0;
+  let suspendedUsers = 0;
+  let verifiedUsers = 0;
+  let unverifiedUsers = 0;
+  let newToday = 0;
+  let new7d = 0;
+  let new30d = 0;
+
+  const dailyCounts = new Map<string, number>();
+  const weeklyCounts = new Map<string, number>();
+  const monthlyCounts = new Map<string, number>();
+
+  const getMondayKey = (date: Date): string => {
+    const d = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+    const day = d.getUTCDay();
+    const diff = day === 0 ? -6 : 1 - day;
+    d.setUTCDate(d.getUTCDate() + diff);
+    return d.toISOString().slice(0, 10);
+  };
+
+  for (const u of records) {
+    if (u.status === 'active') activeUsers += 1;
+    else suspendedUsers += 1;
+    if (u.email_verified) verifiedUsers += 1;
+    else unverifiedUsers += 1;
+
+    const createdMs = new Date(u.created_at).getTime();
+    if (u.created_at.slice(0, 10) === todayUtcKey) newToday += 1;
+    if (createdMs >= ms7d) new7d += 1;
+    if (createdMs >= ms30d) new30d += 1;
+
+    const dObj = new Date(u.created_at);
+    if (!Number.isNaN(dObj.getTime())) {
+      const dayKey = dObj.toISOString().slice(0, 10);
+      dailyCounts.set(dayKey, (dailyCounts.get(dayKey) || 0) + 1);
+
+      const weekKey = getMondayKey(dObj);
+      weeklyCounts.set(weekKey, (weeklyCounts.get(weekKey) || 0) + 1);
+
+      const monthKey = dObj.toISOString().slice(0, 7);
+      monthlyCounts.set(monthKey, (monthlyCounts.get(monthKey) || 0) + 1);
+    }
+  }
+
+  const daily: Array<{ key: string; label: string; count: number }> = [];
+  for (let i = 13; i >= 0; i -= 1) {
+    const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - i));
+    const key = d.toISOString().slice(0, 10);
+    const label = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' });
+    daily.push({ key, label, count: dailyCounts.get(key) || 0 });
+  }
+
+  const weekly: Array<{ key: string; label: string; count: number }> = [];
+  const currentMonday = new Date(`${getMondayKey(now)}T00:00:00.000Z`);
+  for (let i = 11; i >= 0; i -= 1) {
+    const d = new Date(currentMonday.getTime() - i * 7 * 24 * 60 * 60 * 1000);
+    const key = d.toISOString().slice(0, 10);
+    const label = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' });
+    weekly.push({ key, label, count: weeklyCounts.get(key) || 0 });
+  }
+
+  const monthly: Array<{ key: string; label: string; count: number }> = [];
+  for (let i = 11; i >= 0; i -= 1) {
+    const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i, 1));
+    const key = d.toISOString().slice(0, 7);
+    const label = d.toLocaleDateString('en-US', { month: 'short', year: '2-digit', timeZone: 'UTC' });
+    monthly.push({ key, label, count: monthlyCounts.get(key) || 0 });
+  }
+
+  return {
+    summary: {
+      total_users: records.length,
+      active_users: activeUsers,
+      suspended_users: suspendedUsers,
+      verified_users: verifiedUsers,
+      unverified_users: unverifiedUsers,
+      new_today: newToday,
+      new_7d: new7d,
+      new_30d: new30d,
+    },
+    trends: { daily, weekly, monthly },
+    records,
+  };
+}
+
+app.get('/api/admin/registrations', requireRole('admin'), (_req: Request, res: Response) => {
+  res.json(buildRegistrationAnalytics());
+});
+
+function escapeCsvCell(value: string): string {
+  const safe = /^[=+\-@\t\r]/.test(value) ? `'${value}` : value;
+  return `"${safe.replace(/"/g, '""')}"`;
+}
+
+app.get('/api/admin/registrations/export', requireRole('admin'), (_req: Request, res: Response) => {
+  const analytics = buildRegistrationAnalytics();
+  const headers = [
+    'User ID',
+    'Name',
+    'Email',
+    'Role',
+    'Status',
+    'Email Verified',
+    'Timezone',
+    'Bio',
+    'Registered At (UTC)',
+    'Last Login At (UTC)',
+  ];
+  const lines = [headers.map(escapeCsvCell).join(',')];
+  for (const r of analytics.records) {
+    lines.push(
+      [
+        r.id,
+        r.name,
+        r.email,
+        r.role,
+        r.status,
+        r.email_verified ? 'Verified' : 'Unverified',
+        r.timezone || 'UTC',
+        r.bio || '',
+        r.created_at,
+        r.last_login_at || '',
+      ]
+        .map((v) => escapeCsvCell(String(v)))
+        .join(',')
+    );
+  }
+  const stamp = new Date().toISOString().slice(0, 10);
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="meridianfx-registrations-${stamp}.csv"`);
+  res.send(lines.join('\r\n'));
 });
 
 app.patch('/api/admin/users/:id', requireRole('admin'), (req: AuthRequest, res: Response) => {

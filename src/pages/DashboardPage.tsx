@@ -18,7 +18,7 @@ import { PWAInstallButton } from '../components/PWAInstallButton';
 import type { MarketInstrument } from '../types';
 
 export const DashboardPage: React.FC = () => {
-  const { user, signals, updates, courses, navigate, setShowNotifModal } = usePlatform();
+  const { user, authLoading, signals, updates, courses, navigate, setShowNotifModal } = usePlatform();
   const [watchlistQuotes, setWatchlistQuotes] = useState<MarketInstrument[]>([]);
   const [pushActive, setPushActive] = useState(false);
 
@@ -28,6 +28,14 @@ export const DashboardPage: React.FC = () => {
       .then((res) => setWatchlistQuotes(res.instruments))
       .catch(() => undefined);
   }, []);
+
+  if (authLoading && !user) {
+    return (
+      <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-8 text-center text-sm text-slate-500">
+        Restoring your workspace...
+      </div>
+    );
+  }
 
   if (!user) {
     return (
