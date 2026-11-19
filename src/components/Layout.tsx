@@ -77,9 +77,13 @@ export const Layout: React.FC<LayoutProps> = ({ children }) => {
               <button
                 type="button"
                 onClick={() => navigate('/signals')}
-                className="hover:text-[#881337] dark:hover:text-white transition-colors whitespace-nowrap shrink-0"
+                className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-500/35 px-2.5 py-1 text-emerald-700 dark:text-emerald-400 font-semibold hover:bg-emerald-100/80 dark:hover:bg-emerald-900/50 transition-colors whitespace-nowrap shrink-0"
               >
-                Signals
+                <span className="relative flex h-2 w-2 shrink-0" aria-hidden="true">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-85" />
+                  <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
+                </span>
+                <span>Signals</span>
               </button>
               <button
                 type="button"
@@ -160,10 +164,39 @@ export const Layout: React.FC<LayoutProps> = ({ children }) => {
           aria-label="Mobile Navigation"
           className="lg:hidden fixed bottom-0 left-0 right-0 z-40 border-t border-slate-200 dark:border-slate-800 bg-white/95 dark:bg-[#0D1321]/95 backdrop-blur-md pb-safe"
         >
-          <div className="grid grid-cols-5 h-16">
+          <div className="grid grid-cols-5 h-16 px-1">
             {mobileBottomTabs.map((item) => {
               const Icon = item.icon;
               const active = route === item.path;
+              const isSignalsTab = item.path === '/signals';
+              if (isSignalsTab) {
+                return (
+                  <button
+                    key={item.label}
+                    type="button"
+                    onClick={() => navigate(item.path)}
+                    className={`my-1.5 mx-0.5 rounded-xl border flex flex-col items-center justify-center min-h-[44px] transition-all ${
+                      active
+                        ? 'bg-emerald-600/15 dark:bg-emerald-500/20 border-[#15803D] dark:border-emerald-400 text-[#15803D] dark:text-emerald-300 shadow-xs'
+                        : 'bg-emerald-50/90 dark:bg-emerald-950/45 border-emerald-500/35 text-[#15803D] dark:text-emerald-400 hover:bg-emerald-100/80 dark:hover:bg-emerald-900/50'
+                    }`}
+                  >
+                    <div className="relative">
+                      <Icon className="w-5 h-5" />
+                      <span
+                        className="absolute -top-1 -right-2 flex h-2.5 w-2.5"
+                        aria-hidden="true"
+                      >
+                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-90" />
+                        <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500 ring-2 ring-white dark:ring-[#0D1321]" />
+                      </span>
+                    </div>
+                    <span className="text-[11px] font-bold mt-1 leading-none">
+                      {item.label}
+                    </span>
+                  </button>
+                );
+              }
               return (
                 <button
                   key={item.label}
@@ -222,6 +255,30 @@ export const Layout: React.FC<LayoutProps> = ({ children }) => {
           {navItems.map((item) => {
             const Icon = item.icon;
             const active = route === item.path;
+            const isSignalsTab = item.path === '/signals';
+            if (isSignalsTab) {
+              return (
+                <button
+                  key={item.path}
+                  type="button"
+                  onClick={() => navigate(item.path)}
+                  className={`w-full flex items-center justify-between gap-2 px-3 py-2.5 rounded-lg border text-sm transition-colors ${
+                    active
+                      ? 'bg-emerald-600/15 dark:bg-emerald-500/20 border-[#15803D]/60 dark:border-emerald-400/60 text-[#15803D] dark:text-emerald-300 font-semibold'
+                      : 'bg-emerald-50/70 dark:bg-emerald-950/30 border-emerald-500/30 text-[#15803D] dark:text-emerald-400 font-semibold hover:bg-emerald-100/70 dark:hover:bg-emerald-900/40'
+                  }`}
+                >
+                  <span className="flex items-center gap-3 min-w-0">
+                    <Icon className="w-4 h-4 shrink-0" />
+                    <span className="truncate">{item.label}</span>
+                  </span>
+                  <span className="relative flex h-2.5 w-2.5 shrink-0" aria-hidden="true">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-85" />
+                    <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500" />
+                  </span>
+                </button>
+              );
+            }
             return (
               <button
                 key={item.path}
@@ -436,10 +493,37 @@ export const Layout: React.FC<LayoutProps> = ({ children }) => {
         aria-label="Mobile Navigation"
         className="lg:hidden fixed bottom-0 left-0 right-0 z-40 border-t border-slate-200 dark:border-slate-800 bg-white/95 dark:bg-[#0D1321]/95 backdrop-blur-md pb-safe"
       >
-        <div className="grid grid-cols-5 h-16">
+        <div className="grid grid-cols-5 h-16 px-1">
           {mobileBottomTabs.map((item) => {
             const Icon = item.icon;
             const active = route === item.path;
+            const isSignalsTab = item.path === '/signals';
+            if (isSignalsTab) {
+              return (
+                <button
+                  key={item.label}
+                  type="button"
+                  onClick={() => navigate(item.path)}
+                  className={`my-1.5 mx-0.5 rounded-xl border flex flex-col items-center justify-center min-h-[44px] transition-all ${
+                    active
+                      ? 'bg-emerald-600/15 dark:bg-emerald-500/20 border-[#15803D] dark:border-emerald-400 text-[#15803D] dark:text-emerald-300 shadow-xs'
+                      : 'bg-emerald-50/90 dark:bg-emerald-950/45 border-emerald-500/35 text-[#15803D] dark:text-emerald-400 hover:bg-emerald-100/80 dark:hover:bg-emerald-900/50'
+                  }`}
+                >
+                  <div className="relative">
+                    <Icon className="w-5 h-5" />
+                    <span
+                      className="absolute -top-1 -right-2 flex h-2.5 w-2.5"
+                      aria-hidden="true"
+                    >
+                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-90" />
+                      <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500 ring-2 ring-white dark:ring-[#0D1321]" />
+                    </span>
+                  </div>
+                  <span className="text-[11px] font-bold mt-1 leading-none">{item.label}</span>
+                </button>
+              );
+            }
             return (
               <button
                 key={item.label}

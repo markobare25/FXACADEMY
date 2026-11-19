@@ -782,11 +782,15 @@ export const SignalsPage: React.FC = () => {
                   />
                 </div>
                 <p
-                  className="text-[11px] sm:text-xs text-slate-500 dark:text-slate-400 truncate leading-tight tabular-nums"
+                  className="inline-flex items-center gap-1.5 text-[11px] sm:text-xs text-[#15803D] dark:text-emerald-400 font-semibold truncate leading-tight tabular-nums"
                   title="Estimated community activity"
                 >
-                  <span className="font-medium text-slate-700 dark:text-slate-300">
-                    {estimatedMembers.toLocaleString()} Active Members
+                  <span className="relative flex h-2 w-2 shrink-0" aria-hidden="true">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-80" />
+                    <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
+                  </span>
+                  <span>
+                    {estimatedMembers.toLocaleString()} active now
                   </span>
                 </p>
               </div>
@@ -1491,8 +1495,8 @@ export const SignalsPage: React.FC = () => {
             <div className="rounded-xl bg-slate-50 dark:bg-slate-900/80 p-3.5 space-y-2 text-xs">
               <div className="flex items-center justify-between">
                 <span className="text-slate-500 dark:text-slate-400">Estimated Activity</span>
-                <span className="font-mono font-semibold text-slate-800 dark:text-slate-200 tabular-nums">
-                  {estimatedMembers.toLocaleString()} Active Members
+                <span className="font-mono font-semibold text-[#15803D] dark:text-emerald-400 tabular-nums">
+                  {estimatedMembers.toLocaleString()} active now
                 </span>
               </div>
               <div className="flex items-center justify-between">
