@@ -94,6 +94,7 @@ export interface MarketUpdate {
 }
 
 export type CourseLevel = 'Beginner' | 'Intermediate' | 'Advanced';
+export type ContentPublishStatus = 'draft' | 'published' | 'unpublished' | 'archived' | 'scheduled';
 
 export interface QuizQuestion {
   id: string;
@@ -103,36 +104,128 @@ export interface QuizQuestion {
   explanation?: string;
 }
 
+export interface LessonExercise {
+  title: string;
+  objective: string;
+  steps: string[];
+  deliverable: string;
+}
+
+export interface LessonSource {
+  title: string;
+  url: string;
+}
+
 export interface Lesson {
   id: string;
   course_id: string;
   title: string;
   category: string;
   summary: string;
+  learning_objective?: string;
+  introduction?: string;
   content: string;
+  demonstration?: string;
+  common_mistakes?: string[];
+  summary_recap?: string;
+  practical_exercise?: LessonExercise | null;
+  visual_key?: string | null;
   video_url?: string | null;
+  audio_url?: string | null;
+  transcript?: string | null;
   pdf_url?: string | null;
   image_url?: string | null;
+  sources?: LessonSource[];
+  tags?: string[];
   duration_minutes: number;
   order_index: number;
+  status?: ContentPublishStatus;
+  scheduled_at?: string | null;
+  published_at?: string | null;
+  updated_at?: string | null;
+  material_version?: number;
+  needs_review?: boolean;
+  needs_review_note?: string | null;
   quiz: QuizQuestion[];
   completed?: boolean;
   bookmarked?: boolean;
   quiz_score?: number | null;
+  scroll_pct?: number;
   created_at: string;
+}
+
+export interface CourseAssessmentRecord {
+  best_score: number;
+  passed: boolean;
+  attempts: number;
+  completed_at: string | null;
+  certificate_id: string | null;
 }
 
 export interface Course {
   id: string;
+  slug?: string;
+  course_number?: number;
   title: string;
   description: string;
   category: string;
   level: CourseLevel;
+  level_label?: string;
+  prerequisites?: string;
+  learning_outcomes?: string[];
+  estimated_hours?: number;
+  status?: ContentPublishStatus;
   cover_image_url?: string | null;
+  assessment?: QuizQuestion[];
+  assessment_record?: CourseAssessmentRecord | null;
   enrolled?: boolean;
+  last_lesson_id?: string | null;
   completed_lessons?: number;
   total_lessons?: number;
   lessons?: Lesson[];
+  created_at: string;
+  updated_at?: string | null;
+}
+
+export interface AcademyResumeState {
+  last_course_id: string | null;
+  last_lesson_id: string | null;
+  last_scroll_pct: number;
+  flashcard_progress: Record<string, 'mastered' | 'review'>;
+  updated_at: string | null;
+}
+
+export interface LessonVersion {
+  id: string;
+  lesson_id: string;
+  version_number: number;
+  title: string;
+  content: string;
+  changed_by: string;
+  change_note: string;
+  created_at: string;
+}
+
+export interface AcademyAuditLog {
+  id: string;
+  actor_id: string;
+  actor_name: string;
+  action: string;
+  target_type: string;
+  target_id: string;
+  details: string;
+  created_at: string;
+}
+
+export interface AcademyContentReport {
+  id: string;
+  user_id: string | null;
+  reporter_name: string;
+  lesson_id: string;
+  lesson_title: string;
+  reason: string;
+  status: 'open' | 'resolved' | 'dismissed';
+  resolution_note?: string | null;
   created_at: string;
 }
 

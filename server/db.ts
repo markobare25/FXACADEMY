@@ -2,6 +2,7 @@ import Database from 'better-sqlite3';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { ALL_CURRICULUM_COURSES } from './curriculum/index.ts';
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
@@ -154,12 +155,21 @@ export function initDatabase(): void {
 
     CREATE TABLE IF NOT EXISTS courses (
       id TEXT PRIMARY KEY,
+      slug TEXT,
+      course_number INTEGER,
       title TEXT NOT NULL,
       description TEXT NOT NULL,
       category TEXT NOT NULL,
       level TEXT NOT NULL,
+      level_label TEXT,
+      prerequisites TEXT,
+      learning_outcomes_json TEXT DEFAULT '[]',
+      estimated_hours REAL DEFAULT 3.0,
+      status TEXT NOT NULL DEFAULT 'published',
+      assessment_json TEXT DEFAULT '[]',
       cover_image_url TEXT,
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      updated_at TEXT
     );
 
     CREATE TABLE IF NOT EXISTS lessons (
@@ -168,12 +178,28 @@ export function initDatabase(): void {
       title TEXT NOT NULL,
       category TEXT NOT NULL,
       summary TEXT NOT NULL,
+      learning_objective TEXT,
+      introduction TEXT,
       content TEXT NOT NULL,
+      demonstration TEXT,
+      common_mistakes_json TEXT DEFAULT '[]',
+      summary_recap TEXT,
+      practical_exercise_json TEXT,
+      visual_key TEXT,
       video_url TEXT,
+      audio_url TEXT,
+      transcript TEXT,
       pdf_url TEXT,
       image_url TEXT,
+      sources_json TEXT DEFAULT '[]',
+      tags_json TEXT DEFAULT '[]',
       duration_minutes INTEGER NOT NULL DEFAULT 10,
       order_index INTEGER NOT NULL DEFAULT 1,
+      status TEXT NOT NULL DEFAULT 'published',
+      scheduled_at TEXT,
+      published_at TEXT,
+      updated_at TEXT,
+      material_version INTEGER NOT NULL DEFAULT 1,
       quiz_json TEXT NOT NULL DEFAULT '[]',
       created_at TEXT NOT NULL,
       FOREIGN KEY (course_id) REFERENCES courses(id) ON DELETE CASCADE
@@ -195,10 +221,71 @@ export function initDatabase(): void {
       completed INTEGER NOT NULL DEFAULT 0,
       bookmarked INTEGER NOT NULL DEFAULT 0,
       quiz_score INTEGER,
+      scroll_pct INTEGER NOT NULL DEFAULT 0,
+      needs_review INTEGER NOT NULL DEFAULT 0,
+      needs_review_note TEXT,
       updated_at TEXT NOT NULL,
       PRIMARY KEY (user_id, lesson_id),
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
       FOREIGN KEY (lesson_id) REFERENCES lessons(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS user_academy_state (
+      user_id TEXT PRIMARY KEY,
+      last_course_id TEXT,
+      last_lesson_id TEXT,
+      last_scroll_pct INTEGER NOT NULL DEFAULT 0,
+      flashcard_progress_json TEXT NOT NULL DEFAULT '{}',
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS course_assessments (
+      user_id TEXT NOT NULL,
+      course_id TEXT NOT NULL,
+      best_score INTEGER NOT NULL DEFAULT 0,
+      passed INTEGER NOT NULL DEFAULT 0,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      completed_at TEXT,
+      certificate_id TEXT,
+      PRIMARY KEY (user_id, course_id),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (course_id) REFERENCES courses(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS lesson_versions (
+      id TEXT PRIMARY KEY,
+      lesson_id TEXT NOT NULL,
+      version_number INTEGER NOT NULL,
+      title TEXT NOT NULL,
+      content TEXT NOT NULL,
+      changed_by TEXT NOT NULL,
+      change_note TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (lesson_id) REFERENCES lessons(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS academy_audit_logs (
+      id TEXT PRIMARY KEY,
+      actor_id TEXT NOT NULL,
+      actor_name TEXT NOT NULL,
+      action TEXT NOT NULL,
+      target_type TEXT NOT NULL,
+      target_id TEXT NOT NULL,
+      details TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS academy_content_reports (
+      id TEXT PRIMARY KEY,
+      user_id TEXT,
+      reporter_name TEXT NOT NULL,
+      lesson_id TEXT NOT NULL,
+      lesson_title TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'open',
+      resolution_note TEXT,
+      created_at TEXT NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS community_posts (
@@ -318,6 +405,45 @@ export function initDatabase(): void {
       created_at TEXT NOT NULL
     );
   `);
+
+  // Ensure backward-compatible column upgrades on pre-existing databases
+  const ensureColumn = (table: string, column: string, definition: string) => {
+    const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    if (!cols.some((c) => c.name === column)) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    }
+  };
+
+  ensureColumn('courses', 'slug', 'TEXT');
+  ensureColumn('courses', 'course_number', 'INTEGER');
+  ensureColumn('courses', 'level_label', 'TEXT');
+  ensureColumn('courses', 'prerequisites', 'TEXT');
+  ensureColumn('courses', 'learning_outcomes_json', "TEXT DEFAULT '[]'");
+  ensureColumn('courses', 'estimated_hours', 'REAL DEFAULT 3.0');
+  ensureColumn('courses', 'status', "TEXT NOT NULL DEFAULT 'published'");
+  ensureColumn('courses', 'assessment_json', "TEXT DEFAULT '[]'");
+  ensureColumn('courses', 'updated_at', 'TEXT');
+
+  ensureColumn('lessons', 'learning_objective', 'TEXT');
+  ensureColumn('lessons', 'introduction', 'TEXT');
+  ensureColumn('lessons', 'demonstration', 'TEXT');
+  ensureColumn('lessons', 'common_mistakes_json', "TEXT DEFAULT '[]'");
+  ensureColumn('lessons', 'summary_recap', 'TEXT');
+  ensureColumn('lessons', 'practical_exercise_json', 'TEXT');
+  ensureColumn('lessons', 'visual_key', 'TEXT');
+  ensureColumn('lessons', 'audio_url', 'TEXT');
+  ensureColumn('lessons', 'transcript', 'TEXT');
+  ensureColumn('lessons', 'sources_json', "TEXT DEFAULT '[]'");
+  ensureColumn('lessons', 'tags_json', "TEXT DEFAULT '[]'");
+  ensureColumn('lessons', 'status', "TEXT NOT NULL DEFAULT 'published'");
+  ensureColumn('lessons', 'scheduled_at', 'TEXT');
+  ensureColumn('lessons', 'published_at', 'TEXT');
+  ensureColumn('lessons', 'updated_at', 'TEXT');
+  ensureColumn('lessons', 'material_version', 'INTEGER NOT NULL DEFAULT 1');
+
+  ensureColumn('lesson_progress', 'scroll_pct', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('lesson_progress', 'needs_review', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('lesson_progress', 'needs_review_note', 'TEXT');
 
   // Migrate legacy dark hero image references to the bright daylight desk asset
   db.prepare(
@@ -589,205 +715,94 @@ function seedInitialData(): void {
     );
   }
 
-  // Seed Forex Trading Academy courses & lessons across the 15 categories
-  const courseCount = db.prepare('SELECT COUNT(*) as cnt FROM courses').get() as { cnt: number };
-  if (courseCount.cnt === 0) {
-    const insertCourse = db.prepare(
-      `INSERT INTO courses (id, title, description, category, level, cover_image_url, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    );
-    const insertLesson = db.prepare(
-      `INSERT INTO lessons (id, course_id, title, category, summary, content, duration_minutes, order_index, quiz_json, image_url, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    );
+  // Seed or upgrade to full 15-course Forex Academy Curriculum
+  const hasCanonical = db
+    .prepare("SELECT id FROM courses WHERE id = 'course-01-intro-forex'")
+    .get() as { id: string } | undefined;
 
-    const c1 = crypto.randomUUID();
-    insertCourse.run(
-      c1,
-      'Foundations of Global Foreign Exchange',
-      'Master currency market mechanics, pip valuation, spread dynamics, major/cross pairs, and candlestick anatomy from first principles.',
-      'Introduction to Forex',
-      'Beginner',
-      '/src/assets/images/academy_forex_cover_1795085836938.jpg',
-      now
-    );
-
-    insertLesson.run(
-      crypto.randomUUID(),
-      c1,
-      'How the $7.5T Forex Market Operates',
-      'Introduction to Forex',
-      'Understand interbank liquidity, trading sessions (Tokyo, London, New York), and why currency pairs move.',
-      'The foreign exchange (Forex) market is the largest decentralized financial market globally, operating 24 hours a day across five business days.\n\n### Core Trading Sessions\n1. **Sydney & Tokyo (Asian Session)**: Characterized by tighter ranges in European pairs and heightened liquidity in JPY, AUD, and NZD crosses.\n2. **London Session**: Accounts for roughly 38% of global FX turnover, frequently establishing daily highs or lows and breaking Asian ranges.\n3. **New York Overlap (12:00–16:00 UTC)**: Highest liquidity and tightest spreads as London and New York desks trade simultaneously.\n\n### Market Participants\nCentral banks, commercial banks, institutional hedge funds, multinational corporations, and retail traders interact through liquidity providers. Always align your trading activity with liquid session overlaps to avoid erratic spreads.',
-      12,
-      1,
-      JSON.stringify([
-        {
-          id: 'q1',
-          question: 'Which trading overlap typically provides the highest Forex liquidity and tightest spreads?',
-          options: [
-            'Sydney and Tokyo overlap',
-            'London and New York overlap',
-            'Weekend futures open',
-            'Late Friday close',
-          ],
-          correct_index: 1,
-          explanation: 'London and New York together represent the majority of daily global FX volume.',
-        },
-        {
-          id: 'q2',
-          question: 'What is a pip in most non-JPY currency pairs like EURUSD?',
-          options: ['0.01', '0.001', '0.0001', '1.00'],
-          correct_index: 2,
-          explanation: 'Standard non-JPY pairs quote pips at the fourth decimal place (0.0001).',
-        },
-      ]),
-      '/src/assets/images/academy_forex_cover_1795085836938.jpg',
-      now
-    );
-
-    insertLesson.run(
-      crypto.randomUUID(),
-      c1,
-      'Decoding Currency Pairs, Lots & Leverage',
-      'Understanding currency pairs',
-      'Learn base vs quote currencies, pip value calculation, and responsible leverage sizing.',
-      'Every Forex trade involves simultaneously buying one currency and selling another.\n\n### Base vs. Quote Currency\nIn **EUR/USD = 1.0580**, EUR is the **base currency** and USD is the **quote currency**. Buying EUR/USD means you expect the Euro to strengthen relative to the US Dollar.\n\n### Position Sizing & Lot Units\n- **Standard Lot**: 100,000 units (~$10 per pip on USD-quoted pairs)\n- **Mini Lot**: 10,000 units (~$1 per pip)\n- **Micro Lot**: 1,000 units (~$0.10 per pip)\n\nNever size a position by arbitrary lot numbers—calculate lot size from your Stop Loss distance and maximum account risk percentage.',
-      14,
-      2,
-      JSON.stringify([
-        {
-          id: 'q3',
-          question: 'In GBP/JPY, which currency is the quote currency?',
-          options: ['GBP', 'JPY', 'USD', 'Both'],
-          correct_index: 1,
-          explanation: 'The second currency listed in a pair is always the quote (counter) currency.',
-        },
-      ]),
-      null,
-      now
-    );
-
-    insertLesson.run(
-      crypto.randomUUID(),
-      c1,
-      'Reading Japanese Candlestick Patterns with Context',
-      'Candlestick patterns',
-      'Identify engulfing bars, pin bars, inside bars, and why candle location matters more than isolated shapes.',
-      'Japanese candlesticks compress Open, High, Low, and Close (OHLC) auction dynamics into a single visual unit.\n\n### High-Probability Formations\n- **Pin Bar (Rejection Wick)**: A long wick extending into key support or resistance shows aggressive order absorption and rejection.\n- **Engulfing Candle**: A body that completely engulfs the prior candle body signals a decisive shift in short-term order flow.\n\n### Context Rule\nA bullish pin bar in the middle of choppy consolidation carries low predictive value. The exact same candle sweeping a prior daily low at structural support carries strong institutional significance.',
-      15,
-      3,
-      JSON.stringify([
-        {
-          id: 'q4',
-          question: 'What determines whether a candlestick pattern is high probability?',
-          options: [
-            'Bright chart colors',
-            'Structural location at key support/resistance or liquidity levels',
-            'Trading on the 1-second chart only',
-            'Ignoring the prevailing trend',
-          ],
-          correct_index: 1,
-          explanation: 'Candlestick signals are only meaningful when anchored at significant market structure.',
-        },
-      ]),
-      null,
-      now
-    );
-
-    const c2 = crypto.randomUUID();
-    insertCourse.run(
-      c2,
-      'Price Action, Market Structure & Risk Engineering',
-      'Transition from indicator overload to institutional market structure, support & resistance, trendlines, and mathematical risk management.',
-      'Technical analysis',
-      'Intermediate',
-      '/src/assets/images/hero_light_trading_1795086732029.jpg',
-      now
-    );
-
-    insertLesson.run(
-      crypto.randomUUID(),
-      c2,
-      'Multi-Timeframe Support, Resistance & Trendlines',
-      'Support and resistance',
-      'Map high-timeframe supply/demand zones, clean trendlines, and role reversals.',
-      'Institutional order flow respects higher-timeframe levels (Weekly, Daily, H4) far more reliably than M5 noise.\n\n### Top-Down Workflow\n1. Mark Weekly and Daily swing highs/lows and consolidation ranges.\n2. Identify dynamic trendlines connecting at least two confirmed impulse lows/highs.\n3. Wait for price to reach your zone on H4/H1 before refining execution on M15.\n\nRemember: support and resistance are **zones**, not razor-thin single lines.',
-      18,
-      1,
-      JSON.stringify([
-        {
-          id: 'q5',
-          question: 'Which timeframes provide the strongest structural support and resistance zones?',
-          options: ['1-minute and 5-minute', 'Weekly, Daily, and 4-Hour', 'Tick charts', 'All timeframes have equal weight'],
-          correct_index: 1,
-          explanation: 'Higher timeframes reflect larger institutional capital commitments.',
-        },
-      ]),
-      null,
-      now
-    );
-
-    insertLesson.run(
-      crypto.randomUUID(),
-      c2,
-      'Position Sizing, Expectancy & Trading Psychology',
-      'Risk management',
-      'Build mathematical expectancy with fixed fractional risk (0.5%-1%), asymmetric R:R, and emotional discipline.',
-      'Even a strategy with a 45% win rate is consistently profitable when average winners are 2.5R to 3R and losses are strictly capped at 1R.\n\n### Expectancy Formula\n`Expectancy = (Win% × Avg Win) - (Loss% × Avg Loss)`\n\n### Non-Negotiable Risk Rules\n- Risk **0.5% to 1.0%** maximum per trade idea.\n- Never add to a losing position or remove a protective Stop Loss.\n- Cap daily drawdown at 2%—walk away after two consecutive full stop-outs to protect decision clarity.',
-      16,
-      2,
-      JSON.stringify([
-        {
-          id: 'q6',
-          question: 'With a 1:3 Risk-to-Reward ratio, what minimum win rate is needed just to break even (before spreads)?',
-          options: ['50%', '25%', '75%', '60%'],
-          correct_index: 1,
-          explanation: 'At 1:3 R:R, 1 winner (+3R) offsets 3 losers (-3R), so 25% is breakeven.',
-        },
-      ]),
-      null,
-      now
-    );
-
-    const c3 = crypto.randomUUID();
-    insertCourse.run(
-      c3,
-      'Macroeconomics, Gold (XAUUSD) & Digital Assets',
-      'Trade central bank policy divergence, real yields, Gold volatility, and Bitcoin macro liquidity cycles.',
-      'Gold trading',
-      'Advanced',
-      '/src/assets/images/gold_commodity_analysis_1795085837457.jpg',
-      now
-    );
-
-    insertLesson.run(
-      crypto.randomUUID(),
-      c3,
-      'Trading XAUUSD Around Real Yields & US CPI',
-      'Gold trading',
-      'Understand the inverse correlation between US 10Y TIPS real yields, DXY strength, and Spot Gold.',
-      'Gold (XAUUSD) behaves as both a non-yielding monetary asset and a geopolitical safe haven.\n\n### Key Macro Drivers\n- **US Real Yields (Nominal Yield minus Inflation Expectations)**: Rising real yields raise the opportunity cost of holding Gold, often pressuring XAUUSD lower.\n- **US Dollar Index (DXY)**: Because Gold is priced in USD, broad dollar strength generally creates headwinds.\n- **ATR-Adjusted Stops**: Gold routinely moves $20–$40 intraday; always scale stop distances using 14-period Average True Range (ATR) and reduce lot size accordingly.',
-      20,
-      1,
-      JSON.stringify([
-        {
-          id: 'q7',
-          question: 'Why must traders typically use wider stops and smaller lot sizes on XAUUSD compared to EURUSD?',
-          options: [
-            'Gold has lower tick value',
-            'Gold exhibits significantly higher intraday ATR volatility',
-            'Gold only trades on weekends',
-            'Gold has no spread',
-          ],
-          correct_index: 1,
-          explanation: 'High intraday pip/dollar swings require ATR-adjusted stop placement and scaled position sizing.',
-        },
-      ]),
-      '/src/assets/images/gold_commodity_analysis_1795085837457.jpg',
-      now
-    );
+  if (!hasCanonical) {
+    // Remove legacy pre-curriculum 3 placeholder sample courses only if canonical curriculum wasn't seeded yet
+    db.prepare('DELETE FROM courses WHERE course_number IS NULL').run();
   }
+
+  const upsertCourse = db.prepare(`
+    INSERT INTO courses (
+      id, slug, course_number, title, description, category, level, level_label,
+      prerequisites, learning_outcomes_json, estimated_hours, status, assessment_json,
+      cover_image_url, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'published', ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      slug = excluded.slug,
+      course_number = excluded.course_number,
+      level_label = COALESCE(courses.level_label, excluded.level_label),
+      prerequisites = COALESCE(courses.prerequisites, excluded.prerequisites),
+      learning_outcomes_json = CASE WHEN courses.learning_outcomes_json IS NULL OR courses.learning_outcomes_json = '[]' THEN excluded.learning_outcomes_json ELSE courses.learning_outcomes_json END,
+      estimated_hours = COALESCE(courses.estimated_hours, excluded.estimated_hours),
+      assessment_json = CASE WHEN courses.assessment_json IS NULL OR courses.assessment_json = '[]' THEN excluded.assessment_json ELSE courses.assessment_json END
+  `);
+
+  const insertSeedLesson = db.prepare(`
+    INSERT OR IGNORE INTO lessons (
+      id, course_id, title, category, summary, learning_objective, introduction, content,
+      demonstration, common_mistakes_json, summary_recap, practical_exercise_json,
+      visual_key, duration_minutes, order_index, status, published_at, updated_at,
+      material_version, sources_json, tags_json, quiz_json, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'published', ?, ?, 1, ?, ?, ?, ?)
+  `);
+
+  const seedTransaction = db.transaction(() => {
+    for (const c of ALL_CURRICULUM_COURSES) {
+      upsertCourse.run(
+        c.id,
+        c.slug,
+        c.course_number,
+        c.title,
+        c.description,
+        c.category,
+        c.level,
+        c.level_label,
+        c.prerequisites,
+        JSON.stringify(c.learning_outcomes),
+        c.estimated_hours,
+        JSON.stringify(c.assessment),
+        c.cover_image_url,
+        now,
+        now
+      );
+
+      c.lessons.forEach((l, idx) => {
+        insertSeedLesson.run(
+          l.id,
+          c.id,
+          l.title,
+          l.category,
+          l.summary,
+          l.learning_objective,
+          l.introduction,
+          l.content,
+          l.demonstration,
+          JSON.stringify(l.common_mistakes),
+          l.summary_recap,
+          JSON.stringify(l.practical_exercise),
+          l.visual_key,
+          l.duration_minutes,
+          idx + 1,
+          now,
+          now,
+          JSON.stringify(l.sources),
+          JSON.stringify(l.tags),
+          JSON.stringify(l.quiz),
+          now
+        );
+      });
+    }
+  });
+  seedTransaction();
+
+  // Fix any legacy dark cover images on seeded records
+  db.prepare(
+    `UPDATE courses SET cover_image_url = '/src/assets/images/hero_light_trading_1795086732029.jpg' WHERE cover_image_url = '/src/assets/images/hero_trading_desk_1795085837463.jpg'`
+  ).run();
 
   // Seed initial Community Post if empty
   const postCount = db.prepare('SELECT COUNT(*) as cnt FROM community_posts').get() as { cnt: number };

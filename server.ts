@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import multer from 'multer';
 import { WebSocketServer, WebSocket } from 'ws';
+import { GoogleGenAI } from '@google/genai';
 import { z } from 'zod';
 import {
   BACKUP_DIR,
@@ -85,7 +86,7 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: { fileSize: 20 * 1024 * 1024 },
+  limits: { fileSize: 25 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     const allowed = [
       'image/jpeg',
@@ -96,11 +97,17 @@ const upload = multer({
       'application/pdf',
       'video/mp4',
       'video/webm',
+      'audio/mpeg',
+      'audio/mp3',
+      'audio/mp4',
+      'audio/wav',
+      'audio/webm',
+      'audio/ogg',
     ];
     if (allowed.includes(file.mimetype)) {
       cb(null, true);
     } else {
-      cb(new Error('Unsupported file type. Allowed: images, PDF, MP4, WebM.'));
+      cb(new Error('Unsupported file type. Allowed: images, PDF, MP4, WebM, MP3, WAV, OGG.'));
     }
   },
 });
@@ -151,8 +158,12 @@ function getPublicStats(): PublicStats {
   const totalUpdates = (
     db.prepare('SELECT COUNT(*) as c FROM market_updates WHERE published = 1').get() as { c: number }
   ).c;
-  const totalCourses = (db.prepare('SELECT COUNT(*) as c FROM courses').get() as { c: number }).c;
-  const totalLessons = (db.prepare('SELECT COUNT(*) as c FROM lessons').get() as { c: number }).c;
+  const totalCourses = (
+    db.prepare("SELECT COUNT(*) as c FROM courses WHERE status = 'published'").get() as { c: number }
+  ).c;
+  const totalLessons = (
+    db.prepare("SELECT COUNT(*) as c FROM lessons WHERE status = 'published'").get() as { c: number }
+  ).c;
   const totalUsers = (
     db.prepare("SELECT COUNT(*) as c FROM users WHERE status = 'active'").get() as { c: number }
   ).c;
@@ -1045,37 +1056,151 @@ app.post('/api/updates/:id/bookmark', requireAuth, (req: AuthRequest, res: Respo
 });
 
 // ---------- Forex Trading Academy ----------
-app.get('/api/academy/courses', optionalAuth, (req: AuthRequest, res: Response) => {
-  const courseRows = db.prepare('SELECT * FROM courses ORDER BY created_at ASC').all() as Array<
-    Record<string, unknown>
-  >;
-  const lessonRows = db.prepare('SELECT * FROM lessons ORDER BY order_index ASC, created_at ASC').all() as Array<
-    Record<string, unknown>
-  >;
+function safeJsonParse<T>(raw: unknown, fallback: T): T {
+  if (typeof raw !== 'string' || !raw.trim()) return fallback;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
+  }
+}
 
-  const enrolledSet = new Set<string>();
-  const progressMap = new Map<string, { completed: boolean; bookmarked: boolean; quiz_score: number | null }>();
+function logAcademyAudit(
+  actorId: string,
+  actorName: string,
+  action: string,
+  targetType: string,
+  targetId: string,
+  details: string
+): void {
+  try {
+    db.prepare(
+      `INSERT INTO academy_audit_logs (id, actor_id, actor_name, action, target_type, target_id, details, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(crypto.randomUUID(), actorId, actorName, action, targetType, targetId, details.slice(0, 600), new Date().toISOString());
+  } catch {
+    // non-fatal audit log write
+  }
+}
+
+app.get('/api/academy/courses', optionalAuth, (req: AuthRequest, res: Response) => {
+  const includeAll = req.user?.role === 'admin' && req.query.includeAll === 'true';
+
+  const courseRows = db
+    .prepare(
+      includeAll
+        ? 'SELECT * FROM courses ORDER BY COALESCE(course_number, 999) ASC, created_at ASC'
+        : "SELECT * FROM courses WHERE status = 'published' ORDER BY COALESCE(course_number, 999) ASC, created_at ASC"
+    )
+    .all() as Array<Record<string, unknown>>;
+
+  const lessonRows = db
+    .prepare(
+      includeAll
+        ? 'SELECT * FROM lessons ORDER BY order_index ASC, created_at ASC'
+        : "SELECT * FROM lessons WHERE status = 'published' ORDER BY order_index ASC, created_at ASC"
+    )
+    .all() as Array<Record<string, unknown>>;
+
+  const enrollMap = new Map<string, string | null>();
+  const progressMap = new Map<
+    string,
+    {
+      completed: boolean;
+      bookmarked: boolean;
+      quiz_score: number | null;
+      scroll_pct: number;
+      needs_review: boolean;
+      needs_review_note: string | null;
+    }
+  >();
+  const assessmentMap = new Map<
+    string,
+    {
+      best_score: number;
+      passed: boolean;
+      attempts: number;
+      completed_at: string | null;
+      certificate_id: string | null;
+    }
+  >();
+  let resumeState: {
+    last_course_id: string | null;
+    last_lesson_id: string | null;
+    last_scroll_pct: number;
+    flashcard_progress: Record<string, 'mastered' | 'review'>;
+    updated_at: string | null;
+  } | null = null;
 
   if (req.user) {
     const enrolls = db
-      .prepare('SELECT course_id FROM enrollments WHERE user_id = ?')
-      .all(req.user.id) as Array<{ course_id: string }>;
-    for (const e of enrolls) enrolledSet.add(e.course_id);
+      .prepare('SELECT course_id, last_lesson_id FROM enrollments WHERE user_id = ?')
+      .all(req.user.id) as Array<{ course_id: string; last_lesson_id: string | null }>;
+    for (const e of enrolls) enrollMap.set(e.course_id, e.last_lesson_id);
 
     const progs = db
-      .prepare('SELECT lesson_id, completed, bookmarked, quiz_score FROM lesson_progress WHERE user_id = ?')
+      .prepare(
+        'SELECT lesson_id, completed, bookmarked, quiz_score, scroll_pct, needs_review, needs_review_note FROM lesson_progress WHERE user_id = ?'
+      )
       .all(req.user.id) as Array<{
       lesson_id: string;
       completed: number;
       bookmarked: number;
       quiz_score: number | null;
+      scroll_pct: number | null;
+      needs_review: number | null;
+      needs_review_note: string | null;
     }>;
     for (const p of progs) {
       progressMap.set(p.lesson_id, {
         completed: Boolean(p.completed),
         bookmarked: Boolean(p.bookmarked),
         quiz_score: p.quiz_score,
+        scroll_pct: p.scroll_pct ?? 0,
+        needs_review: Boolean(p.needs_review),
+        needs_review_note: p.needs_review_note || null,
       });
+    }
+
+    const assessRows = db
+      .prepare('SELECT course_id, best_score, passed, attempts, completed_at, certificate_id FROM course_assessments WHERE user_id = ?')
+      .all(req.user.id) as Array<{
+      course_id: string;
+      best_score: number;
+      passed: number;
+      attempts: number;
+      completed_at: string | null;
+      certificate_id: string | null;
+    }>;
+    for (const a of assessRows) {
+      assessmentMap.set(a.course_id, {
+        best_score: a.best_score,
+        passed: Boolean(a.passed),
+        attempts: a.attempts,
+        completed_at: a.completed_at,
+        certificate_id: a.certificate_id,
+      });
+    }
+
+    const st = db
+      .prepare('SELECT * FROM user_academy_state WHERE user_id = ?')
+      .get(req.user.id) as
+      | {
+          last_course_id: string | null;
+          last_lesson_id: string | null;
+          last_scroll_pct: number;
+          flashcard_progress_json: string;
+          updated_at: string;
+        }
+      | undefined;
+    if (st) {
+      resumeState = {
+        last_course_id: st.last_course_id,
+        last_lesson_id: st.last_lesson_id,
+        last_scroll_pct: st.last_scroll_pct || 0,
+        flashcard_progress: safeJsonParse(st.flashcard_progress_json, {}),
+        updated_at: st.updated_at,
+      };
     }
   }
 
@@ -1086,23 +1211,111 @@ app.get('/api/academy/courses', optionalAuth, (req: AuthRequest, res: Response) 
         const prog = progressMap.get(String(l.id));
         return {
           ...l,
-          quiz: JSON.parse(String(l.quiz_json || '[]')),
+          status: (l.status as string) || 'published',
+          common_mistakes: safeJsonParse<string[]>(l.common_mistakes_json, []),
+          practical_exercise: safeJsonParse(l.practical_exercise_json, null),
+          sources: safeJsonParse(l.sources_json, []),
+          tags: safeJsonParse<string[]>(l.tags_json, []),
+          quiz: safeJsonParse(l.quiz_json, []),
           completed: prog?.completed || false,
           bookmarked: prog?.bookmarked || false,
           quiz_score: prog?.quiz_score ?? null,
+          scroll_pct: prog?.scroll_pct ?? 0,
+          needs_review: prog?.needs_review || false,
+          needs_review_note: prog?.needs_review_note || null,
         };
       });
 
     return {
       ...c,
-      enrolled: enrolledSet.has(String(c.id)),
-      total_lessons: courseLessons.length,
+      status: (c.status as string) || 'published',
+      learning_outcomes: safeJsonParse<string[]>(c.learning_outcomes_json, []),
+      assessment: safeJsonParse(c.assessment_json, []),
+      assessment_record: assessmentMap.get(String(c.id)) || null,
+      enrolled: enrollMap.has(String(c.id)),
+      last_lesson_id: enrollMap.get(String(c.id)) || null,
+      total_lessons: courseLessons.filter((l) => l.status === 'published').length || courseLessons.length,
       completed_lessons: courseLessons.filter((l) => l.completed).length,
       lessons: courseLessons,
     };
   });
 
-  res.json({ courses });
+  res.json({ courses, resume_state: resumeState });
+});
+
+app.put('/api/academy/resume', requireAuth, (req: AuthRequest, res: Response) => {
+  const schema = z.object({
+    last_course_id: z.string().nullable().optional(),
+    last_lesson_id: z.string().nullable().optional(),
+    last_scroll_pct: z.number().int().min(0).max(100).default(0),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid resume state payload.' });
+    return;
+  }
+
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO user_academy_state (user_id, last_course_id, last_lesson_id, last_scroll_pct, flashcard_progress_json, updated_at)
+     VALUES (?, ?, ?, ?, '{}', ?)
+     ON CONFLICT(user_id) DO UPDATE SET
+       last_course_id = COALESCE(excluded.last_course_id, user_academy_state.last_course_id),
+       last_lesson_id = COALESCE(excluded.last_lesson_id, user_academy_state.last_lesson_id),
+       last_scroll_pct = excluded.last_scroll_pct,
+       updated_at = excluded.updated_at`
+  ).run(
+    req.user!.id,
+    parsed.data.last_course_id ?? null,
+    parsed.data.last_lesson_id ?? null,
+    parsed.data.last_scroll_pct,
+    now
+  );
+
+  if (parsed.data.last_lesson_id && parsed.data.last_scroll_pct > 0) {
+    db.prepare(
+      `INSERT INTO lesson_progress (user_id, lesson_id, completed, bookmarked, scroll_pct, updated_at)
+       VALUES (?, ?, 0, 0, ?, ?)
+       ON CONFLICT(user_id, lesson_id) DO UPDATE SET
+         scroll_pct = MAX(lesson_progress.scroll_pct, excluded.scroll_pct),
+         updated_at = excluded.updated_at`
+    ).run(req.user!.id, parsed.data.last_lesson_id, parsed.data.last_scroll_pct, now);
+  }
+
+  res.json({ ok: true });
+});
+
+app.post('/api/academy/flashcards/progress', requireAuth, (req: AuthRequest, res: Response) => {
+  const schema = z.object({
+    card_id: z.string().min(1).max(80),
+    status: z.enum(['mastered', 'review']),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid flashcard progress payload.' });
+    return;
+  }
+
+  const now = new Date().toISOString();
+  const existing = db
+    .prepare('SELECT flashcard_progress_json FROM user_academy_state WHERE user_id = ?')
+    .get(req.user!.id) as { flashcard_progress_json: string } | undefined;
+
+  const progress = safeJsonParse<Record<string, 'mastered' | 'review'>>(
+    existing?.flashcard_progress_json,
+    {}
+  );
+  progress[parsed.data.card_id] = parsed.data.status;
+
+  db.prepare(
+    `INSERT INTO user_academy_state (user_id, flashcard_progress_json, updated_at)
+     VALUES (?, ?, ?)
+     ON CONFLICT(user_id) DO UPDATE SET
+       flashcard_progress_json = excluded.flashcard_progress_json,
+       updated_at = excluded.updated_at`
+  ).run(req.user!.id, JSON.stringify(progress), now);
+
+  res.json({ ok: true, flashcard_progress: progress });
 });
 
 app.post('/api/academy/courses/:id/enroll', requireAuth, (req: AuthRequest, res: Response) => {
@@ -1118,6 +1331,8 @@ app.post('/api/academy/lessons/:id/progress', requireAuth, (req: AuthRequest, re
     completed: z.boolean().optional(),
     bookmarked: z.boolean().optional(),
     quiz_answers: z.array(z.number()).optional(),
+    scroll_pct: z.number().int().min(0).max(100).optional(),
+    clear_review: z.boolean().optional(),
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
@@ -1136,14 +1351,18 @@ app.post('/api/academy/lessons/:id/progress', requireAuth, (req: AuthRequest, re
   const existing = db
     .prepare('SELECT * FROM lesson_progress WHERE user_id = ? AND lesson_id = ?')
     .get(req.user!.id, req.params.id) as
-    | { completed: number; bookmarked: number; quiz_score: number | null }
+    | {
+        completed: number;
+        bookmarked: number;
+        quiz_score: number | null;
+        scroll_pct: number | null;
+        needs_review: number | null;
+      }
     | undefined;
 
   let quizScore = existing?.quiz_score ?? null;
   if (parsed.data.quiz_answers) {
-    const questions = JSON.parse(String(lesson.quiz_json || '[]')) as Array<{
-      correct_index: number;
-    }>;
+    const questions = safeJsonParse<Array<{ correct_index: number }>>(lesson.quiz_json, []);
     if (questions.length > 0) {
       let correct = 0;
       questions.forEach((q, idx) => {
@@ -1165,17 +1384,21 @@ app.post('/api/academy/lessons/:id/progress', requireAuth, (req: AuthRequest, re
         ? 1
         : 0
       : existing?.bookmarked ?? 0;
+  const scrollPct = parsed.data.scroll_pct !== undefined ? parsed.data.scroll_pct : existing?.scroll_pct ?? 0;
+  const needsReview = parsed.data.clear_review || parsed.data.completed ? 0 : existing?.needs_review ?? 0;
 
   const now = new Date().toISOString();
   db.prepare(
-    `INSERT INTO lesson_progress (user_id, lesson_id, completed, bookmarked, quiz_score, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?)
+    `INSERT INTO lesson_progress (user_id, lesson_id, completed, bookmarked, quiz_score, scroll_pct, needs_review, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(user_id, lesson_id) DO UPDATE SET
        completed = excluded.completed,
        bookmarked = excluded.bookmarked,
        quiz_score = excluded.quiz_score,
+       scroll_pct = MAX(lesson_progress.scroll_pct, excluded.scroll_pct),
+       needs_review = excluded.needs_review,
        updated_at = excluded.updated_at`
-  ).run(req.user!.id, req.params.id, completed, bookmarked, quizScore, now);
+  ).run(req.user!.id, req.params.id, completed, bookmarked, quizScore, scrollPct, needsReview, now);
 
   // Auto-enroll & save resume checkpoint
   db.prepare(
@@ -1184,12 +1407,169 @@ app.post('/api/academy/lessons/:id/progress', requireAuth, (req: AuthRequest, re
      ON CONFLICT(user_id, course_id) DO UPDATE SET last_lesson_id = excluded.last_lesson_id`
   ).run(req.user!.id, String(lesson.course_id), now, req.params.id);
 
+  db.prepare(
+    `INSERT INTO user_academy_state (user_id, last_course_id, last_lesson_id, last_scroll_pct, updated_at)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(user_id) DO UPDATE SET
+       last_course_id = excluded.last_course_id,
+       last_lesson_id = excluded.last_lesson_id,
+       last_scroll_pct = excluded.last_scroll_pct,
+       updated_at = excluded.updated_at`
+  ).run(req.user!.id, String(lesson.course_id), req.params.id, scrollPct, now);
+
   res.json({
     ok: true,
     completed: Boolean(completed),
     bookmarked: Boolean(bookmarked),
     quiz_score: quizScore,
+    scroll_pct: scrollPct,
+    needs_review: Boolean(needsReview),
   });
+});
+
+app.post('/api/academy/courses/:id/assessment', requireAuth, (req: AuthRequest, res: Response) => {
+  const schema = z.object({
+    answers: z.array(z.number().int()),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid assessment submission.' });
+    return;
+  }
+
+  const course = db.prepare('SELECT * FROM courses WHERE id = ?').get(req.params.id) as
+    | Record<string, unknown>
+    | undefined;
+  if (!course) {
+    res.status(404).json({ error: 'Course not found.' });
+    return;
+  }
+
+  const questions = safeJsonParse<Array<{ id: string; correct_index: number; explanation?: string }>>(
+    course.assessment_json,
+    []
+  );
+  if (questions.length === 0) {
+    res.status(400).json({ error: 'No assessment questions configured for this course.' });
+    return;
+  }
+
+  let correct = 0;
+  const breakdown = questions.map((q, idx) => {
+    const picked = parsed.data.answers[idx];
+    const isCorrect = picked === q.correct_index;
+    if (isCorrect) correct++;
+    return {
+      question_id: q.id,
+      correct_index: q.correct_index,
+      picked_index: picked,
+      is_correct: isCorrect,
+      explanation: q.explanation || '',
+    };
+  });
+  const score = Math.round((correct / questions.length) * 100);
+  const passedScore = score >= 70;
+
+  const totalPublishedLessons = (
+    db.prepare("SELECT COUNT(*) as c FROM lessons WHERE course_id = ? AND status = 'published'").get(req.params.id) as {
+      c: number;
+    }
+  ).c;
+  const completedLessons = (
+    db
+      .prepare(
+        `SELECT COUNT(*) as c FROM lesson_progress lp
+         JOIN lessons l ON lp.lesson_id = l.id
+         WHERE lp.user_id = ? AND l.course_id = ? AND l.status = 'published' AND lp.completed = 1`
+      )
+      .get(req.user!.id, req.params.id) as { c: number }
+  ).c;
+
+  const allLessonsCompleted = totalPublishedLessons === 0 || completedLessons >= totalPublishedLessons;
+  const passed = passedScore && allLessonsCompleted;
+
+  const existing = db
+    .prepare('SELECT * FROM course_assessments WHERE user_id = ? AND course_id = ?')
+    .get(req.user!.id, req.params.id) as
+    | {
+        best_score: number;
+        passed: number;
+        attempts: number;
+        completed_at: string | null;
+        certificate_id: string | null;
+      }
+    | undefined;
+
+  const now = new Date().toISOString();
+  const nextBest = Math.max(existing?.best_score ?? 0, score);
+  const nextPassed = existing?.passed === 1 || passed ? 1 : 0;
+  const certId =
+    existing?.certificate_id ||
+    (nextPassed === 1 ? `MFX-EDU-${String(course.course_number || 'C').padStart(2, '0')}-${crypto.randomBytes(3).toString('hex').toUpperCase()}` : null);
+  const completedAt = existing?.completed_at || (nextPassed === 1 ? now : null);
+
+  db.prepare(
+    `INSERT INTO course_assessments (user_id, course_id, best_score, passed, attempts, completed_at, certificate_id)
+     VALUES (?, ?, ?, ?, 1, ?, ?)
+     ON CONFLICT(user_id, course_id) DO UPDATE SET
+       best_score = excluded.best_score,
+       passed = excluded.passed,
+       attempts = course_assessments.attempts + 1,
+       completed_at = COALESCE(course_assessments.completed_at, excluded.completed_at),
+       certificate_id = COALESCE(course_assessments.certificate_id, excluded.certificate_id)`
+  ).run(req.user!.id, req.params.id, nextBest, nextPassed, completedAt, certId);
+
+  logUserActivity(
+    req.user!.id,
+    'Course Assessment Attempted',
+    `Scored ${score}% on ${String(course.title)} (${passed ? 'Passed' : 'Review'})`,
+    req.ip
+  );
+
+  res.json({
+    score,
+    correct,
+    total: questions.length,
+    passed_score: passedScore,
+    all_lessons_completed: allLessonsCompleted,
+    passed: Boolean(nextPassed),
+    certificate_id: certId,
+    breakdown,
+  });
+});
+
+app.post('/api/academy/lessons/:id/report', optionalAuth, rateLimit(10, 60_000), (req: AuthRequest, res: Response) => {
+  const schema = z.object({
+    reason: z.string().trim().min(5).max(1000),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Please describe the issue (at least 5 characters).' });
+    return;
+  }
+
+  const lesson = db.prepare('SELECT id, title FROM lessons WHERE id = ?').get(req.params.id) as
+    | { id: string; title: string }
+    | undefined;
+  if (!lesson) {
+    res.status(404).json({ error: 'Lesson not found.' });
+    return;
+  }
+
+  db.prepare(
+    `INSERT INTO academy_content_reports (id, user_id, reporter_name, lesson_id, lesson_title, reason, status, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, 'open', ?)`
+  ).run(
+    crypto.randomUUID(),
+    req.user?.id || null,
+    req.user?.name || 'Academy Learner',
+    lesson.id,
+    lesson.title,
+    parsed.data.reason,
+    new Date().toISOString()
+  );
+
+  res.status(201).json({ ok: true });
 });
 
 app.post('/api/academy/courses', requireRole('admin'), (req: AuthRequest, res: Response) => {
@@ -1198,53 +1578,13 @@ app.post('/api/academy/courses', requireRole('admin'), (req: AuthRequest, res: R
     description: z.string().trim().min(10).max(2000),
     category: z.string().trim().min(2).max(80),
     level: z.enum(['Beginner', 'Intermediate', 'Advanced']),
+    level_label: z.string().max(80).optional(),
+    prerequisites: z.string().max(400).optional(),
+    learning_outcomes: z.array(z.string()).optional(),
+    estimated_hours: z.number().min(0.5).max(100).optional(),
+    status: z.enum(['draft', 'published', 'unpublished', 'archived', 'scheduled']).default('published'),
     cover_image_url: z.string().max(400).optional().nullable(),
-  });
-  const parsed = schema.safeParse(req.body);
-  if (!parsed.success) {
-    res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid course data.' });
-    return;
-  }
-
-  const id = crypto.randomUUID();
-  const now = new Date().toISOString();
-  db.prepare(
-    `INSERT INTO courses (id, title, description, category, level, cover_image_url, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    id,
-    parsed.data.title,
-    parsed.data.description,
-    parsed.data.category,
-    parsed.data.level,
-    parsed.data.cover_image_url || '/src/assets/images/academy_forex_cover_1795085836938.jpg',
-    now
-  );
-
-  const course = db.prepare('SELECT * FROM courses WHERE id = ?').get(id);
-  broadcastWs('academy:updated', { type: 'course', id });
-  res.status(201).json({ course });
-});
-
-app.delete('/api/academy/courses/:id', requireRole('admin'), (req: Request, res: Response) => {
-  db.prepare('DELETE FROM courses WHERE id = ?').run(req.params.id);
-  broadcastWs('academy:updated', { type: 'course_deleted', id: req.params.id });
-  res.json({ ok: true });
-});
-
-app.post('/api/academy/lessons', requireRole('admin'), async (req: AuthRequest, res: Response) => {
-  const schema = z.object({
-    course_id: z.string().min(1),
-    title: z.string().trim().min(3).max(160),
-    category: z.string().trim().min(2).max(80),
-    summary: z.string().trim().min(5).max(500),
-    content: z.string().trim().min(10).max(20000),
-    video_url: z.string().max(400).optional().nullable(),
-    pdf_url: z.string().max(400).optional().nullable(),
-    image_url: z.string().max(400).optional().nullable(),
-    duration_minutes: z.number().int().min(1).max(240).default(12),
-    order_index: z.number().int().min(1).default(1),
-    quiz: z
+    assessment: z
       .array(
         z.object({
           id: z.string(),
@@ -1255,10 +1595,173 @@ app.post('/api/academy/lessons', requireRole('admin'), async (req: AuthRequest, 
         })
       )
       .optional(),
-    send_push: z.boolean().optional(),
   });
-
   const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid course data.' });
+    return;
+  }
+
+  const maxNum = (
+    db.prepare('SELECT COALESCE(MAX(course_number), 0) as m FROM courses').get() as { m: number }
+  ).m;
+  const id = crypto.randomUUID();
+  const now = new Date().toISOString();
+  const slug = parsed.data.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+
+  db.prepare(
+    `INSERT INTO courses (
+      id, slug, course_number, title, description, category, level, level_label,
+      prerequisites, learning_outcomes_json, estimated_hours, status, assessment_json,
+      cover_image_url, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    id,
+    slug,
+    maxNum + 1,
+    parsed.data.title,
+    parsed.data.description,
+    parsed.data.category,
+    parsed.data.level,
+    parsed.data.level_label || parsed.data.level,
+    parsed.data.prerequisites || 'None',
+    JSON.stringify(parsed.data.learning_outcomes || []),
+    parsed.data.estimated_hours ?? 3.0,
+    parsed.data.status,
+    JSON.stringify(parsed.data.assessment || []),
+    parsed.data.cover_image_url || '/src/assets/images/academy_forex_cover_1795085836938.jpg',
+    now,
+    now
+  );
+
+  logAcademyAudit(req.user!.id, req.user!.name, 'Course Created', 'course', id, parsed.data.title);
+  const course = db.prepare('SELECT * FROM courses WHERE id = ?').get(id);
+  broadcastWs('academy:updated', { type: 'course', id });
+  res.status(201).json({ course });
+});
+
+app.patch('/api/academy/courses/:id', requireRole('admin'), (req: AuthRequest, res: Response) => {
+  const existing = db.prepare('SELECT * FROM courses WHERE id = ?').get(req.params.id) as
+    | Record<string, unknown>
+    | undefined;
+  if (!existing) {
+    res.status(404).json({ error: 'Course not found.' });
+    return;
+  }
+
+  const schema = z.object({
+    title: z.string().trim().min(3).max(160).optional(),
+    description: z.string().trim().min(10).max(2000).optional(),
+    category: z.string().trim().min(2).max(80).optional(),
+    level: z.enum(['Beginner', 'Intermediate', 'Advanced']).optional(),
+    level_label: z.string().max(80).optional(),
+    prerequisites: z.string().max(400).optional(),
+    learning_outcomes: z.array(z.string()).optional(),
+    estimated_hours: z.number().min(0.5).max(100).optional(),
+    status: z.enum(['draft', 'published', 'unpublished', 'archived', 'scheduled']).optional(),
+    cover_image_url: z.string().max(400).optional().nullable(),
+    assessment: z
+      .array(
+        z.object({
+          id: z.string(),
+          question: z.string(),
+          options: z.array(z.string()).min(2),
+          correct_index: z.number().int().min(0),
+          explanation: z.string().optional(),
+        })
+      )
+      .optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid course update payload.' });
+    return;
+  }
+
+  const d = parsed.data;
+  const now = new Date().toISOString();
+  db.prepare(
+    `UPDATE courses SET
+      title = ?, description = ?, category = ?, level = ?, level_label = ?,
+      prerequisites = ?, learning_outcomes_json = ?, estimated_hours = ?, status = ?,
+      assessment_json = ?, cover_image_url = ?, updated_at = ?
+     WHERE id = ?`
+  ).run(
+    d.title ?? existing.title,
+    d.description ?? existing.description,
+    d.category ?? existing.category,
+    d.level ?? existing.level,
+    d.level_label ?? existing.level_label,
+    d.prerequisites ?? existing.prerequisites,
+    d.learning_outcomes ? JSON.stringify(d.learning_outcomes) : existing.learning_outcomes_json,
+    d.estimated_hours ?? existing.estimated_hours,
+    d.status ?? existing.status,
+    d.assessment ? JSON.stringify(d.assessment) : existing.assessment_json,
+    d.cover_image_url !== undefined ? d.cover_image_url : existing.cover_image_url,
+    now,
+    req.params.id
+  );
+
+  logAcademyAudit(req.user!.id, req.user!.name, 'Course Updated', 'course', req.params.id, String(d.title ?? existing.title));
+  broadcastWs('academy:updated', { type: 'course_updated', id: req.params.id });
+  res.json({ ok: true });
+});
+
+app.delete('/api/academy/courses/:id', requireRole('admin'), (req: AuthRequest, res: Response) => {
+  db.prepare('DELETE FROM courses WHERE id = ?').run(req.params.id);
+  logAcademyAudit(req.user!.id, req.user!.name, 'Course Deleted', 'course', req.params.id, 'Removed course');
+  broadcastWs('academy:updated', { type: 'course_deleted', id: req.params.id });
+  res.json({ ok: true });
+});
+
+const lessonInputSchema = z.object({
+  course_id: z.string().min(1),
+  title: z.string().trim().min(3).max(180),
+  category: z.string().trim().min(2).max(80),
+  summary: z.string().trim().min(5).max(800),
+  learning_objective: z.string().max(600).optional(),
+  introduction: z.string().max(3000).optional(),
+  content: z.string().trim().min(10).max(30000),
+  demonstration: z.string().max(6000).optional(),
+  common_mistakes: z.array(z.string()).optional(),
+  summary_recap: z.string().max(2000).optional(),
+  practical_exercise: z
+    .object({
+      title: z.string(),
+      objective: z.string(),
+      steps: z.array(z.string()),
+      deliverable: z.string(),
+    })
+    .nullable()
+    .optional(),
+  visual_key: z.string().max(120).optional().nullable(),
+  video_url: z.string().max(500).optional().nullable(),
+  audio_url: z.string().max(500).optional().nullable(),
+  transcript: z.string().max(20000).optional().nullable(),
+  pdf_url: z.string().max(500).optional().nullable(),
+  image_url: z.string().max(500).optional().nullable(),
+  sources: z.array(z.object({ title: z.string(), url: z.string() })).optional(),
+  tags: z.array(z.string()).optional(),
+  duration_minutes: z.number().int().min(1).max(240).default(15),
+  order_index: z.number().int().min(1).default(1),
+  status: z.enum(['draft', 'published', 'unpublished', 'archived', 'scheduled']).default('published'),
+  scheduled_at: z.string().optional().nullable(),
+  quiz: z
+    .array(
+      z.object({
+        id: z.string(),
+        question: z.string(),
+        options: z.array(z.string()).min(2),
+        correct_index: z.number().int().min(0),
+        explanation: z.string().optional(),
+      })
+    )
+    .optional(),
+  send_push: z.boolean().optional(),
+});
+
+app.post('/api/academy/lessons', requireRole('admin'), async (req: AuthRequest, res: Response) => {
+  const parsed = lessonInputSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid lesson payload.' });
     return;
@@ -1267,27 +1770,56 @@ app.post('/api/academy/lessons', requireRole('admin'), async (req: AuthRequest, 
   const d = parsed.data;
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
+  const publishedAt = d.status === 'published' ? now : null;
+
   db.prepare(
-    `INSERT INTO lessons (id, course_id, title, category, summary, content, video_url, pdf_url, image_url, duration_minutes, order_index, quiz_json, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO lessons (
+      id, course_id, title, category, summary, learning_objective, introduction, content,
+      demonstration, common_mistakes_json, summary_recap, practical_exercise_json,
+      visual_key, video_url, audio_url, transcript, pdf_url, image_url, sources_json, tags_json,
+      duration_minutes, order_index, status, scheduled_at, published_at, updated_at, material_version,
+      quiz_json, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
   ).run(
     id,
     d.course_id,
     d.title,
     d.category,
     d.summary,
+    d.learning_objective || null,
+    d.introduction || null,
     d.content,
+    d.demonstration || null,
+    JSON.stringify(d.common_mistakes || []),
+    d.summary_recap || null,
+    d.practical_exercise ? JSON.stringify(d.practical_exercise) : null,
+    d.visual_key || null,
     d.video_url || null,
+    d.audio_url || null,
+    d.transcript || null,
     d.pdf_url || null,
     d.image_url || null,
+    JSON.stringify(d.sources || []),
+    JSON.stringify(d.tags || []),
     d.duration_minutes,
     d.order_index,
+    d.status,
+    d.scheduled_at || null,
+    publishedAt,
+    now,
     JSON.stringify(d.quiz || []),
     now
   );
 
+  db.prepare(
+    `INSERT INTO lesson_versions (id, lesson_id, version_number, title, content, changed_by, change_note, created_at)
+     VALUES (?, ?, 1, ?, ?, ?, 'Initial lesson creation', ?)`
+  ).run(crypto.randomUUID(), id, d.title, d.content, req.user!.name, now);
+
+  logAcademyAudit(req.user!.id, req.user!.name, 'Lesson Created', 'lesson', id, `${d.title} (${d.status})`);
   broadcastWs('academy:updated', { type: 'lesson', id });
-  if (d.send_push !== false) {
+
+  if (d.status === 'published' && d.send_push !== false) {
     await dispatchNotification({
       title: `New Academy Lesson: ${d.title}`,
       body: `${d.category} · ${d.duration_minutes} min study module published.`,
@@ -1301,8 +1833,231 @@ app.post('/api/academy/lessons', requireRole('admin'), async (req: AuthRequest, 
   res.status(201).json({ lesson });
 });
 
-app.delete('/api/academy/lessons/:id', requireRole('admin'), (req: Request, res: Response) => {
+app.patch('/api/academy/lessons/:id', requireRole('admin'), async (req: AuthRequest, res: Response) => {
+  const existing = db.prepare('SELECT * FROM lessons WHERE id = ?').get(req.params.id) as
+    | Record<string, unknown>
+    | undefined;
+  if (!existing) {
+    res.status(404).json({ error: 'Lesson not found.' });
+    return;
+  }
+
+  const updateSchema = lessonInputSchema.partial().extend({
+    material_update: z.boolean().optional(),
+    change_note: z.string().max(400).optional(),
+  });
+  const parsed = updateSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid lesson update payload.' });
+    return;
+  }
+
+  const d = parsed.data;
+  const now = new Date().toISOString();
+  const nextVersion = Number(existing.material_version || 1) + 1;
+  const nextStatus = d.status ?? String(existing.status || 'published');
+  const nextPublishedAt =
+    nextStatus === 'published' && !existing.published_at ? now : existing.published_at;
+
+  db.prepare(
+    `UPDATE lessons SET
+      course_id = ?, title = ?, category = ?, summary = ?, learning_objective = ?,
+      introduction = ?, content = ?, demonstration = ?, common_mistakes_json = ?,
+      summary_recap = ?, practical_exercise_json = ?, visual_key = ?, video_url = ?,
+      audio_url = ?, transcript = ?, pdf_url = ?, image_url = ?, sources_json = ?,
+      tags_json = ?, duration_minutes = ?, order_index = ?, status = ?, scheduled_at = ?,
+      published_at = ?, updated_at = ?, material_version = ?, quiz_json = ?
+     WHERE id = ?`
+  ).run(
+    d.course_id ?? existing.course_id,
+    d.title ?? existing.title,
+    d.category ?? existing.category,
+    d.summary ?? existing.summary,
+    d.learning_objective !== undefined ? d.learning_objective : existing.learning_objective,
+    d.introduction !== undefined ? d.introduction : existing.introduction,
+    d.content ?? existing.content,
+    d.demonstration !== undefined ? d.demonstration : existing.demonstration,
+    d.common_mistakes ? JSON.stringify(d.common_mistakes) : existing.common_mistakes_json,
+    d.summary_recap !== undefined ? d.summary_recap : existing.summary_recap,
+    d.practical_exercise !== undefined
+      ? d.practical_exercise
+        ? JSON.stringify(d.practical_exercise)
+        : null
+      : existing.practical_exercise_json,
+    d.visual_key !== undefined ? d.visual_key : existing.visual_key,
+    d.video_url !== undefined ? d.video_url : existing.video_url,
+    d.audio_url !== undefined ? d.audio_url : existing.audio_url,
+    d.transcript !== undefined ? d.transcript : existing.transcript,
+    d.pdf_url !== undefined ? d.pdf_url : existing.pdf_url,
+    d.image_url !== undefined ? d.image_url : existing.image_url,
+    d.sources ? JSON.stringify(d.sources) : existing.sources_json,
+    d.tags ? JSON.stringify(d.tags) : existing.tags_json,
+    d.duration_minutes ?? existing.duration_minutes,
+    d.order_index ?? existing.order_index,
+    nextStatus,
+    d.scheduled_at !== undefined ? d.scheduled_at : existing.scheduled_at,
+    nextPublishedAt,
+    now,
+    nextVersion,
+    d.quiz ? JSON.stringify(d.quiz) : existing.quiz_json,
+    req.params.id
+  );
+
+  db.prepare(
+    `INSERT INTO lesson_versions (id, lesson_id, version_number, title, content, changed_by, change_note, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    crypto.randomUUID(),
+    req.params.id,
+    nextVersion,
+    String(d.title ?? existing.title),
+    String(d.content ?? existing.content),
+    req.user!.name,
+    d.change_note || (d.material_update ? 'Material curriculum update' : 'Lesson edit'),
+    now
+  );
+
+  // Preserve learner completion records; optionally flag for review if materially updated
+  if (d.material_update) {
+    db.prepare(
+      'UPDATE lesson_progress SET needs_review = 1, needs_review_note = ? WHERE lesson_id = ? AND completed = 1'
+    ).run(d.change_note || 'Curriculum updated by Academy Admin — recommended review.', req.params.id);
+  }
+
+  logAcademyAudit(
+    req.user!.id,
+    req.user!.name,
+    'Lesson Updated',
+    'lesson',
+    req.params.id,
+    `${String(d.title ?? existing.title)} · v${nextVersion} (${nextStatus})${d.material_update ? ' [Review Flagged]' : ''}`
+  );
+  broadcastWs('academy:updated', { type: 'lesson_updated', id: req.params.id });
+
+  if (nextStatus === 'published' && existing.status !== 'published' && d.send_push) {
+    await dispatchNotification({
+      title: `Academy Lesson Published: ${String(d.title ?? existing.title)}`,
+      body: `${String(d.category ?? existing.category)} lesson is now live.`,
+      category: 'academy',
+      linkUrl: '/academy',
+      broadcastWs,
+    });
+  }
+
+  const updated = db.prepare('SELECT * FROM lessons WHERE id = ?').get(req.params.id);
+  res.json({ lesson: updated });
+});
+
+app.post('/api/academy/lessons/reorder', requireRole('admin'), (req: AuthRequest, res: Response) => {
+  const schema = z.object({
+    course_id: z.string().min(1),
+    lesson_ids: z.array(z.string().min(1)).min(1),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid reorder payload.' });
+    return;
+  }
+
+  const updateOrder = db.prepare('UPDATE lessons SET order_index = ?, updated_at = ? WHERE id = ? AND course_id = ?');
+  const now = new Date().toISOString();
+  const tx = db.transaction(() => {
+    parsed.data.lesson_ids.forEach((lid, idx) => {
+      updateOrder.run(idx + 1, now, lid, parsed.data.course_id);
+    });
+  });
+  tx();
+
+  logAcademyAudit(req.user!.id, req.user!.name, 'Lessons Reordered', 'course', parsed.data.course_id, `${parsed.data.lesson_ids.length} lessons arranged`);
+  broadcastWs('academy:updated', { type: 'lessons_reordered', course_id: parsed.data.course_id });
+  res.json({ ok: true });
+});
+
+app.get('/api/academy/lessons/:id/versions', requireRole('admin'), (req: Request, res: Response) => {
+  const versions = db
+    .prepare('SELECT * FROM lesson_versions WHERE lesson_id = ? ORDER BY version_number DESC LIMIT 20')
+    .all(req.params.id);
+  res.json({ versions });
+});
+
+app.get('/api/admin/academy/audit', requireRole('admin'), (_req: Request, res: Response) => {
+  const logs = db.prepare('SELECT * FROM academy_audit_logs ORDER BY created_at DESC LIMIT 60').all();
+  const reports = db.prepare('SELECT * FROM academy_content_reports ORDER BY created_at DESC LIMIT 60').all();
+  res.json({ logs, reports });
+});
+
+app.patch('/api/admin/academy/reports/:id', requireRole('admin'), (req: AuthRequest, res: Response) => {
+  const schema = z.object({
+    status: z.enum(['resolved', 'dismissed']),
+    resolution_note: z.string().max(400).optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid report resolution.' });
+    return;
+  }
+  db.prepare('UPDATE academy_content_reports SET status = ?, resolution_note = ? WHERE id = ?').run(
+    parsed.data.status,
+    parsed.data.resolution_note || null,
+    req.params.id
+  );
+  logAcademyAudit(req.user!.id, req.user!.name, `Content Report ${parsed.data.status}`, 'report', req.params.id, parsed.data.resolution_note || '');
+  res.json({ ok: true });
+});
+
+app.post('/api/admin/academy/generate-illustration', requireRole('admin'), async (req: AuthRequest, res: Response) => {
+  const schema = z.object({
+    topic: z.string().trim().min(3).max(200),
+    description: z.string().trim().min(5).max(800),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Provide a topic and brief concept description.' });
+    return;
+  }
+
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    res.status(503).json({
+      error: 'GEMINI_API_KEY is not configured on the server. Add GEMINI_API_KEY or upload a custom diagram image directly.',
+    });
+    return;
+  }
+
+  try {
+    const ai = new GoogleGenAI({
+      apiKey,
+      httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
+    });
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-4-hydrogen',
+      contents: `Generate a clean, crisp, publication-grade educational SVG diagram (width="820" height="420" viewBox="0 0 820 420") illustrating the following Forex trading concept clearly:\nTopic: ${parsed.data.topic}\nConcept: ${parsed.data.description}\n\nDesign rules:\n- Use clean slate (#0F172A, #475569, #F8FAFC), maroon (#881337), and emerald (#15803D) vector palette with light #FFFFFF card background.\n- Label key elements, price zones, entry/stop levels, or structure points legibly using Plus Jakarta Sans / sans-serif font.\n- Include a small subtle label in the top-right corner: "SIMULATED EDUCATIONAL DIAGRAM".\n- Never fabricate real market historical quotes or promise profits.\n- Return ONLY valid raw <svg ...>...</svg> markup with zero markdown backticks or commentary.`,
+    });
+
+    const raw = (response.text || '').trim();
+    const svgMatch = raw.match(/<svg[\s\S]*<\/svg>/i);
+    if (!svgMatch) {
+      res.status(502).json({ error: 'Model response did not return valid SVG diagram markup.' });
+      return;
+    }
+
+    // Strip any unsafe script tags if present
+    const cleanSvg = svgMatch[0].replace(/<script[\s\S]*?<\/script>/gi, '');
+    const filename = `illustration-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.svg`;
+    fs.writeFileSync(path.join(UPLOAD_DIR, filename), cleanSvg, 'utf-8');
+
+    const url = `/uploads/${filename}`;
+    logAcademyAudit(req.user!.id, req.user!.name, 'Generated Educational Illustration', 'illustration', filename, parsed.data.topic);
+    res.status(201).json({ url, filename });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Illustration generation failed.' });
+  }
+});
+
+app.delete('/api/academy/lessons/:id', requireRole('admin'), (req: AuthRequest, res: Response) => {
   db.prepare('DELETE FROM lessons WHERE id = ?').run(req.params.id);
+  logAcademyAudit(req.user!.id, req.user!.name, 'Lesson Deleted', 'lesson', req.params.id, 'Removed lesson');
   broadcastWs('academy:updated', { type: 'lesson_deleted', id: req.params.id });
   res.json({ ok: true });
 });
@@ -1917,6 +2672,27 @@ setInterval(async () => {
         category: n.category as keyof NotificationPreferences,
         linkUrl: n.link_url,
         targetUserIds: n.target_user_ids ? (JSON.parse(n.target_user_ids) as string[]) : null,
+        broadcastWs,
+      });
+    }
+
+    // 2.5 Publish due scheduled Academy lessons
+    const dueLessons = db
+      .prepare("SELECT * FROM lessons WHERE status = 'scheduled' AND scheduled_at IS NOT NULL AND scheduled_at <= ?")
+      .all(nowIso) as Array<Record<string, unknown>>;
+
+    for (const l of dueLessons) {
+      db.prepare("UPDATE lessons SET status = 'published', published_at = ?, updated_at = ? WHERE id = ?").run(
+        nowIso,
+        nowIso,
+        String(l.id)
+      );
+      broadcastWs('academy:updated', { type: 'lesson_published', id: String(l.id) });
+      await dispatchNotification({
+        title: `New Academy Lesson: ${String(l.title)}`,
+        body: `${String(l.category)} lesson is now available in the Trading Academy.`,
+        category: 'academy',
+        linkUrl: '/academy',
         broadcastWs,
       });
     }

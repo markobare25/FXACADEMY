@@ -7,7 +7,6 @@ import {
   Edit3,
   LayoutDashboard,
   Pin,
-  Plus,
   Radio,
   Search,
   Settings as SettingsIcon,
@@ -19,13 +18,11 @@ import {
 } from 'lucide-react';
 import { usePlatform } from '../context/PlatformContext';
 import { apiFetch, formatLocalDateTime, uploadMediaFile } from '../lib/api';
-import { ACADEMY_CATEGORIES } from './AcademyPage';
+import { AdminAcademyManager } from '../components/admin/AdminAcademyManager';
 import type {
-  CourseLevel,
   MarketUpdate,
   MarketUpdateCategory,
   PlatformSettings,
-  QuizQuestion,
   SignalDirection,
   SignalStatus,
   TradingSignal,
@@ -82,7 +79,7 @@ interface OverviewPayload {
 }
 
 export const AdminPage: React.FC = () => {
-  const { user, settings, signals, courses, refreshAll, navigate } = usePlatform();
+  const { user, settings, signals, refreshAll, navigate } = usePlatform();
   const [tab, setTab] = useState<AdminTab>('overview');
   const [overview, setOverview] = useState<OverviewPayload | null>(null);
   const [allUpdates, setAllUpdates] = useState<MarketUpdate[]>([]);
@@ -154,33 +151,6 @@ export const AdminPage: React.FC = () => {
     scheduled_at: '',
   });
 
-  // Academy Form State
-  const [courseForm, setCourseForm] = useState({
-    title: '',
-    description: '',
-    category: ACADEMY_CATEGORIES[0],
-    level: 'Beginner' as CourseLevel,
-    cover_image_url: '',
-  });
-  const [lessonForm, setLessonForm] = useState({
-    course_id: '',
-    title: '',
-    category: ACADEMY_CATEGORIES[0],
-    summary: '',
-    content: '',
-    video_url: '',
-    pdf_url: '',
-    image_url: '',
-    duration_minutes: 15,
-    order_index: 1,
-    quizQuestion: '',
-    quizOptA: '',
-    quizOptB: '',
-    quizOptC: '',
-    quizCorrect: 0,
-    send_push: true,
-  });
-
   // User search
   const [userSearch, setUserSearch] = useState('');
 
@@ -190,12 +160,6 @@ export const AdminPage: React.FC = () => {
   useEffect(() => {
     setSettingsForm(settings);
   }, [settings]);
-
-  useEffect(() => {
-    if (!lessonForm.course_id && courses.length > 0) {
-      setLessonForm((f) => ({ ...f, course_id: courses[0].id }));
-    }
-  }, [courses, lessonForm.course_id]);
 
   const loadAdminData = useCallback(async () => {
     if (user?.role !== 'admin') return;
@@ -414,82 +378,6 @@ export const AdminPage: React.FC = () => {
       await loadAdminData();
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Failed to send notification.');
-    }
-  };
-
-  // --- Academy Handlers ---
-  const handleCreateCourse = async (e: React.FormEvent) => {
-    e.preventDefault();
-    try {
-      await apiFetch('/api/academy/courses', {
-        method: 'POST',
-        body: JSON.stringify(courseForm),
-      });
-      setCourseForm({
-        title: '',
-        description: '',
-        category: ACADEMY_CATEGORIES[0],
-        level: 'Beginner',
-        cover_image_url: '',
-      });
-      notifyOk('Course created.');
-      await refreshAll();
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : 'Course creation failed.');
-    }
-  };
-
-  const handleCreateLesson = async (e: React.FormEvent) => {
-    e.preventDefault();
-    try {
-      const quiz: QuizQuestion[] =
-        lessonForm.quizQuestion.trim() && lessonForm.quizOptA.trim() && lessonForm.quizOptB.trim()
-          ? [
-              {
-                id: `q-${Date.now()}`,
-                question: lessonForm.quizQuestion.trim(),
-                options: [lessonForm.quizOptA, lessonForm.quizOptB, lessonForm.quizOptC].filter(
-                  (x) => x.trim().length > 0
-                ),
-                correct_index: lessonForm.quizCorrect,
-              },
-            ]
-          : [];
-
-      await apiFetch('/api/academy/lessons', {
-        method: 'POST',
-        body: JSON.stringify({
-          course_id: lessonForm.course_id,
-          title: lessonForm.title,
-          category: lessonForm.category,
-          summary: lessonForm.summary,
-          content: lessonForm.content,
-          video_url: lessonForm.video_url || null,
-          pdf_url: lessonForm.pdf_url || null,
-          image_url: lessonForm.image_url || null,
-          duration_minutes: Number(lessonForm.duration_minutes) || 15,
-          order_index: Number(lessonForm.order_index) || 1,
-          quiz,
-          send_push: lessonForm.send_push,
-        }),
-      });
-      setLessonForm((f) => ({
-        ...f,
-        title: '',
-        summary: '',
-        content: '',
-        video_url: '',
-        pdf_url: '',
-        image_url: '',
-        quizQuestion: '',
-        quizOptA: '',
-        quizOptB: '',
-        quizOptC: '',
-      }));
-      notifyOk('Lesson published to Academy.');
-      await refreshAll();
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : 'Failed to publish lesson.');
     }
   };
 
@@ -1340,226 +1228,14 @@ export const AdminPage: React.FC = () => {
 
       {/* E. ACADEMY MANAGEMENT */}
       {tab === 'academy' && (
-        <div className="space-y-6">
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            {/* Create Course */}
-            <form
-              onSubmit={handleCreateCourse}
-              className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5 space-y-3.5"
-            >
-              <h2 className="text-base font-bold text-slate-900 dark:text-white">Create Course</h2>
-              <input
-                type="text"
-                required
-                placeholder="Course title"
-                value={courseForm.title}
-                onChange={(e) => setCourseForm({ ...courseForm, title: e.target.value })}
-                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
-              />
-              <div className="grid grid-cols-2 gap-3">
-                <select
-                  value={courseForm.category}
-                  onChange={(e) => setCourseForm({ ...courseForm, category: e.target.value })}
-                  className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs"
-                >
-                  {ACADEMY_CATEGORIES.map((c) => (
-                    <option key={c} value={c}>
-                      {c}
-                    </option>
-                  ))}
-                </select>
-                <select
-                  value={courseForm.level}
-                  onChange={(e) =>
-                    setCourseForm({ ...courseForm, level: e.target.value as CourseLevel })
-                  }
-                  className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs"
-                >
-                  <option value="Beginner">Beginner</option>
-                  <option value="Intermediate">Intermediate</option>
-                  <option value="Advanced">Advanced</option>
-                </select>
-              </div>
-              <textarea
-                rows={3}
-                required
-                placeholder="Course description..."
-                value={courseForm.description}
-                onChange={(e) => setCourseForm({ ...courseForm, description: e.target.value })}
-                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
-              />
-              <button
-                type="submit"
-                className="inline-flex items-center gap-2 rounded-lg bg-[#15803D] px-4 py-2 text-xs font-semibold text-white hover:bg-[#166534]"
-              >
-                <Plus className="w-4 h-4" /> Create Course
-              </button>
-            </form>
-
-            {/* Publish Lesson */}
-            <form
-              onSubmit={handleCreateLesson}
-              className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5 space-y-3"
-            >
-              <h2 className="text-base font-bold text-slate-900 dark:text-white">
-                Publish Lesson & Quiz
-              </h2>
-              <div className="grid grid-cols-2 gap-3">
-                <select
-                  value={lessonForm.course_id}
-                  onChange={(e) => setLessonForm({ ...lessonForm, course_id: e.target.value })}
-                  className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs"
-                >
-                  {courses.map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.title}
-                    </option>
-                  ))}
-                </select>
-                <select
-                  value={lessonForm.category}
-                  onChange={(e) => setLessonForm({ ...lessonForm, category: e.target.value })}
-                  className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs"
-                >
-                  {ACADEMY_CATEGORIES.map((c) => (
-                    <option key={c} value={c}>
-                      {c}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <input
-                type="text"
-                required
-                placeholder="Lesson title"
-                value={lessonForm.title}
-                onChange={(e) => setLessonForm({ ...lessonForm, title: e.target.value })}
-                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
-              />
-              <input
-                type="text"
-                required
-                placeholder="Short summary"
-                value={lessonForm.summary}
-                onChange={(e) => setLessonForm({ ...lessonForm, summary: e.target.value })}
-                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs"
-              />
-              <textarea
-                rows={3}
-                required
-                placeholder="Full lesson content..."
-                value={lessonForm.content}
-                onChange={(e) => setLessonForm({ ...lessonForm, content: e.target.value })}
-                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
-              />
-
-              <div className="flex flex-wrap gap-2 text-xs">
-                <label className="inline-flex items-center gap-1.5 cursor-pointer rounded-lg border border-slate-300 dark:border-slate-700 px-2.5 py-1.5">
-                  <Upload className="w-3.5 h-3.5" />
-                  <span>{lessonForm.pdf_url ? 'PDF Ready' : 'Upload PDF'}</span>
-                  <input
-                    type="file"
-                    accept="application/pdf"
-                    className="hidden"
-                    onChange={(e) =>
-                      handleUploadField(e.target.files?.[0], (url) =>
-                        setLessonForm((f) => ({ ...f, pdf_url: url }))
-                      )
-                    }
-                  />
-                </label>
-                <label className="inline-flex items-center gap-1.5 cursor-pointer rounded-lg border border-slate-300 dark:border-slate-700 px-2.5 py-1.5">
-                  <Upload className="w-3.5 h-3.5" />
-                  <span>{lessonForm.video_url ? 'Video Ready' : 'Upload Video'}</span>
-                  <input
-                    type="file"
-                    accept="video/mp4,video/webm"
-                    className="hidden"
-                    onChange={(e) =>
-                      handleUploadField(e.target.files?.[0], (url) =>
-                        setLessonForm((f) => ({ ...f, video_url: url }))
-                      )
-                    }
-                  />
-                </label>
-              </div>
-
-              <div className="rounded-lg border border-slate-200 dark:border-slate-800 p-3 space-y-2 text-xs">
-                <p className="font-semibold">Optional Quiz Question</p>
-                <input
-                  type="text"
-                  placeholder="Quiz question..."
-                  value={lessonForm.quizQuestion}
-                  onChange={(e) => setLessonForm({ ...lessonForm, quizQuestion: e.target.value })}
-                  className="w-full rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2.5 py-1.5"
-                />
-                <div className="grid grid-cols-3 gap-2">
-                  <input
-                    type="text"
-                    placeholder="Option A (Correct if 0)"
-                    value={lessonForm.quizOptA}
-                    onChange={(e) => setLessonForm({ ...lessonForm, quizOptA: e.target.value })}
-                    className="rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2 py-1"
-                  />
-                  <input
-                    type="text"
-                    placeholder="Option B"
-                    value={lessonForm.quizOptB}
-                    onChange={(e) => setLessonForm({ ...lessonForm, quizOptB: e.target.value })}
-                    className="rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2 py-1"
-                  />
-                  <input
-                    type="text"
-                    placeholder="Option C"
-                    value={lessonForm.quizOptC}
-                    onChange={(e) => setLessonForm({ ...lessonForm, quizOptC: e.target.value })}
-                    className="rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2 py-1"
-                  />
-                </div>
-              </div>
-
-              <button
-                type="submit"
-                className="w-full rounded-lg bg-[#15803D] py-2 text-xs font-semibold text-white hover:bg-[#166534] min-h-[40px]"
-              >
-                Publish Lesson
-              </button>
-            </form>
-          </div>
-
-          {/* Student Progress Table */}
-          <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5">
-            <h2 className="text-sm font-bold text-slate-900 dark:text-white mb-3">
-              Student Progress Monitoring
-            </h2>
-            <div className="overflow-x-auto">
-              <table className="w-full text-left text-xs">
-                <thead>
-                  <tr className="border-b border-slate-200 dark:border-slate-800 text-slate-500">
-                    <th className="py-2 pr-4">Student</th>
-                    <th className="py-2 pr-4">Email</th>
-                    <th className="py-2 pr-4 text-right">Enrolled</th>
-                    <th className="py-2 pr-4 text-right">Lessons Done</th>
-                    <th className="py-2 text-right">Avg Quiz</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                  {(overview?.student_progress || []).map((st) => (
-                    <tr key={st.id}>
-                      <td className="py-2 pr-4 font-medium">{st.name}</td>
-                      <td className="py-2 pr-4 text-slate-500">{st.email}</td>
-                      <td className="py-2 pr-4 text-right font-mono">{st.courses_enrolled}</td>
-                      <td className="py-2 pr-4 text-right font-mono">{st.lessons_completed}</td>
-                      <td className="py-2 text-right font-mono">
-                        {st.avg_quiz_score !== null ? `${st.avg_quiz_score}%` : '—'}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
+        <AdminAcademyManager
+          studentProgress={overview?.student_progress || []}
+          onNotify={notifyOk}
+          onError={setErrorMsg}
+          onGlobalRefresh={async () => {
+            await Promise.all([refreshAll(), loadAdminData()]);
+          }}
+        />
       )}
 
       {/* F. USER MANAGEMENT, REPORTS & CONTACTS */}

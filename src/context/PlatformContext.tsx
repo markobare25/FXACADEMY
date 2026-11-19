@@ -1,6 +1,7 @@
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
 import { apiFetch, setStoredToken } from '../lib/api';
 import type {
+  AcademyResumeState,
   AppNotification,
   Course,
   MarketUpdate,
@@ -22,6 +23,7 @@ interface PlatformContextValue {
   signals: TradingSignal[];
   updates: MarketUpdate[];
   courses: Course[];
+  resumeState: AcademyResumeState | null;
   notifications: AppNotification[];
   unreadCount: number;
   showNotifModal: boolean;
@@ -35,6 +37,7 @@ interface PlatformContextValue {
   setSignals: React.Dispatch<React.SetStateAction<TradingSignal[]>>;
   setUpdates: React.Dispatch<React.SetStateAction<MarketUpdate[]>>;
   setCourses: React.Dispatch<React.SetStateAction<Course[]>>;
+  setResumeState: React.Dispatch<React.SetStateAction<AcademyResumeState | null>>;
 }
 
 const DEFAULT_SETTINGS: PlatformSettings = {
@@ -93,6 +96,7 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   const [signals, setSignals] = useState<TradingSignal[]>([]);
   const [updates, setUpdates] = useState<MarketUpdate[]>([]);
   const [courses, setCourses] = useState<Course[]>([]);
+  const [resumeState, setResumeState] = useState<AcademyResumeState | null>(null);
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
   const [unreadCount, setUnreadCount] = useState(0);
   const [showNotifModal, setShowNotifModal] = useState(false);
@@ -154,7 +158,7 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         apiFetch<{ settings: PlatformSettings; stats: PublicStats }>('/api/settings'),
         apiFetch<{ signals: TradingSignal[] }>('/api/signals'),
         apiFetch<{ updates: MarketUpdate[] }>('/api/updates'),
-        apiFetch<{ courses: Course[] }>('/api/academy/courses'),
+        apiFetch<{ courses: Course[]; resume_state?: AcademyResumeState | null }>('/api/academy/courses'),
       ]);
 
       setUser(meRes.user);
@@ -163,6 +167,7 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       setSignals(sigRes.signals);
       setUpdates(updRes.updates);
       setCourses(acadRes.courses);
+      setResumeState(acadRes.resume_state ?? null);
 
       if (settingsRes.settings.seo_title) {
         document.title = settingsRes.settings.seo_title;
@@ -281,8 +286,13 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
               break;
             }
             case 'academy:updated': {
-              apiFetch<{ courses: Course[] }>('/api/academy/courses')
-                .then((res) => setCourses(res.courses))
+              apiFetch<{ courses: Course[]; resume_state?: AcademyResumeState | null }>('/api/academy/courses')
+                .then((res) => {
+                  setCourses(res.courses);
+                  if (res.resume_state !== undefined) {
+                    setResumeState(res.resume_state);
+                  }
+                })
                 .catch(() => undefined);
               break;
             }
@@ -347,6 +357,7 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     await apiFetch('/api/auth/logout', { method: 'POST' }).catch(() => undefined);
     setStoredToken(null);
     setUser(null);
+    setResumeState(null);
     setNotifications([]);
     setUnreadCount(0);
     navigate('/');
@@ -366,6 +377,7 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         signals,
         updates,
         courses,
+        resumeState,
         notifications,
         unreadCount,
         showNotifModal,
@@ -379,6 +391,7 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         setSignals,
         setUpdates,
         setCourses,
+        setResumeState,
       }}
     >
       {children}
