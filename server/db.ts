@@ -30,6 +30,10 @@ export const DB_PATH = path.join(DATA_DIR, 'meridianfx.db');
 export const UPLOAD_DIR = UPLOADS_DIR;
 export const BACKUP_DIR = BACKUPS_DIR;
 
+export const DESIGNATED_ADMIN_EMAIL = (
+  process.env.DESIGNATED_ADMIN_EMAIL || 'markobare25@gmail.com'
+).toLowerCase();
+
 export const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
@@ -128,6 +132,36 @@ export function initDatabase(): void {
       created_by TEXT NOT NULL,
       created_at TEXT NOT NULL,
       FOREIGN KEY (signal_id) REFERENCES signals(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS signal_messages (
+      id TEXT PRIMARY KEY,
+      author_id TEXT NOT NULL,
+      author_name TEXT NOT NULL,
+      content TEXT NOT NULL DEFAULT '',
+      image_url TEXT,
+      image_name TEXT,
+      message_type TEXT NOT NULL DEFAULT 'update',
+      status TEXT NOT NULL DEFAULT 'active',
+      pinned INTEGER NOT NULL DEFAULT 0,
+      edited_at TEXT,
+      completed_at TEXT,
+      completed_summary TEXT,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_signal_messages_status_created
+      ON signal_messages(status, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS signal_message_reactions (
+      message_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      reaction TEXT NOT NULL CHECK (reaction IN ('love', 'like')),
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (message_id, user_id),
+      FOREIGN KEY (message_id) REFERENCES signal_messages(id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     );
 
     CREATE TABLE IF NOT EXISTS market_updates (
@@ -512,13 +546,41 @@ function seedInitialData(): void {
     upsertSetting.run('jwt_secret', crypto.randomBytes(48).toString('hex'));
   }
 
-  // Seed primary Administrator if zero admins exist
+  // Ensure designated administrator account (markobare25@gmail.com) has admin privileges if present or configured
+  const designatedUser = db
+    .prepare('SELECT id, role, status, email_verified FROM users WHERE LOWER(email) = ?')
+    .get(DESIGNATED_ADMIN_EMAIL) as
+    | { id: string; role: string; status: string; email_verified: number }
+    | undefined;
+
+  if (designatedUser) {
+    if (designatedUser.role !== 'admin' || designatedUser.status !== 'active' || !designatedUser.email_verified) {
+      db.prepare("UPDATE users SET role = 'admin', status = 'active', email_verified = 1 WHERE id = ?").run(
+        designatedUser.id
+      );
+    }
+  } else if (process.env.ADMIN_PASSWORD && process.env.ADMIN_PASSWORD.length >= 8) {
+    db.prepare(
+      `INSERT INTO users (id, name, email, password_hash, role, status, email_verified, bio, created_at)
+       VALUES (?, ?, ?, ?, 'admin', 'active', 1, ?, ?)`
+    ).run(
+      crypto.randomUUID(),
+      'MeridianFX Admin',
+      DESIGNATED_ADMIN_EMAIL,
+      hashPassword(process.env.ADMIN_PASSWORD),
+      'Head of Trading Desk & Signals Strategy at MeridianFX.',
+      now
+    );
+  }
+
+  // Seed primary fallback Administrator if zero admins exist
   const adminCount = db
     .prepare("SELECT COUNT(*) as cnt FROM users WHERE role = 'admin'")
     .get() as { cnt: number };
   let adminId = '';
   if (adminCount.cnt === 0) {
     adminId = crypto.randomUUID();
+    const initialSecret = process.env.ADMIN_PASSWORD || crypto.randomBytes(24).toString('hex');
     db.prepare(
       `INSERT INTO users (id, name, email, password_hash, role, status, email_verified, bio, created_at)
        VALUES (?, ?, ?, ?, 'admin', 'active', 1, ?, ?)`
@@ -526,14 +588,14 @@ function seedInitialData(): void {
       adminId,
       'Chief Market Strategist',
       'admin@meridianfx.com',
-      hashPassword('Admin!Meridian2026'),
+      hashPassword(initialSecret),
       'Head of Macro Research & FX Strategy at MeridianFX.',
       now
     );
   } else {
     const existingAdmin = db
-      .prepare("SELECT id FROM users WHERE role = 'admin' LIMIT 1")
-      .get() as { id: string };
+      .prepare("SELECT id FROM users WHERE role = 'admin' ORDER BY CASE WHEN LOWER(email) = ? THEN 0 ELSE 1 END LIMIT 1")
+      .get(DESIGNATED_ADMIN_EMAIL) as { id: string };
     adminId = existingAdmin.id;
   }
 
@@ -845,6 +907,8 @@ export function createDatabaseBackup(): { filename: string; path: string; create
     users: db.prepare('SELECT id, name, email, role, status, email_verified, timezone, notification_prefs, watchlist, created_at, last_login_at FROM users').all(),
     signals: db.prepare('SELECT * FROM signals').all(),
     signal_updates: db.prepare('SELECT * FROM signal_updates').all(),
+    signal_messages: db.prepare('SELECT * FROM signal_messages').all(),
+    signal_message_reactions: db.prepare('SELECT * FROM signal_message_reactions').all(),
     market_updates: db.prepare('SELECT * FROM market_updates').all(),
     courses: db.prepare('SELECT * FROM courses').all(),
     lessons: db.prepare('SELECT * FROM lessons').all(),

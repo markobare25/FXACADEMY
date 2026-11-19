@@ -360,6 +360,7 @@ export const ForgotPasswordPage: React.FC = () => {
   const [code, setCode] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [issuedCode, setIssuedCode] = useState<string | null>(null);
+  const [isAdminRecovery, setIsAdminRecovery] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -367,12 +368,21 @@ export const ForgotPasswordPage: React.FC = () => {
     e.preventDefault();
     setLoading(true);
     setError(null);
+    setIssuedCode(null);
+    setIsAdminRecovery(false);
     try {
-      const res = await apiFetch<{ reset_code?: string }>('/api/auth/forgot-password', {
-        method: 'POST',
-        body: JSON.stringify({ email }),
-      });
-      if (res.reset_code) setIssuedCode(res.reset_code);
+      const res = await apiFetch<{ reset_code?: string; is_admin_account?: boolean }>(
+        '/api/auth/forgot-password',
+        {
+          method: 'POST',
+          body: JSON.stringify({ email }),
+        }
+      );
+      if (res.is_admin_account) {
+        setIsAdminRecovery(true);
+      } else if (res.reset_code) {
+        setIssuedCode(res.reset_code);
+      }
       setStep('reset');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Request failed.');
@@ -420,7 +430,7 @@ export const ForgotPasswordPage: React.FC = () => {
                 required
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
-                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3.5 py-2.5 text-sm text-slate-900 dark:text-white"
+                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3.5 py-2.5 text-base sm:text-sm text-slate-900 dark:text-white"
               />
             </div>
             {error && <p className="text-xs text-red-500">{error}</p>}
@@ -436,6 +446,11 @@ export const ForgotPasswordPage: React.FC = () => {
 
         {step === 'reset' && (
           <form onSubmit={handleReset} className="mt-6 space-y-4">
+            {isAdminRecovery && (
+              <div className="rounded-lg border border-emerald-200 dark:border-emerald-900/40 bg-emerald-50 dark:bg-emerald-950/20 px-3 py-2.5 text-xs text-emerald-800 dark:text-emerald-300 leading-relaxed">
+                Administrator credentials are never exposed in browser responses. Enter your server recovery key (<span className="font-mono font-semibold">ADMIN_RESET_KEY</span>) or the one-time recovery code recorded in your server console logs.
+              </div>
+            )}
             {issuedCode && (
               <div className="rounded-lg border border-rose-200 dark:border-rose-900/40 bg-rose-50 dark:bg-rose-950/20 px-3 py-2 text-xs text-[#881337] dark:text-rose-400">
                 Recovery code issued: <span className="font-mono font-bold">{issuedCode}</span>
@@ -443,14 +458,15 @@ export const ForgotPasswordPage: React.FC = () => {
             )}
             <div>
               <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
-                Reset Code
+                {isAdminRecovery ? 'Admin Recovery Key or Server Code' : 'Reset Code'}
               </label>
               <input
                 type="text"
                 required
                 value={code}
                 onChange={(e) => setCode(e.target.value)}
-                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3.5 py-2.5 text-sm font-mono text-slate-900 dark:text-white"
+                placeholder={isAdminRecovery ? 'Enter ADMIN_RESET_KEY or 6-digit code' : 'Enter 6-digit code'}
+                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3.5 py-2.5 text-base sm:text-sm font-mono text-slate-900 dark:text-white"
               />
             </div>
             <div>
@@ -463,7 +479,7 @@ export const ForgotPasswordPage: React.FC = () => {
                 minLength={8}
                 value={newPassword}
                 onChange={(e) => setNewPassword(e.target.value)}
-                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3.5 py-2.5 text-sm text-slate-900 dark:text-white"
+                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3.5 py-2.5 text-base sm:text-sm text-slate-900 dark:text-white"
               />
             </div>
             {error && <p className="text-xs text-red-500">{error}</p>}

@@ -61,6 +61,31 @@ export interface TradingSignal {
   updates?: SignalUpdateEntry[];
 }
 
+export type SignalChatMessageType = 'signal' | 'update' | 'analysis' | 'announcement';
+export type SignalChatStatus = 'active' | 'completed';
+export type SignalReactionType = 'love' | 'like';
+
+export interface SignalChatMessage {
+  id: string;
+  author_id: string;
+  author_name: string;
+  content: string;
+  image_url?: string | null;
+  image_name?: string | null;
+  message_type: SignalChatMessageType;
+  status: SignalChatStatus;
+  pinned: boolean;
+  edited_at?: string | null;
+  completed_at?: string | null;
+  completed_summary?: string | null;
+  created_at: string;
+  reactions: {
+    love: number;
+    like: number;
+  };
+  user_reaction: SignalReactionType | null;
+}
+
 export type MarketUpdateCategory =
   | 'Breaking News'
   | 'Forex Update'

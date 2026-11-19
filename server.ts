@@ -10,6 +10,7 @@ import { GoogleGenAI } from '@google/genai';
 import { z } from 'zod';
 import {
   BACKUP_DIR,
+  DESIGNATED_ADMIN_EMAIL,
   UPLOAD_DIR,
   createDatabaseBackup,
   db,
@@ -55,9 +56,16 @@ httpServer.on('upgrade', (request, socket, head) => {
 const wsClients = new Set<WebSocket>();
 wss.on('connection', (ws) => {
   wsClients.add(ws);
-  ws.send(JSON.stringify({ event: 'connected', data: { timestamp: new Date().toISOString() } }));
-  ws.on('close', () => wsClients.delete(ws));
-  ws.on('error', () => wsClients.delete(ws));
+  ws.send(JSON.stringify({ event: 'connected', data: { timestamp: new Date().toISOString(), online_count: wsClients.size } }));
+  broadcastWs('presence:update', { online_count: wsClients.size });
+  ws.on('close', () => {
+    wsClients.delete(ws);
+    broadcastWs('presence:update', { online_count: wsClients.size });
+  });
+  ws.on('error', () => {
+    wsClients.delete(ws);
+    broadcastWs('presence:update', { online_count: wsClients.size });
+  });
 });
 
 function broadcastWs(event: string, data: unknown): void {
@@ -235,15 +243,19 @@ app.post('/api/auth/register', rateLimit(15, 60_000), (req: Request, res: Respon
   const now = new Date().toISOString();
   const verifyToken = crypto.randomBytes(24).toString('hex');
   const verifyCode = String(crypto.randomInt(100000, 999999));
+  const assignedRole = email === DESIGNATED_ADMIN_EMAIL ? 'admin' : 'user';
+  const initialVerified = email === DESIGNATED_ADMIN_EMAIL ? 1 : 0;
 
   db.prepare(
     `INSERT INTO users (id, name, email, password_hash, role, status, email_verified, timezone, created_at, last_login_at)
-     VALUES (?, ?, ?, ?, 'user', 'active', 0, ?, ?, ?)`
+     VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)`
   ).run(
     userId,
     parsed.data.name,
     email,
     hashPassword(parsed.data.password),
+    assignedRole,
+    initialVerified,
     parsed.data.timezone || 'UTC',
     now,
     now
@@ -263,14 +275,13 @@ app.post('/api/auth/register', rateLimit(15, 60_000), (req: Request, res: Respon
   logUserActivity(userId, 'Account Registered', 'New MeridianFX trader account created.', req.ip);
 
   const userRow = db.prepare('SELECT * FROM users WHERE id = ?').get(userId) as Record<string, unknown>;
-  const token = signToken({ sub: userId, role: 'user' });
+  const token = signToken({ sub: userId, role: assignedRole });
   setSessionCookie(res, token);
 
   res.status(201).json({
     user: mapDbUser(userRow),
     token,
-    verification_code: verifyCode,
-    verification_token: verifyToken,
+    ...(initialVerified ? {} : { verification_code: verifyCode, verification_token: verifyToken }),
   });
 });
 
@@ -378,7 +389,9 @@ app.post('/api/auth/resend-verification', requireAuth, rateLimit(5, 60_000), (re
 
 app.post('/api/auth/forgot-password', rateLimit(10, 60_000), (req: Request, res: Response) => {
   const email = String(req.body?.email || '').trim().toLowerCase();
-  const user = db.prepare('SELECT id FROM users WHERE email = ?').get(email) as { id: string } | undefined;
+  const user = db.prepare('SELECT id, role FROM users WHERE email = ?').get(email) as
+    | { id: string; role: string }
+    | undefined;
 
   if (!user) {
     res.json({ ok: true, message: 'If an account exists for that email, a reset code has been generated.' });
@@ -398,6 +411,18 @@ app.post('/api/auth/forgot-password', rateLimit(10, 60_000), (req: Request, res:
     new Date(Date.now() + 60 * 60 * 1000).toISOString()
   );
   logUserActivity(user.id, 'Password Reset Requested', 'Reset code issued.', req.ip);
+
+  // Never expose administrator reset codes in public HTTP responses or database logs
+  if (user.role === 'admin') {
+    console.info(`[MeridianFX Admin Recovery] One-time reset code generated for ${email}: ${resetCode}`);
+    res.json({
+      ok: true,
+      is_admin_account: true,
+      message:
+        'Administrator recovery initiated. Enter your server recovery key (ADMIN_RESET_KEY) or server-issued one-time code to reset credentials.',
+    });
+    return;
+  }
 
   res.json({
     ok: true,
@@ -420,32 +445,45 @@ app.post('/api/auth/reset-password', rateLimit(10, 60_000), (req: Request, res: 
   }
 
   const user = db
-    .prepare('SELECT id FROM users WHERE email = ?')
-    .get(parsed.data.email.toLowerCase()) as { id: string } | undefined;
+    .prepare('SELECT id, role FROM users WHERE email = ?')
+    .get(parsed.data.email.toLowerCase()) as { id: string; role: string } | undefined;
   if (!user) {
     res.status(400).json({ error: 'Invalid reset code or email.' });
     return;
   }
 
-  const resetRow = db
-    .prepare(
-      'SELECT * FROM password_resets WHERE user_id = ? AND (code = ? OR token = ?) AND used = 0 ORDER BY expires_at DESC LIMIT 1'
-    )
-    .get(user.id, parsed.data.code, parsed.data.code) as
-    | { id: string; expires_at: string }
-    | undefined;
+  // Allow server-configured ADMIN_RESET_KEY for designated admin credential recovery
+  let authorizedViaAdminKey = false;
+  const serverResetKey = process.env.ADMIN_RESET_KEY;
+  if (user.role === 'admin' && serverResetKey && serverResetKey.length >= 12) {
+    const providedBuf = Buffer.from(parsed.data.code);
+    const expectedBuf = Buffer.from(serverResetKey);
+    if (providedBuf.length === expectedBuf.length && crypto.timingSafeEqual(providedBuf, expectedBuf)) {
+      authorizedViaAdminKey = true;
+    }
+  }
 
-  if (!resetRow || new Date(resetRow.expires_at).getTime() < Date.now()) {
-    res.status(400).json({ error: 'Invalid or expired reset code.' });
-    return;
+  if (!authorizedViaAdminKey) {
+    const resetRow = db
+      .prepare(
+        'SELECT * FROM password_resets WHERE user_id = ? AND (code = ? OR token = ?) AND used = 0 ORDER BY expires_at DESC LIMIT 1'
+      )
+      .get(user.id, parsed.data.code, parsed.data.code) as
+      | { id: string; expires_at: string }
+      | undefined;
+
+    if (!resetRow || new Date(resetRow.expires_at).getTime() < Date.now()) {
+      res.status(400).json({ error: 'Invalid or expired reset code.' });
+      return;
+    }
+    db.prepare('UPDATE password_resets SET used = 1 WHERE id = ?').run(resetRow.id);
   }
 
   db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(
     hashPassword(parsed.data.new_password),
     user.id
   );
-  db.prepare('UPDATE password_resets SET used = 1 WHERE id = ?').run(resetRow.id);
-  logUserActivity(user.id, 'Password Reset Completed', 'Password updated via reset token.', req.ip);
+  logUserActivity(user.id, 'Password Reset Completed', 'Password updated via verified recovery.', req.ip);
 
   res.json({ ok: true });
 });
@@ -566,7 +604,365 @@ app.delete('/api/users/account', requireAuth, (req: AuthRequest, res: Response) 
   res.json({ ok: true });
 });
 
-// ---------- Trading Signals ----------
+// ---------- Signals Community Chat (Active Live Stream & Completed Archive) ----------
+const recentSignalChatDedup = new Map<string, number>();
+
+function hydrateSignalMessages(rows: Array<Record<string, unknown>>, userId?: string) {
+  if (rows.length === 0) return [];
+
+  const messageIds = rows.map((r) => String(r.id));
+  const placeholders = messageIds.map(() => '?').join(',');
+
+  const reactRows = db
+    .prepare(
+      `SELECT message_id, reaction, COUNT(*) as cnt
+       FROM signal_message_reactions
+       WHERE message_id IN (${placeholders})
+       GROUP BY message_id, reaction`
+    )
+    .all(...messageIds) as Array<{ message_id: string; reaction: 'love' | 'like'; cnt: number }>;
+
+  const reactMap = new Map<string, { love: number; like: number }>();
+  for (const r of reactRows) {
+    const cur = reactMap.get(r.message_id) || { love: 0, like: 0 };
+    if (r.reaction === 'love') cur.love = r.cnt;
+    if (r.reaction === 'like') cur.like = r.cnt;
+    reactMap.set(r.message_id, cur);
+  }
+
+  const userReactMap = new Map<string, 'love' | 'like'>();
+  if (userId) {
+    const uRows = db
+      .prepare(
+        `SELECT message_id, reaction
+         FROM signal_message_reactions
+         WHERE user_id = ? AND message_id IN (${placeholders})`
+      )
+      .all(userId, ...messageIds) as Array<{ message_id: string; reaction: 'love' | 'like' }>;
+    for (const ur of uRows) {
+      userReactMap.set(ur.message_id, ur.reaction);
+    }
+  }
+
+  return rows.map((row) => ({
+    id: String(row.id),
+    author_id: String(row.author_id),
+    author_name: String(row.author_name),
+    content: String(row.content || ''),
+    image_url: row.image_url ? String(row.image_url) : null,
+    image_name: row.image_name ? String(row.image_name) : null,
+    message_type: String(row.message_type || 'update'),
+    status: String(row.status || 'active'),
+    pinned: Boolean(row.pinned),
+    edited_at: row.edited_at ? String(row.edited_at) : null,
+    completed_at: row.completed_at ? String(row.completed_at) : null,
+    completed_summary: row.completed_summary ? String(row.completed_summary) : null,
+    created_at: String(row.created_at),
+    reactions: reactMap.get(String(row.id)) || { love: 0, like: 0 },
+    user_reaction: userReactMap.get(String(row.id)) || null,
+  }));
+}
+
+app.get('/api/signals/messages', optionalAuth, (req: AuthRequest, res: Response) => {
+  const status = req.query.status === 'completed' ? 'completed' : 'active';
+  const limitRaw = Number(req.query.limit || 40);
+  const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(Math.floor(limitRaw), 1), 100) : 40;
+  const before = typeof req.query.before === 'string' && req.query.before.trim() ? req.query.before.trim() : null;
+  const search = typeof req.query.search === 'string' && req.query.search.trim() ? req.query.search.trim() : null;
+
+  const orderCol = status === 'completed' ? 'COALESCE(completed_at, created_at)' : 'created_at';
+  const conditions: string[] = ['status = ?'];
+  const params: unknown[] = [status];
+
+  if (before) {
+    conditions.push(`${orderCol} < ?`);
+    params.push(before);
+  }
+  if (search) {
+    conditions.push('(LOWER(content) LIKE ? OR LOWER(COALESCE(completed_summary, \'\')) LIKE ?)');
+    const likeTerm = `%${search.toLowerCase()}%`;
+    params.push(likeTerm, likeTerm);
+  }
+
+  const rows = db
+    .prepare(
+      `SELECT * FROM signal_messages
+       WHERE ${conditions.join(' AND ')}
+       ORDER BY ${orderCol} DESC
+       LIMIT ?`
+    )
+    .all(...params, limit + 1) as Array<Record<string, unknown>>;
+
+  const hasMore = rows.length > limit;
+  const sliced = hasMore ? rows.slice(0, limit) : rows;
+  const ordered = status === 'active' ? sliced.reverse() : sliced;
+
+  const pinnedRows =
+    status === 'active'
+      ? (db
+          .prepare("SELECT * FROM signal_messages WHERE status = 'active' AND pinned = 1 ORDER BY created_at DESC LIMIT 5")
+          .all() as Array<Record<string, unknown>>)
+      : [];
+
+  const activeCount = (
+    db.prepare("SELECT COUNT(*) as c FROM signal_messages WHERE status = 'active'").get() as { c: number }
+  ).c;
+  const completedCount = (
+    db.prepare("SELECT COUNT(*) as c FROM signal_messages WHERE status = 'completed'").get() as { c: number }
+  ).c;
+
+  res.json({
+    messages: hydrateSignalMessages(ordered, req.user?.id),
+    pinned: hydrateSignalMessages(pinnedRows, req.user?.id),
+    has_more: hasMore,
+    counts: {
+      active: activeCount,
+      completed: completedCount,
+    },
+    online_count: wsClients.size,
+  });
+});
+
+const signalMessageCreateSchema = z
+  .object({
+    content: z.string().max(8000).optional().default(''),
+    image_url: z.string().max(500).optional().nullable(),
+    image_name: z.string().max(250).optional().nullable(),
+    message_type: z.enum(['signal', 'update', 'analysis', 'announcement']).default('update'),
+    pinned: z.boolean().default(false),
+    send_push: z.boolean().default(true),
+    client_request_id: z.string().max(80).optional(),
+  })
+  .refine((d) => d.content.trim().length > 0 || Boolean(d.image_url), {
+    message: 'Enter a message or attach an image before sending.',
+  });
+
+app.post('/api/signals/messages', requireRole('admin'), async (req: AuthRequest, res: Response) => {
+  const parsed = signalMessageCreateSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid signal chat message.' });
+    return;
+  }
+
+  const d = parsed.data;
+  const trimmedContent = d.content.trim();
+  const dedupKey = d.client_request_id
+    ? `req:${req.user!.id}:${d.client_request_id}`
+    : `msg:${req.user!.id}:${trimmedContent}:${d.image_url || ''}`;
+  const lastSentAt = recentSignalChatDedup.get(dedupKey);
+  if (lastSentAt && Date.now() - lastSentAt < 5000) {
+    res.status(409).json({ error: 'Duplicate message submission ignored.' });
+    return;
+  }
+  recentSignalChatDedup.set(dedupKey, Date.now());
+  for (const [k, ts] of recentSignalChatDedup.entries()) {
+    if (Date.now() - ts > 15_000) recentSignalChatDedup.delete(k);
+  }
+
+  const id = crypto.randomUUID();
+  const now = new Date().toISOString();
+
+  db.prepare(
+    `INSERT INTO signal_messages (
+      id, author_id, author_name, content, image_url, image_name,
+      message_type, status, pinned, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`
+  ).run(
+    id,
+    req.user!.id,
+    req.user!.name,
+    trimmedContent,
+    d.image_url || null,
+    d.image_name || null,
+    d.message_type,
+    d.pinned ? 1 : 0,
+    now
+  );
+
+  const row = db.prepare('SELECT * FROM signal_messages WHERE id = ?').get(id) as Record<string, unknown>;
+  const hydrated = hydrateSignalMessages([row], req.user!.id)[0];
+
+  broadcastWs('signals_chat:created', hydrated);
+
+  if (d.send_push !== false) {
+    const preview = trimmedContent
+      ? trimmedContent.replace(/\s+/g, ' ').slice(0, 140)
+      : 'New chart image shared in Active Signals Chat.';
+    await dispatchNotification({
+      title: 'MeridianFX',
+      body: preview,
+      category: 'signals',
+      linkUrl: '/signals?tab=active',
+      broadcastWs,
+    });
+  }
+
+  res.status(201).json({ message: hydrated });
+});
+
+const signalMessagePatchSchema = z.object({
+  content: z.string().max(8000).optional(),
+  image_url: z.string().max(500).optional().nullable(),
+  image_name: z.string().max(250).optional().nullable(),
+  message_type: z.enum(['signal', 'update', 'analysis', 'announcement']).optional(),
+  pinned: z.boolean().optional(),
+  status: z.enum(['active', 'completed']).optional(),
+  completed_summary: z.string().max(1000).optional().nullable(),
+});
+
+app.patch('/api/signals/messages/:id', requireRole('admin'), (req: AuthRequest, res: Response) => {
+  const existing = db.prepare('SELECT * FROM signal_messages WHERE id = ?').get(req.params.id) as
+    | Record<string, unknown>
+    | undefined;
+  if (!existing) {
+    res.status(404).json({ error: 'Message not found.' });
+    return;
+  }
+
+  const parsed = signalMessagePatchSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid message update.' });
+    return;
+  }
+
+  const d = parsed.data;
+  const now = new Date().toISOString();
+  const nextContent = d.content !== undefined ? d.content.trim() : String(existing.content || '');
+  const nextImageUrl = d.image_url !== undefined ? d.image_url : (existing.image_url as string | null);
+  if (!nextContent && !nextImageUrl) {
+    res.status(400).json({ error: 'Message cannot be empty without an image attachment.' });
+    return;
+  }
+
+  const nextStatus = d.status ?? String(existing.status);
+  const contentEdited = d.content !== undefined && nextContent !== String(existing.content || '');
+  const imageEdited = d.image_url !== undefined && nextImageUrl !== existing.image_url;
+  const nextEditedAt = contentEdited || imageEdited ? now : (existing.edited_at as string | null);
+
+  let nextCompletedAt = existing.completed_at as string | null;
+  let nextPinned = d.pinned !== undefined ? (d.pinned ? 1 : 0) : Number(existing.pinned || 0);
+  if (d.status === 'completed' && existing.status !== 'completed') {
+    nextCompletedAt = now;
+    nextPinned = 0;
+  } else if (d.status === 'active' && existing.status !== 'active') {
+    nextCompletedAt = null;
+  }
+
+  db.prepare(
+    `UPDATE signal_messages SET
+      content = ?,
+      image_url = ?,
+      image_name = ?,
+      message_type = ?,
+      pinned = ?,
+      status = ?,
+      edited_at = ?,
+      completed_at = ?,
+      completed_summary = ?
+     WHERE id = ?`
+  ).run(
+    nextContent,
+    nextImageUrl || null,
+    d.image_name !== undefined ? d.image_name : existing.image_name,
+    d.message_type ?? existing.message_type,
+    nextPinned,
+    nextStatus,
+    nextEditedAt,
+    nextCompletedAt,
+    d.completed_summary !== undefined ? d.completed_summary : existing.completed_summary,
+    req.params.id
+  );
+
+  const updatedRow = db.prepare('SELECT * FROM signal_messages WHERE id = ?').get(req.params.id) as Record<
+    string,
+    unknown
+  >;
+  const hydrated = hydrateSignalMessages([updatedRow], req.user!.id)[0];
+
+  broadcastWs('signals_chat:updated', hydrated);
+  res.json({ message: hydrated });
+});
+
+app.delete('/api/signals/messages/:id', requireRole('admin'), (req: Request, res: Response) => {
+  const info = db.prepare('DELETE FROM signal_messages WHERE id = ?').run(req.params.id);
+  if (info.changes === 0) {
+    res.status(404).json({ error: 'Message not found.' });
+    return;
+  }
+  broadcastWs('signals_chat:deleted', { id: req.params.id });
+  res.json({ ok: true });
+});
+
+app.post('/api/signals/messages/:id/react', requireAuth, (req: AuthRequest, res: Response) => {
+  const schema = z.object({
+    reaction: z.enum(['love', 'like']).nullable(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Valid reaction (love or like) is required.' });
+    return;
+  }
+
+  const msg = db.prepare('SELECT id FROM signal_messages WHERE id = ?').get(req.params.id) as
+    | { id: string }
+    | undefined;
+  if (!msg) {
+    res.status(404).json({ error: 'Message not found.' });
+    return;
+  }
+
+  const existing = db
+    .prepare('SELECT reaction FROM signal_message_reactions WHERE message_id = ? AND user_id = ?')
+    .get(req.params.id, req.user!.id) as { reaction: 'love' | 'like' } | undefined;
+
+  let nextUserReaction: 'love' | 'like' | null = null;
+  if (parsed.data.reaction === null || (existing && existing.reaction === parsed.data.reaction)) {
+    db.prepare('DELETE FROM signal_message_reactions WHERE message_id = ? AND user_id = ?').run(
+      req.params.id,
+      req.user!.id
+    );
+    nextUserReaction = null;
+  } else {
+    db.prepare(
+      `INSERT INTO signal_message_reactions (message_id, user_id, reaction, created_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(message_id, user_id) DO UPDATE SET
+         reaction = excluded.reaction,
+         created_at = excluded.created_at`
+    ).run(req.params.id, req.user!.id, parsed.data.reaction, new Date().toISOString());
+    nextUserReaction = parsed.data.reaction;
+  }
+
+  const counts = db
+    .prepare(
+      `SELECT reaction, COUNT(*) as cnt
+       FROM signal_message_reactions
+       WHERE message_id = ?
+       GROUP BY reaction`
+    )
+    .all(req.params.id) as Array<{ reaction: 'love' | 'like'; cnt: number }>;
+
+  const reactions = { love: 0, like: 0 };
+  for (const c of counts) {
+    if (c.reaction === 'love') reactions.love = c.cnt;
+    if (c.reaction === 'like') reactions.like = c.cnt;
+  }
+
+  broadcastWs('signals_chat:reacted', {
+    message_id: String(req.params.id),
+    reactions,
+    actor_id: req.user!.id,
+    reaction: nextUserReaction,
+  });
+
+  res.json({
+    message_id: String(req.params.id),
+    reactions,
+    user_reaction: nextUserReaction,
+  });
+});
+
+// ---------- Legacy Structured Trading Signals (Home / Dashboard summary compatibility) ----------
 function hydrateSignals(rows: Array<Record<string, unknown>>) {
   const updateStmt = db.prepare(
     'SELECT * FROM signal_updates WHERE signal_id = ? ORDER BY created_at DESC'
@@ -2466,6 +2862,14 @@ app.patch('/api/admin/users/:id', requireRole('admin'), (req: AuthRequest, res: 
 
   if (req.params.id === req.user!.id && parsed.data.status === 'suspended') {
     res.status(400).json({ error: 'You cannot suspend your own administrator account.' });
+    return;
+  }
+
+  if (
+    String(target.email).toLowerCase() === DESIGNATED_ADMIN_EMAIL &&
+    ((parsed.data.role && parsed.data.role !== 'admin') || parsed.data.status === 'suspended')
+  ) {
+    res.status(400).json({ error: 'Cannot revoke privileges from the designated primary administrator account.' });
     return;
   }
 

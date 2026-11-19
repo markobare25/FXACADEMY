@@ -7,9 +7,24 @@ import type {
   MarketUpdate,
   PlatformSettings,
   PublicStats,
+  SignalChatMessage,
+  SignalReactionType,
   TradingSignal,
   User,
 } from '../types';
+
+export type SignalChatWsEvent =
+  | { type: 'created'; message: SignalChatMessage }
+  | { type: 'updated'; message: SignalChatMessage }
+  | { type: 'deleted'; id: string }
+  | {
+      type: 'reacted';
+      message_id: string;
+      reactions: { love: number; like: number };
+      actor_id: string;
+      reaction: SignalReactionType | null;
+    }
+  | { type: 'reconnected' };
 
 interface PlatformContextValue {
   user: User | null;
@@ -38,6 +53,9 @@ interface PlatformContextValue {
   setUpdates: React.Dispatch<React.SetStateAction<MarketUpdate[]>>;
   setCourses: React.Dispatch<React.SetStateAction<Course[]>>;
   setResumeState: React.Dispatch<React.SetStateAction<AcademyResumeState | null>>;
+  onlineCount: number;
+  wsConnected: boolean;
+  subscribeSignalChatEvents: (listener: (event: SignalChatWsEvent) => void) => () => void;
 }
 
 const DEFAULT_SETTINGS: PlatformSettings = {
@@ -100,9 +118,30 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
   const [unreadCount, setUnreadCount] = useState(0);
   const [showNotifModal, setShowNotifModal] = useState(false);
+  const [onlineCount, setOnlineCount] = useState<number>(1);
+  const [wsConnected, setWsConnected] = useState<boolean>(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<number | null>(null);
+  const hasConnectedOnceRef = useRef<boolean>(false);
+  const signalChatListenersRef = useRef<Set<(event: SignalChatWsEvent) => void>>(new Set());
+
+  const subscribeSignalChatEvents = useCallback((listener: (event: SignalChatWsEvent) => void) => {
+    signalChatListenersRef.current.add(listener);
+    return () => {
+      signalChatListenersRef.current.delete(listener);
+    };
+  }, []);
+
+  const emitSignalChatEvent = useCallback((event: SignalChatWsEvent) => {
+    for (const fn of signalChatListenersRef.current) {
+      try {
+        fn(event);
+      } catch {
+        // isolate listener errors
+      }
+    }
+  }, []);
 
   // Sync dark class & theme-color meta tag
   useEffect(() => {
@@ -132,10 +171,12 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   }, []);
 
   const navigate = useCallback((path: string) => {
-    if (window.location.pathname !== path) {
+    const cleanRoute = path.split('?')[0] || '/';
+    if (`${window.location.pathname}${window.location.search}` !== path) {
       window.history.pushState({}, '', path);
     }
-    setRoute(path);
+    setRoute(cleanRoute);
+    window.dispatchEvent(new Event('mfx:locationchange'));
     window.scrollTo({ top: 0, behavior: 'instant' as ScrollBehavior });
   }, []);
 
@@ -232,10 +273,55 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
+      ws.onopen = () => {
+        setWsConnected(true);
+        if (hasConnectedOnceRef.current) {
+          emitSignalChatEvent({ type: 'reconnected' });
+        }
+        hasConnectedOnceRef.current = true;
+      };
+
       ws.onmessage = (evt) => {
         try {
           const msg = JSON.parse(evt.data) as { event: string; data: unknown };
           switch (msg.event) {
+            case 'connected': {
+              const payload = msg.data as { online_count?: number };
+              if (typeof payload?.online_count === 'number') {
+                setOnlineCount(payload.online_count);
+              }
+              break;
+            }
+            case 'presence:update': {
+              const payload = msg.data as { online_count?: number };
+              if (typeof payload?.online_count === 'number') {
+                setOnlineCount(payload.online_count);
+              }
+              break;
+            }
+            case 'signals_chat:created': {
+              emitSignalChatEvent({ type: 'created', message: msg.data as SignalChatMessage });
+              break;
+            }
+            case 'signals_chat:updated': {
+              emitSignalChatEvent({ type: 'updated', message: msg.data as SignalChatMessage });
+              break;
+            }
+            case 'signals_chat:deleted': {
+              const { id } = msg.data as { id: string };
+              emitSignalChatEvent({ type: 'deleted', id });
+              break;
+            }
+            case 'signals_chat:reacted': {
+              const payload = msg.data as {
+                message_id: string;
+                reactions: { love: number; like: number };
+                actor_id: string;
+                reaction: SignalReactionType | null;
+              };
+              emitSignalChatEvent({ type: 'reacted', ...payload });
+              break;
+            }
             case 'signal:created': {
               const incoming = msg.data as TradingSignal;
               setSignals((prev) =>
@@ -311,6 +397,7 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       };
 
       ws.onclose = () => {
+        setWsConnected(false);
         if (!active) return;
         reconnectTimer.current = window.setTimeout(() => {
           connect();
@@ -325,7 +412,7 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
       wsRef.current?.close();
     };
-  }, [refreshAll, refreshNotifications]);
+  }, [refreshAll, refreshNotifications, emitSignalChatEvent]);
 
   const login = async (email: string, password: string): Promise<User> => {
     const res = await apiFetch<{ user: User; token: string }>('/api/auth/login', {
@@ -392,6 +479,9 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         setUpdates,
         setCourses,
         setResumeState,
+        onlineCount,
+        wsConnected,
+        subscribeSignalChatEvents,
       }}
     >
       {children}

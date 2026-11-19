@@ -5,7 +5,9 @@ import {
   Database,
   Download,
   Edit3,
+  KeyRound,
   LayoutDashboard,
+  MessageSquareText,
   Pin,
   Radio,
   Search,
@@ -156,6 +158,14 @@ export const AdminPage: React.FC = () => {
 
   // Platform Settings State
   const [settingsForm, setSettingsForm] = useState<PlatformSettings>(settings);
+
+  // Admin Credential Rotation State
+  const [adminCredForm, setAdminCredForm] = useState({
+    current_password: '',
+    new_password: '',
+    confirm_password: '',
+  });
+  const [rotatingPassword, setRotatingPassword] = useState(false);
 
   useEffect(() => {
     setSettingsForm(settings);
@@ -430,6 +440,30 @@ export const AdminPage: React.FC = () => {
     await loadAdminData();
   };
 
+  const handleRotateAdminPassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (adminCredForm.new_password !== adminCredForm.confirm_password) {
+      setErrorMsg('New password and confirmation do not match.');
+      return;
+    }
+    setRotatingPassword(true);
+    try {
+      await apiFetch('/api/users/password', {
+        method: 'PATCH',
+        body: JSON.stringify({
+          current_password: adminCredForm.current_password,
+          new_password: adminCredForm.new_password,
+        }),
+      });
+      setAdminCredForm({ current_password: '', new_password: '', confirm_password: '' });
+      notifyOk('Administrator password updated securely.');
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Unable to rotate administrator password.');
+    } finally {
+      setRotatingPassword(false);
+    }
+  };
+
   const filteredUsers = usersList.filter(
     (u) =>
       u.name.toLowerCase().includes(userSearch.toLowerCase()) ||
@@ -586,11 +620,36 @@ export const AdminPage: React.FC = () => {
 
       {/* B. SIGNAL MANAGEMENT */}
       {tab === 'signals' && (
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-          <form
-            onSubmit={handleSubmitSignal}
-            className="lg:col-span-5 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5 space-y-3.5 h-fit"
-          >
+        <div className="space-y-6">
+          <div className="rounded-2xl border border-[#881337]/30 bg-rose-50/70 dark:bg-rose-950/20 p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+            <div className="flex items-start gap-3">
+              <div className="w-10 h-10 rounded-xl bg-[#881337] text-white flex items-center justify-center shrink-0">
+                <MessageSquareText className="w-5 h-5" />
+              </div>
+              <div>
+                <h2 className="text-sm sm:text-base font-bold text-slate-900 dark:text-white">
+                  Live Signals Community Channel
+                </h2>
+                <p className="text-xs text-slate-600 dark:text-slate-300 mt-0.5">
+                  Publish real-time messages, chart screenshots, pinned announcements, and archive completed updates directly in the Signals chat composer.
+                </p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => navigate('/signals?tab=active')}
+              className="inline-flex items-center justify-center gap-2 rounded-xl bg-[#881337] px-4 py-2.5 text-xs font-semibold text-white hover:bg-[#6B0F2B] shrink-0 min-h-[42px]"
+            >
+              <MessageSquareText className="w-4 h-4" />
+              <span>Open Live Signals Chat & Composer</span>
+            </button>
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+            <form
+              onSubmit={handleSubmitSignal}
+              className="lg:col-span-5 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5 space-y-3.5 h-fit"
+            >
             <div className="flex items-center justify-between">
               <h2 className="text-base font-bold text-slate-900 dark:text-white">
                 {editingSignalId ? 'Edit Trading Signal' : 'Publish New Signal'}
@@ -905,6 +964,7 @@ export const AdminPage: React.FC = () => {
                 </div>
               ))}
             </div>
+          </div>
           </div>
         </div>
       )}
@@ -1370,129 +1430,194 @@ export const AdminPage: React.FC = () => {
         </div>
       )}
 
-      {/* G. PLATFORM SETTINGS */}
+      {/* G. PLATFORM SETTINGS & ADMIN SECURITY */}
       {tab === 'settings' && (
-        <form
-          onSubmit={handleSaveSettings}
-          className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-6 space-y-4 max-w-3xl"
-        >
-          <h2 className="text-base font-bold text-slate-900 dark:text-white">
-            Platform Branding, Content, SEO & Integrations
-          </h2>
+        <div className="space-y-6 max-w-3xl">
+          <form
+            onSubmit={handleSaveSettings}
+            className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-6 space-y-4"
+          >
+            <h2 className="text-base font-bold text-slate-900 dark:text-white">
+              Platform Branding, Content, SEO & Integrations
+            </h2>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-xs font-medium mb-1">Brand Name</label>
+                <input
+                  type="text"
+                  value={settingsForm.brand_name}
+                  onChange={(e) => setSettingsForm({ ...settingsForm, brand_name: e.target.value })}
+                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium mb-1">Contact Email</label>
+                <input
+                  type="email"
+                  value={settingsForm.contact_email}
+                  onChange={(e) => setSettingsForm({ ...settingsForm, contact_email: e.target.value })}
+                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
+                />
+              </div>
+            </div>
+
+            <div className="flex items-center gap-3 text-xs">
+              <label className="inline-flex items-center gap-2 cursor-pointer rounded-lg border border-slate-300 dark:border-slate-700 px-3 py-2">
+                <Upload className="w-3.5 h-3.5" />
+                <span>Upload Custom Brand Logo</span>
+                <input
+                  type="file"
+                  accept="image/*"
+                  className="hidden"
+                  onChange={(e) =>
+                    handleUploadField(e.target.files?.[0], (url) =>
+                      setSettingsForm((f) => ({ ...f, logo_url: url }))
+                    )
+                  }
+                />
+              </label>
+              <span className="font-mono text-slate-500">{settingsForm.logo_url}</span>
+            </div>
+
             <div>
-              <label className="block text-xs font-medium mb-1">Brand Name</label>
+              <label className="block text-xs font-medium mb-1">Homepage Hero Headline</label>
               <input
                 type="text"
-                value={settingsForm.brand_name}
-                onChange={(e) => setSettingsForm({ ...settingsForm, brand_name: e.target.value })}
+                value={settingsForm.hero_title}
+                onChange={(e) => setSettingsForm({ ...settingsForm, hero_title: e.target.value })}
                 className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
               />
             </div>
-            <div>
-              <label className="block text-xs font-medium mb-1">Contact Email</label>
-              <input
-                type="email"
-                value={settingsForm.contact_email}
-                onChange={(e) => setSettingsForm({ ...settingsForm, contact_email: e.target.value })}
-                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
-              />
-            </div>
-          </div>
 
-          <div className="flex items-center gap-3 text-xs">
-            <label className="inline-flex items-center gap-2 cursor-pointer rounded-lg border border-slate-300 dark:border-slate-700 px-3 py-2">
-              <Upload className="w-3.5 h-3.5" />
-              <span>Upload Custom Brand Logo</span>
-              <input
-                type="file"
-                accept="image/*"
-                className="hidden"
-                onChange={(e) =>
-                  handleUploadField(e.target.files?.[0], (url) =>
-                    setSettingsForm((f) => ({ ...f, logo_url: url }))
-                  )
-                }
+            <div>
+              <label className="block text-xs font-medium mb-1">Homepage Hero Subtitle</label>
+              <textarea
+                rows={2}
+                value={settingsForm.hero_subtitle}
+                onChange={(e) => setSettingsForm({ ...settingsForm, hero_subtitle: e.target.value })}
+                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
               />
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium mb-1">About Section Text</label>
+              <textarea
+                rows={3}
+                value={settingsForm.about_text}
+                onChange={(e) => setSettingsForm({ ...settingsForm, about_text: e.target.value })}
+                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
+              />
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-xs font-medium mb-1">SEO Title</label>
+                <input
+                  type="text"
+                  value={settingsForm.seo_title}
+                  onChange={(e) => setSettingsForm({ ...settingsForm, seo_title: e.target.value })}
+                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium mb-1">SEO Meta Description</label>
+                <input
+                  type="text"
+                  value={settingsForm.seo_description}
+                  onChange={(e) =>
+                    setSettingsForm({ ...settingsForm, seo_description: e.target.value })
+                  }
+                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
+                />
+              </div>
+            </div>
+
+            <label className="inline-flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={settingsForm.push_enabled}
+                onChange={(e) =>
+                  setSettingsForm({ ...settingsForm, push_enabled: e.target.checked })
+                }
+                className="accent-[#881337]"
+              />
+              <span>Enable Global Push Notification Delivery</span>
             </label>
-            <span className="font-mono text-slate-500">{settingsForm.logo_url}</span>
-          </div>
 
-          <div>
-            <label className="block text-xs font-medium mb-1">Homepage Hero Headline</label>
-            <input
-              type="text"
-              value={settingsForm.hero_title}
-              onChange={(e) => setSettingsForm({ ...settingsForm, hero_title: e.target.value })}
-              className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
-            />
-          </div>
-
-          <div>
-            <label className="block text-xs font-medium mb-1">Homepage Hero Subtitle</label>
-            <textarea
-              rows={2}
-              value={settingsForm.hero_subtitle}
-              onChange={(e) => setSettingsForm({ ...settingsForm, hero_subtitle: e.target.value })}
-              className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
-            />
-          </div>
-
-          <div>
-            <label className="block text-xs font-medium mb-1">About Section Text</label>
-            <textarea
-              rows={3}
-              value={settingsForm.about_text}
-              onChange={(e) => setSettingsForm({ ...settingsForm, about_text: e.target.value })}
-              className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
-            />
-          </div>
-
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div>
-              <label className="block text-xs font-medium mb-1">SEO Title</label>
-              <input
-                type="text"
-                value={settingsForm.seo_title}
-                onChange={(e) => setSettingsForm({ ...settingsForm, seo_title: e.target.value })}
-                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
-              />
+              <button
+                type="submit"
+                className="rounded-lg bg-[#881337] px-5 py-2.5 text-sm font-semibold text-white hover:bg-[#6B0F2B] min-h-[44px]"
+              >
+                Save Platform Configuration
+              </button>
             </div>
-            <div>
-              <label className="block text-xs font-medium mb-1">SEO Meta Description</label>
+          </form>
+
+          {/* Administrator Account & Credential Rotation */}
+          <form
+            onSubmit={handleRotateAdminPassword}
+            className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-6 space-y-4"
+          >
+            <div className="flex items-start gap-3">
+              <KeyRound className="w-5 h-5 text-[#881337] dark:text-rose-400 shrink-0 mt-0.5" />
+              <div>
+                <h2 className="text-base font-bold text-slate-900 dark:text-white">
+                  Administrator Account & Credential Rotation
+                </h2>
+                <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                  Signed in as <span className="font-mono font-semibold text-slate-700 dark:text-slate-200">{user.email}</span> (Designated Admin: <span className="font-mono">markobare25@gmail.com</span>). Offline recovery can also use <span className="font-mono">ADMIN_RESET_KEY</span> on the Forgot Password page.
+                </p>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
               <input
-                type="text"
-                value={settingsForm.seo_description}
+                type="password"
+                required
+                value={adminCredForm.current_password}
                 onChange={(e) =>
-                  setSettingsForm({ ...settingsForm, seo_description: e.target.value })
+                  setAdminCredForm({ ...adminCredForm, current_password: e.target.value })
                 }
-                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
+                placeholder="Current password"
+                className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-base sm:text-sm"
+              />
+              <input
+                type="password"
+                required
+                minLength={8}
+                value={adminCredForm.new_password}
+                onChange={(e) =>
+                  setAdminCredForm({ ...adminCredForm, new_password: e.target.value })
+                }
+                placeholder="New password (min 8 chars)"
+                className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-base sm:text-sm"
+              />
+              <input
+                type="password"
+                required
+                minLength={8}
+                value={adminCredForm.confirm_password}
+                onChange={(e) =>
+                  setAdminCredForm({ ...adminCredForm, confirm_password: e.target.value })
+                }
+                placeholder="Confirm new password"
+                className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-base sm:text-sm"
               />
             </div>
-          </div>
 
-          <label className="inline-flex items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              checked={settingsForm.push_enabled}
-              onChange={(e) =>
-                setSettingsForm({ ...settingsForm, push_enabled: e.target.checked })
-              }
-              className="accent-[#881337]"
-            />
-            <span>Enable Global Push Notification Delivery</span>
-          </label>
-
-          <div>
-            <button
-              type="submit"
-              className="rounded-lg bg-[#881337] px-5 py-2.5 text-sm font-semibold text-white hover:bg-[#6B0F2B] min-h-[44px]"
-            >
-              Save Platform Configuration
-            </button>
-          </div>
-        </form>
+            <div>
+              <button
+                type="submit"
+                disabled={rotatingPassword}
+                className="rounded-lg bg-[#881337] px-5 py-2.5 text-sm font-semibold text-white hover:bg-[#6B0F2B] disabled:opacity-60 min-h-[44px]"
+              >
+                {rotatingPassword ? 'Updating...' : 'Rotate Administrator Password'}
+              </button>
+            </div>
+          </form>
+        </div>
       )}
     </div>
   );
