@@ -36,7 +36,20 @@ ensureVapidKeys();
 
 const app = express();
 const httpServer = http.createServer(app);
-const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
+const wss = new WebSocketServer({ noServer: true });
+
+httpServer.on('upgrade', (request, socket, head) => {
+  try {
+    const pathname = new URL(request.url || '/', 'http://localhost').pathname;
+    if (pathname === '/ws') {
+      wss.handleUpgrade(request, socket, head, (ws) => {
+        wss.emit('connection', ws, request);
+      });
+    }
+  } catch {
+    socket.destroy();
+  }
+});
 
 const wsClients = new Set<WebSocket>();
 wss.on('connection', (ws) => {
@@ -1925,8 +1938,15 @@ const isProduction = process.env.NODE_ENV === 'production';
 async function startServer() {
   if (!isProduction) {
     const { createServer: createViteServer } = await import('vite');
+    const hmrDisabled = process.env.DISABLE_HMR === 'true';
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        allowedHosts: true,
+        ws: { server: httpServer, path: '/__vite_hmr' },
+        hmr: !hmrDisabled,
+        watch: hmrDisabled ? null : undefined,
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);

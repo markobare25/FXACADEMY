@@ -152,7 +152,7 @@ export const ProfilePage: React.FC = () => {
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          <PWAInstallButton variant="compact" label="Install App" />
+          <PWAInstallButton variant="compact" label="INSTALL APP" />
           <button
             type="button"
             onClick={toggleTheme}

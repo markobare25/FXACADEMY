@@ -110,12 +110,13 @@ export const Layout: React.FC<LayoutProps> = ({ children }) => {
               </button>
             </nav>
 
-            {/* Zone 3: 1 primary action */}
-            <div className="shrink-0">
+            {/* Zone 3: Highly visible INSTALL APP + Primary CTA */}
+            <div className="flex items-center gap-2 sm:gap-2.5 shrink-0">
+              <PWAInstallButton variant="header" label="INSTALL APP" />
               <button
                 type="button"
                 onClick={() => navigate('/register')}
-                className="rounded-lg bg-[#881337] px-4 py-2 text-xs sm:text-sm font-semibold text-white hover:bg-[#6B0F2B] transition-colors whitespace-nowrap shrink-0"
+                className="rounded-lg bg-[#881337] px-3 sm:px-4 py-2 text-xs sm:text-sm font-semibold text-white hover:bg-[#6B0F2B] transition-colors whitespace-nowrap shrink-0 min-h-[38px] sm:min-h-[40px]"
               >
                 Get Started
               </button>
@@ -273,7 +274,7 @@ export const Layout: React.FC<LayoutProps> = ({ children }) => {
 
         <div className="p-3 border-t border-slate-200 dark:border-slate-800/80 space-y-2.5">
           <div className="flex justify-center">
-            <PWAInstallButton variant="compact" label="Install Desktop / App" />
+            <PWAInstallButton variant="compact" label="INSTALL APP" />
           </div>
 
           {user ? (
@@ -327,22 +328,56 @@ export const Layout: React.FC<LayoutProps> = ({ children }) => {
 
       {/* Main Content Area */}
       <div className="flex-1 lg:pl-64 flex flex-col min-w-0">
-        {/* Compact Mobile Top Bar (<= 52px) */}
-        <header className="lg:hidden sticky top-0 z-30 h-13 border-b border-slate-200 dark:border-slate-800/80 bg-white/95 dark:bg-[#0B101B]/90 backdrop-blur-md px-4 flex items-center justify-between">
+        {/* Desktop Top Utility Header */}
+        <header className="hidden lg:flex sticky top-0 z-30 h-14 border-b border-slate-200 dark:border-slate-800/80 bg-white/95 dark:bg-[#0B101B]/90 backdrop-blur-md px-8 items-center justify-between gap-4">
+          <div className="flex items-center gap-3 text-xs text-slate-500 dark:text-slate-400">
+            <span className="font-semibold text-slate-800 dark:text-slate-200">
+              {settings.brand_name} Terminal
+            </span>
+            <span aria-hidden="true">·</span>
+            <span>Real-Time Signals & Market Intelligence</span>
+          </div>
+
+          <div className="flex items-center gap-3">
+            <PWAInstallButton variant="header" label="INSTALL APP" />
+            {!user && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => navigate('/login')}
+                  className="rounded-lg border border-slate-300 dark:border-slate-700 px-3.5 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors"
+                >
+                  Sign In
+                </button>
+                <button
+                  type="button"
+                  onClick={() => navigate('/register')}
+                  className="rounded-lg bg-[#881337] px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-[#6B0F2B] transition-colors"
+                >
+                  Get Started
+                </button>
+              </>
+            )}
+          </div>
+        </header>
+
+        {/* Compact Mobile Top Bar */}
+        <header className="lg:hidden sticky top-0 z-30 h-14 border-b border-slate-200 dark:border-slate-800/80 bg-white/95 dark:bg-[#0B101B]/90 backdrop-blur-md px-3.5 flex items-center justify-between gap-2">
           <button
             type="button"
             onClick={() => navigate('/')}
-            className="text-base font-bold tracking-tight text-[#881337] dark:text-white whitespace-nowrap"
+            className="text-base font-bold tracking-tight text-[#881337] dark:text-white whitespace-nowrap shrink-0"
           >
             {settings.brand_name}
           </button>
 
-          <div className="flex items-center gap-1">
+          <div className="flex items-center gap-1.5 shrink-0">
+            <PWAInstallButton variant="header" label="INSTALL APP" />
             {user?.role === 'admin' && (
               <button
                 type="button"
                 onClick={() => navigate('/admin')}
-                className="min-h-[44px] min-w-[44px] flex items-center justify-center text-emerald-700 dark:text-emerald-400"
+                className="min-h-[40px] min-w-[40px] flex items-center justify-center text-emerald-700 dark:text-emerald-400"
                 aria-label="Admin Desk"
               >
                 <Shield className="w-5 h-5" />
@@ -352,12 +387,12 @@ export const Layout: React.FC<LayoutProps> = ({ children }) => {
               <button
                 type="button"
                 onClick={() => navigate('/notifications')}
-                className="relative min-h-[44px] min-w-[44px] flex items-center justify-center text-slate-600 dark:text-slate-300"
+                className="relative min-h-[40px] min-w-[40px] flex items-center justify-center text-slate-600 dark:text-slate-300"
                 aria-label="Notifications"
               >
                 <Bell className="w-5 h-5" />
                 {unreadCount > 0 && (
-                  <span className="absolute top-2.5 right-2.5 text-[10px] font-mono font-bold text-[#881337]">
+                  <span className="absolute top-2 right-2 text-[10px] font-mono font-bold text-[#881337]">
                     {unreadCount}
                   </span>
                 )}
@@ -366,10 +401,10 @@ export const Layout: React.FC<LayoutProps> = ({ children }) => {
             <button
               type="button"
               onClick={toggleTheme}
-              className="min-h-[44px] min-w-[44px] flex items-center justify-center text-slate-600 dark:text-slate-300"
+              className="min-h-[40px] min-w-[40px] flex items-center justify-center text-slate-600 dark:text-slate-300"
               aria-label="Toggle theme"
             >
-              {theme === 'dark' ? <Sun className="w-5 h-5" /> : <Moon className="w-5 h-5" />}
+              {theme === 'dark' ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
             </button>
           </div>
         </header>

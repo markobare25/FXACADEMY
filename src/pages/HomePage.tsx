@@ -105,7 +105,7 @@ export const HomePage: React.FC = () => {
                 </>
               )}
 
-              <PWAInstallButton variant="outline" label="Install App" />
+              <PWAInstallButton variant="primary" label="INSTALL APP" />
 
               <button
                 type="button"

@@ -2,6 +2,7 @@ import React from 'react';
 import { PlatformProvider, usePlatform } from './context/PlatformContext';
 import { Layout } from './components/Layout';
 import { NotificationPromptModal } from './components/NotificationPromptModal';
+import { PWAInstallBanner } from './components/PWAInstallBanner';
 import { HomePage } from './pages/HomePage';
 import {
   ForgotPasswordPage,
@@ -68,6 +69,7 @@ const RouteView: React.FC = () => {
   return (
     <>
       <Layout>{renderPage()}</Layout>
+      <PWAInstallBanner />
       <NotificationPromptModal
         open={showNotifModal}
         onClose={() => setShowNotifModal(false)}

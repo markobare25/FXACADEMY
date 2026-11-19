@@ -73,7 +73,7 @@ export const DashboardPage: React.FC = () => {
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2.5">
-          <PWAInstallButton variant="compact" label="Install App" />
+          <PWAInstallButton variant="compact" label="INSTALL APP" />
           {!pushActive && (
             <button
               type="button"

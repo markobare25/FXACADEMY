@@ -47,6 +47,17 @@ export const CandlestickChart: React.FC<Props> = ({
         vertLine: { color: isDark ? 'rgba(244, 63, 94, 0.45)' : 'rgba(136, 19, 55, 0.35)' },
         horzLine: { color: isDark ? 'rgba(244, 63, 94, 0.45)' : 'rgba(136, 19, 55, 0.35)' },
       },
+      handleScale: {
+        mouseWheel: true,
+        pinch: false,
+        axisPressedMouseMove: true,
+      },
+      handleScroll: {
+        mouseWheel: true,
+        pressedMouseMove: true,
+        horzTouchDrag: true,
+        vertTouchDrag: false,
+      },
     });
 
     const series = chart.addSeries(CandlestickSeries, {
