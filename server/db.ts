@@ -153,6 +153,8 @@ export function initDatabase(): void {
       edited_at TEXT,
       completed_at TEXT,
       completed_summary TEXT,
+      source_type TEXT,
+      source_id TEXT,
       created_at TEXT NOT NULL,
       FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE CASCADE
     );
@@ -410,13 +412,59 @@ export function initDatabase(): void {
     CREATE TABLE IF NOT EXISTS push_subscriptions (
       id TEXT PRIMARY KEY,
       user_id TEXT,
+      visitor_id TEXT,
       endpoint TEXT NOT NULL UNIQUE,
       p256dh TEXT NOT NULL,
       auth TEXT NOT NULL,
       user_agent TEXT,
+      platform TEXT,
+      active INTEGER NOT NULL DEFAULT 1,
+      last_error TEXT,
+      last_success_at TEXT,
       created_at TEXT NOT NULL,
+      updated_at TEXT,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     );
+
+    CREATE TABLE IF NOT EXISTS push_jobs (
+      id TEXT PRIMARY KEY,
+      dedup_key TEXT NOT NULL UNIQUE,
+      signal_message_id TEXT,
+      title TEXT NOT NULL,
+      body TEXT NOT NULL,
+      category TEXT NOT NULL,
+      link_url TEXT NOT NULL DEFAULT '/signals',
+      image_url TEXT,
+      published_at TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'queued',
+      total_targeted INTEGER NOT NULL DEFAULT 0,
+      queued_count INTEGER NOT NULL DEFAULT 0,
+      delivered_count INTEGER NOT NULL DEFAULT 0,
+      failed_count INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS push_job_deliveries (
+      id TEXT PRIMARY KEY,
+      job_id TEXT NOT NULL,
+      subscription_id TEXT NOT NULL,
+      endpoint TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'queued',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      max_attempts INTEGER NOT NULL DEFAULT 4,
+      next_attempt_at TEXT NOT NULL,
+      last_error TEXT,
+      status_code INTEGER,
+      delivered_at TEXT,
+      updated_at TEXT NOT NULL,
+      UNIQUE(job_id, subscription_id),
+      FOREIGN KEY (job_id) REFERENCES push_jobs(id) ON DELETE CASCADE,
+      FOREIGN KEY (subscription_id) REFERENCES push_subscriptions(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_push_deliveries_pending
+      ON push_job_deliveries(status, next_attempt_at);
 
     CREATE TABLE IF NOT EXISTS scheduled_notifications (
       id TEXT PRIMARY KEY,
@@ -503,6 +551,20 @@ export function initDatabase(): void {
   ensureColumn('lesson_progress', 'needs_review', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('lesson_progress', 'needs_review_note', 'TEXT');
   ensureColumn('users', 'needs_password_setup', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('signal_messages', 'source_type', 'TEXT');
+  ensureColumn('signal_messages', 'source_id', 'TEXT');
+  ensureColumn('push_subscriptions', 'visitor_id', 'TEXT');
+  ensureColumn('push_subscriptions', 'active', 'INTEGER NOT NULL DEFAULT 1');
+  ensureColumn('push_subscriptions', 'platform', 'TEXT');
+  ensureColumn('push_subscriptions', 'last_error', 'TEXT');
+  ensureColumn('push_subscriptions', 'last_success_at', 'TEXT');
+  ensureColumn('push_subscriptions', 'updated_at', 'TEXT');
+
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_signal_messages_source
+      ON signal_messages(source_type, source_id)
+      WHERE source_type IS NOT NULL AND source_id IS NOT NULL;
+  `);
 
   // Migrate legacy signal_message_reactions table (2 reactions + user_id PK) to 5-reaction public actor_key schema
   const reactionTableMeta = db

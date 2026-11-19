@@ -33,7 +33,14 @@ import {
   signVisitorCookie,
   verifyVisitorCookie,
 } from './server/auth.ts';
-import { dispatchNotification, ensureVapidKeys } from './server/push.ts';
+import {
+  dispatchNotification,
+  ensureVapidKeys,
+  getPushJobSummary,
+  listRecentPushJobs,
+  processPendingPushDeliveries,
+  setPushWsBroadcaster,
+} from './server/push.ts';
 import { getEconomicCalendar, getMarketCandles, getMarketQuotes } from './server/markets.ts';
 import type {
   NotificationPreferences,
@@ -87,6 +94,8 @@ function broadcastWs(event: string, data: unknown): void {
     }
   }
 }
+
+setPushWsBroadcaster(broadcastWs);
 
 app.use(express.json({ limit: '4mb' }));
 app.use(express.urlencoded({ extended: true, limit: '4mb' }));
@@ -804,14 +813,129 @@ function hydrateSignalMessages(rows: Array<Record<string, unknown>>, actorKey?: 
     edited_at: row.edited_at ? String(row.edited_at) : null,
     completed_at: row.completed_at ? String(row.completed_at) : null,
     completed_summary: row.completed_summary ? String(row.completed_summary) : null,
+    source_type: row.source_type ? String(row.source_type) : null,
+    source_id: row.source_id ? String(row.source_id) : null,
     created_at: String(row.created_at),
     reactions: reactMap.get(String(row.id)) || emptyReactions(),
     user_reaction: userReactMap.get(String(row.id)) || null,
   }));
 }
 
+function getDesignatedAdminIdentity(): { id: string; name: string } | null {
+  const row = db
+    .prepare('SELECT id, name FROM users WHERE LOWER(email) = ? LIMIT 1')
+    .get(DESIGNATED_ADMIN_EMAIL) as { id: string; name: string } | undefined;
+  return row || null;
+}
+
+function publishMirrorToSignalChannel(params: {
+  sourceType: string;
+  sourceId: string;
+  authorId?: string;
+  authorName?: string;
+  messageType: 'signal' | 'update' | 'analysis' | 'announcement';
+  content: string;
+  imageUrl?: string | null;
+  imageName?: string | null;
+  pinned?: boolean;
+  createdAt?: string;
+}) {
+  const existing = db
+    .prepare('SELECT * FROM signal_messages WHERE source_type = ? AND source_id = ?')
+    .get(params.sourceType, params.sourceId) as Record<string, unknown> | undefined;
+  if (existing) {
+    return {
+      message: hydrateSignalMessages([existing], null)[0],
+      created: false,
+    };
+  }
+
+  const adminIdentity = getDesignatedAdminIdentity();
+  const authorId = params.authorId || adminIdentity?.id;
+  if (!authorId) return null;
+
+  const id = crypto.randomUUID();
+  const createdAt = params.createdAt || new Date().toISOString();
+
+  db.prepare(
+    `INSERT OR IGNORE INTO signal_messages (
+      id, author_id, author_name, content, image_url, image_name,
+      message_type, status, pinned, source_type, source_id, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)`
+  ).run(
+    id,
+    authorId,
+    params.authorName || adminIdentity?.name || 'MeridianFX',
+    params.content.trim(),
+    params.imageUrl || null,
+    params.imageName || null,
+    params.messageType,
+    params.pinned ? 1 : 0,
+    params.sourceType,
+    params.sourceId,
+    createdAt
+  );
+
+  const row = db
+    .prepare('SELECT * FROM signal_messages WHERE source_type = ? AND source_id = ?')
+    .get(params.sourceType, params.sourceId) as Record<string, unknown> | undefined;
+  if (!row) return null;
+
+  const hydrated = hydrateSignalMessages([row], null)[0];
+  broadcastWs('signals_chat:created', hydrated);
+  return { message: hydrated, created: String(row.id) === id };
+}
+
+function mapMessageTypeToPushCategory(
+  messageType: string
+): keyof NotificationPreferences {
+  if (messageType === 'signal') return 'signals';
+  if (messageType === 'announcement') return 'announcements';
+  return 'market_updates';
+}
+
+function buildSignalChannelPushPreview(
+  messageType: string,
+  content: string,
+  hasImage: boolean
+): string {
+  const label =
+    messageType === 'signal'
+      ? 'Trading Signal'
+      : messageType === 'analysis'
+        ? 'Chart Analysis'
+        : messageType === 'announcement'
+          ? 'Announcement'
+          : 'Market Update';
+  const snippet = content.replace(/\s+/g, ' ').trim();
+  if (snippet) {
+    return `${label}: ${snippet.slice(0, 140)}`;
+  }
+  if (hasImage) {
+    return `${label}: New trading chart shared in MeridianFX Signals.`;
+  }
+  return `${label}: New update posted in MeridianFX Signals.`;
+}
+
 app.get('/api/signals/messages', optionalAuth, (req: AuthRequest, res: Response) => {
-  const status = req.query.status === 'completed' ? 'completed' : 'active';
+  const requestedStatus = String(req.query.status || 'active');
+  const isAdmin =
+    Boolean(req.user) &&
+    req.user!.role === 'admin' &&
+    req.user!.email.toLowerCase() === DESIGNATED_ADMIN_EMAIL;
+
+  if (requestedStatus === 'draft' && !isAdmin) {
+    res.status(403).json({ error: 'Draft posts are restricted to administrators.' });
+    return;
+  }
+
+  const status =
+    requestedStatus === 'completed'
+      ? 'completed'
+      : requestedStatus === 'draft'
+        ? 'draft'
+        : 'active';
+
   const limitRaw = Number(req.query.limit || 40);
   const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(Math.floor(limitRaw), 1), 100) : 40;
   const before = typeof req.query.before === 'string' && req.query.before.trim() ? req.query.before.trim() : null;
@@ -857,6 +981,9 @@ app.get('/api/signals/messages', optionalAuth, (req: AuthRequest, res: Response)
   const completedCount = (
     db.prepare("SELECT COUNT(*) as c FROM signal_messages WHERE status = 'completed'").get() as { c: number }
   ).c;
+  const draftCount = isAdmin
+    ? (db.prepare("SELECT COUNT(*) as c FROM signal_messages WHERE status = 'draft'").get() as { c: number }).c
+    : 0;
 
   const actor = resolveReactionActor(req, res, false);
 
@@ -867,10 +994,34 @@ app.get('/api/signals/messages', optionalAuth, (req: AuthRequest, res: Response)
     counts: {
       active: activeCount,
       completed: completedCount,
+      draft: draftCount,
     },
     online_count: wsClients.size,
     viewer_key: actor ? hashActorKey(actor.actorKey) : null,
   });
+});
+
+app.get('/api/signals/messages/:id', optionalAuth, (req: AuthRequest, res: Response) => {
+  const row = db.prepare('SELECT * FROM signal_messages WHERE id = ?').get(req.params.id) as
+    | Record<string, unknown>
+    | undefined;
+  if (!row) {
+    res.status(404).json({ error: 'Message not found.' });
+    return;
+  }
+
+  const isAdmin =
+    Boolean(req.user) &&
+    req.user!.role === 'admin' &&
+    req.user!.email.toLowerCase() === DESIGNATED_ADMIN_EMAIL;
+  if (String(row.status) === 'draft' && !isAdmin) {
+    res.status(404).json({ error: 'Message not found.' });
+    return;
+  }
+
+  const actor = resolveReactionActor(req, res, false);
+  const hydrated = hydrateSignalMessages([row], actor?.actorKey)[0];
+  res.json({ message: hydrated });
 });
 
 const signalMessageCreateSchema = z
@@ -879,6 +1030,7 @@ const signalMessageCreateSchema = z
     image_url: z.string().max(500).optional().nullable(),
     image_name: z.string().max(250).optional().nullable(),
     message_type: z.enum(['signal', 'update', 'analysis', 'announcement']).default('update'),
+    status: z.enum(['active', 'draft']).default('active'),
     pinned: z.boolean().default(false),
     send_push: z.boolean().default(true),
     client_request_id: z.string().max(80).optional(),
@@ -902,7 +1054,7 @@ app.post('/api/signals/messages', requireRole('admin'), async (req: AuthRequest,
   const trimmedContent = d.content.trim();
   const dedupKey = d.client_request_id
     ? `req:${req.user!.id}:${d.client_request_id}`
-    : `msg:${req.user!.id}:${trimmedContent}:${d.image_url || ''}`;
+    : `msg:${req.user!.id}:${d.status}:${trimmedContent}:${d.image_url || ''}`;
   const lastSentAt = recentSignalChatDedup.get(dedupKey);
   if (lastSentAt && Date.now() - lastSentAt < 5000) {
     res.status(409).json({ error: 'Duplicate message submission ignored.' });
@@ -915,12 +1067,13 @@ app.post('/api/signals/messages', requireRole('admin'), async (req: AuthRequest,
 
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
+  const initialStatus = d.status === 'draft' ? 'draft' : 'active';
 
   db.prepare(
     `INSERT INTO signal_messages (
       id, author_id, author_name, content, image_url, image_name,
       message_type, status, pinned, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     id,
     req.user!.id,
@@ -929,29 +1082,40 @@ app.post('/api/signals/messages', requireRole('admin'), async (req: AuthRequest,
     d.image_url || null,
     d.image_name || null,
     d.message_type,
-    d.pinned ? 1 : 0,
+    initialStatus,
+    initialStatus === 'active' && d.pinned ? 1 : 0,
     now
   );
 
   const row = db.prepare('SELECT * FROM signal_messages WHERE id = ?').get(id) as Record<string, unknown>;
   const hydrated = hydrateSignalMessages([row], `user:${req.user!.id}`)[0];
 
-  broadcastWs('signals_chat:created', hydrated);
+  let pushJob = null;
+  if (initialStatus === 'active') {
+    broadcastWs('signals_chat:created', hydrated);
 
-  if (d.send_push !== false) {
-    const preview = trimmedContent
-      ? trimmedContent.replace(/\s+/g, ' ').slice(0, 140)
-      : 'New chart image shared in MeridianFX Signal Channel.';
-    await dispatchNotification({
-      title: 'MeridianFX',
-      body: preview,
-      category: 'signals',
-      linkUrl: '/signals',
-      broadcastWs,
-    });
+    const preview = buildSignalChannelPushPreview(
+      d.message_type,
+      trimmedContent,
+      Boolean(d.image_url)
+    );
+    if (d.send_push !== false) {
+      const dispatchRes = await dispatchNotification({
+        title: 'MeridianFX',
+        body: preview,
+        category: mapMessageTypeToPushCategory(d.message_type),
+        linkUrl: `/signals?message=${id}`,
+        signalMessageId: id,
+        imageUrl: d.image_url || null,
+        publishedAt: now,
+        dedupKey: `signal_message:${id}`,
+        broadcastWs,
+      });
+      pushJob = dispatchRes.push_job;
+    }
   }
 
-  res.status(201).json({ message: hydrated });
+  res.status(201).json({ message: hydrated, push_job: pushJob });
 });
 
 const signalMessagePatchSchema = z.object({
@@ -960,11 +1124,12 @@ const signalMessagePatchSchema = z.object({
   image_name: z.string().max(250).optional().nullable(),
   message_type: z.enum(['signal', 'update', 'analysis', 'announcement']).optional(),
   pinned: z.boolean().optional(),
-  status: z.enum(['active', 'completed']).optional(),
+  status: z.enum(['draft', 'active', 'completed']).optional(),
   completed_summary: z.string().max(1000).optional().nullable(),
+  send_push: z.boolean().optional(),
 });
 
-app.patch('/api/signals/messages/:id', requireRole('admin'), (req: AuthRequest, res: Response) => {
+app.patch('/api/signals/messages/:id', requireRole('admin'), async (req: AuthRequest, res: Response) => {
   if (req.user!.email.toLowerCase() !== DESIGNATED_ADMIN_EMAIL) {
     res.status(403).json({ error: 'Only the designated administrator can modify signal channel messages.' });
     return;
@@ -992,19 +1157,28 @@ app.patch('/api/signals/messages/:id', requireRole('admin'), (req: AuthRequest, 
     return;
   }
 
-  const nextStatus = d.status ?? String(existing.status);
+  const prevStatus = String(existing.status);
+  const nextStatus = d.status ?? prevStatus;
+  const publishingFromDraft = prevStatus === 'draft' && nextStatus === 'active';
+
   const contentEdited = d.content !== undefined && nextContent !== String(existing.content || '');
   const imageEdited = d.image_url !== undefined && nextImageUrl !== existing.image_url;
-  const nextEditedAt = contentEdited || imageEdited ? now : (existing.edited_at as string | null);
+  const nextEditedAt =
+    !publishingFromDraft && (contentEdited || imageEdited) ? now : (existing.edited_at as string | null);
 
   let nextCompletedAt = existing.completed_at as string | null;
   let nextPinned = d.pinned !== undefined ? (d.pinned ? 1 : 0) : Number(existing.pinned || 0);
-  if (d.status === 'completed' && existing.status !== 'completed') {
+  if (nextStatus === 'completed' && prevStatus !== 'completed') {
     nextCompletedAt = now;
     nextPinned = 0;
-  } else if (d.status === 'active' && existing.status !== 'active') {
+  } else if (nextStatus === 'active' && prevStatus !== 'active') {
     nextCompletedAt = null;
+  } else if (nextStatus === 'draft') {
+    nextPinned = 0;
   }
+
+  const nextCreatedAt = publishingFromDraft ? now : String(existing.created_at);
+  const nextType = d.message_type ?? String(existing.message_type || 'update');
 
   db.prepare(
     `UPDATE signal_messages SET
@@ -1016,18 +1190,20 @@ app.patch('/api/signals/messages/:id', requireRole('admin'), (req: AuthRequest, 
       status = ?,
       edited_at = ?,
       completed_at = ?,
-      completed_summary = ?
+      completed_summary = ?,
+      created_at = ?
      WHERE id = ?`
   ).run(
     nextContent,
     nextImageUrl || null,
     d.image_name !== undefined ? d.image_name : existing.image_name,
-    d.message_type ?? existing.message_type,
+    nextType,
     nextPinned,
     nextStatus,
     nextEditedAt,
     nextCompletedAt,
     d.completed_summary !== undefined ? d.completed_summary : existing.completed_summary,
+    nextCreatedAt,
     req.params.id
   );
 
@@ -1037,8 +1213,29 @@ app.patch('/api/signals/messages/:id', requireRole('admin'), (req: AuthRequest, 
   >;
   const hydrated = hydrateSignalMessages([updatedRow], `user:${req.user!.id}`)[0];
 
-  broadcastWs('signals_chat:updated', hydrated);
-  res.json({ message: hydrated });
+  let pushJob = null;
+  if (publishingFromDraft) {
+    broadcastWs('signals_chat:created', hydrated);
+    if (d.send_push !== false) {
+      const preview = buildSignalChannelPushPreview(nextType, nextContent, Boolean(nextImageUrl));
+      const dispatchRes = await dispatchNotification({
+        title: 'MeridianFX',
+        body: preview,
+        category: mapMessageTypeToPushCategory(nextType),
+        linkUrl: `/signals?message=${hydrated.id}`,
+        signalMessageId: hydrated.id,
+        imageUrl: nextImageUrl || null,
+        publishedAt: nextCreatedAt,
+        dedupKey: `signal_message:${hydrated.id}`,
+        broadcastWs,
+      });
+      pushJob = dispatchRes.push_job;
+    }
+  } else if (nextStatus !== 'draft') {
+    broadcastWs('signals_chat:updated', hydrated);
+  }
+
+  res.json({ message: hydrated, push_job: pushJob });
 });
 
 app.delete('/api/signals/messages/:id', requireRole('admin'), (req: AuthRequest, res: Response) => {
@@ -1244,17 +1441,50 @@ app.post('/api/signals', requireRole('admin'), async (req: AuthRequest, res: Res
   const hydrated = hydrateSignals([row])[0];
   broadcastWs('signal:created', hydrated);
 
+  const tpList = [d.tp1, d.tp2, d.tp3, d.tp4].filter(Boolean).join(' · ');
+  const mirrorText = [
+    `${d.direction} ${d.pair.toUpperCase()} (${d.timeframe} · ${d.classification})`,
+    `Entry: ${d.entry_price} | SL: ${d.stop_loss} | TP: ${tpList} | R:R ${d.risk_reward}`,
+    d.analysis,
+    d.admin_remarks ? `Note: ${d.admin_remarks}` : '',
+  ]
+    .filter(Boolean)
+    .join('\n\n');
+
+  const mirrored = publishMirrorToSignalChannel({
+    sourceType: 'signal',
+    sourceId: id,
+    authorId: req.user!.id,
+    authorName: req.user!.name,
+    messageType: 'signal',
+    content: mirrorText,
+    imageUrl: d.chart_image_url || null,
+    imageName: d.chart_image_url ? `${d.pair.toUpperCase()} chart` : null,
+    createdAt: now,
+  });
+
+  const targetUrl = mirrored ? `/signals?message=${mirrored.message.id}` : '/signals';
+  let pushJob = null;
   if (d.send_push !== false) {
-    await dispatchNotification({
+    const dispatchRes = await dispatchNotification({
       title: `New ${d.direction} Signal: ${d.pair.toUpperCase()}`,
       body: `Entry ${d.entry_price} · SL ${d.stop_loss} · TP1 ${d.tp1} (${d.timeframe})`,
       category: 'signals',
-      linkUrl: '/signals',
+      linkUrl: targetUrl,
+      signalMessageId: mirrored?.message.id || null,
+      imageUrl: d.chart_image_url || null,
+      publishedAt: now,
+      dedupKey: `signal:${id}`,
       broadcastWs,
     });
+    pushJob = dispatchRes.push_job;
   }
 
-  res.status(201).json({ signal: hydrated });
+  res.status(201).json({
+    signal: hydrated,
+    signal_message: mirrored?.message || null,
+    push_job: pushJob,
+  });
 });
 
 app.patch('/api/signals/:id', requireRole('admin'), async (req: AuthRequest, res: Response) => {
@@ -1304,27 +1534,40 @@ app.patch('/api/signals/:id', requireRole('admin'), async (req: AuthRequest, res
     req.params.id
   );
 
+  let pushJob = null;
+  let mirroredMsg = null;
+
   if (d.status && d.status !== existing.status) {
+    const signalUpdateId = crypto.randomUUID();
+    const noteText = `Status updated to ${nextStatus}.${d.admin_remarks ? ` ${d.admin_remarks}` : ''}`;
     db.prepare(
       `INSERT INTO signal_updates (id, signal_id, note, status_snapshot, created_by, created_at)
        VALUES (?, ?, ?, ?, ?, ?)`
-    ).run(
-      crypto.randomUUID(),
-      req.params.id,
-      `Status updated to ${nextStatus}.${d.admin_remarks ? ` ${d.admin_remarks}` : ''}`,
-      nextStatus,
-      req.user!.name,
-      now
-    );
+    ).run(signalUpdateId, req.params.id, noteText, nextStatus, req.user!.name, now);
+
+    const mirrored = publishMirrorToSignalChannel({
+      sourceType: 'signal_update',
+      sourceId: signalUpdateId,
+      authorId: req.user!.id,
+      authorName: req.user!.name,
+      messageType: 'update',
+      content: `${nextPair} Signal Update (${nextStatus}): ${noteText}`,
+      createdAt: now,
+    });
+    mirroredMsg = mirrored?.message || null;
 
     if (d.send_push !== false) {
-      await dispatchNotification({
+      const dispatchRes = await dispatchNotification({
         title: `${nextPair} Signal Update: ${nextStatus}`,
         body: d.admin_remarks || `${nextPair} status changed from ${String(existing.status)} to ${nextStatus}.`,
         category: 'signal_updates',
-        linkUrl: '/signals',
+        linkUrl: mirrored ? `/signals?message=${mirrored.message.id}` : '/signals',
+        signalMessageId: mirrored?.message.id || null,
+        publishedAt: now,
+        dedupKey: `signal_update:${signalUpdateId}`,
         broadcastWs,
       });
+      pushJob = dispatchRes.push_job;
     }
   }
 
@@ -1335,7 +1578,7 @@ app.patch('/api/signals/:id', requireRole('admin'), async (req: AuthRequest, res
   const hydrated = hydrateSignals([updatedRow])[0];
   broadcastWs('signal:updated', hydrated);
 
-  res.json({ signal: hydrated });
+  res.json({ signal: hydrated, signal_message: mirroredMsg, push_job: pushJob });
 });
 
 app.post('/api/signals/:id/updates', requireRole('admin'), async (req: AuthRequest, res: Response) => {
@@ -1360,6 +1603,7 @@ app.post('/api/signals/:id/updates', requireRole('admin'), async (req: AuthReque
 
   const now = new Date().toISOString();
   const nextStatus = parsed.data.status || String(existing.status);
+  const signalUpdateId = crypto.randomUUID();
 
   db.prepare('UPDATE signals SET status = ?, admin_remarks = ?, updated_at = ? WHERE id = ?').run(
     nextStatus,
@@ -1370,7 +1614,7 @@ app.post('/api/signals/:id/updates', requireRole('admin'), async (req: AuthReque
   db.prepare(
     `INSERT INTO signal_updates (id, signal_id, note, status_snapshot, created_by, created_at)
      VALUES (?, ?, ?, ?, ?, ?)`
-  ).run(crypto.randomUUID(), req.params.id, parsed.data.note, nextStatus, req.user!.name, now);
+  ).run(signalUpdateId, req.params.id, parsed.data.note, nextStatus, req.user!.name, now);
 
   const updatedRow = db.prepare('SELECT * FROM signals WHERE id = ?').get(req.params.id) as Record<
     string,
@@ -1379,17 +1623,36 @@ app.post('/api/signals/:id/updates', requireRole('admin'), async (req: AuthReque
   const hydrated = hydrateSignals([updatedRow])[0];
   broadcastWs('signal:updated', hydrated);
 
+  const mirrored = publishMirrorToSignalChannel({
+    sourceType: 'signal_update',
+    sourceId: signalUpdateId,
+    authorId: req.user!.id,
+    authorName: req.user!.name,
+    messageType: 'update',
+    content: `${String(existing.pair)} Update (${nextStatus}): ${parsed.data.note}`,
+    createdAt: now,
+  });
+
+  let pushJob = null;
   if (parsed.data.send_push !== false) {
-    await dispatchNotification({
+    const dispatchRes = await dispatchNotification({
       title: `${String(existing.pair)} Update (${nextStatus})`,
       body: parsed.data.note,
       category: 'signal_updates',
-      linkUrl: '/signals',
+      linkUrl: mirrored ? `/signals?message=${mirrored.message.id}` : '/signals',
+      signalMessageId: mirrored?.message.id || null,
+      publishedAt: now,
+      dedupKey: `signal_update:${signalUpdateId}`,
       broadcastWs,
     });
+    pushJob = dispatchRes.push_job;
   }
 
-  res.status(201).json({ signal: hydrated });
+  res.status(201).json({
+    signal: hydrated,
+    signal_message: mirrored?.message || null,
+    push_job: pushJob,
+  });
 });
 
 app.delete('/api/signals/:id', requireRole('admin'), (req: Request, res: Response) => {
@@ -1520,22 +1783,56 @@ app.post('/api/updates', requireRole('admin'), async (req: AuthRequest, res: Res
   >;
   const hydrated = hydrateUpdates([row], req.user!.id)[0];
 
+  let pushJob = null;
+  let mirroredMsg = null;
+
   if (published === 1) {
     broadcastWs('update:created', hydrated);
+    const isAnnouncement =
+      d.category === 'Platform Announcement' || d.category === 'Risk Warning';
+    const mirrorContent = [
+      `${d.category}: ${d.title}`,
+      d.content,
+      d.external_link ? `Reference: ${d.external_link}` : '',
+    ]
+      .filter(Boolean)
+      .join('\n\n');
+
+    const mirrored = publishMirrorToSignalChannel({
+      sourceType: 'market_update',
+      sourceId: id,
+      authorId: req.user!.id,
+      authorName: req.user!.name,
+      messageType: isAnnouncement ? 'announcement' : 'update',
+      content: mirrorContent,
+      imageUrl: d.image_url || null,
+      imageName: d.title,
+      pinned: Boolean(d.pinned),
+      createdAt: now,
+    });
+    mirroredMsg = mirrored?.message || null;
+
     if (d.send_push !== false) {
-      const isAnnouncement =
-        d.category === 'Platform Announcement' || d.category === 'Risk Warning';
-      await dispatchNotification({
+      const dispatchRes = await dispatchNotification({
         title: `${d.category}: ${d.title}`,
         body: d.content.slice(0, 140),
         category: isAnnouncement ? 'announcements' : 'market_updates',
-        linkUrl: '/updates',
+        linkUrl: mirrored ? `/signals?message=${mirrored.message.id}` : '/signals',
+        signalMessageId: mirrored?.message.id || null,
+        imageUrl: d.image_url || null,
+        publishedAt: now,
+        dedupKey: `market_update:${id}`,
         broadcastWs,
       });
+      pushJob = dispatchRes.push_job;
     }
   }
 
-  res.status(201).json({ update: hydrated });
+  res.status(201).json({
+    update: hydrated,
+    signal_message: mirroredMsg,
+    push_job: pushJob,
+  });
 });
 
 app.patch('/api/updates/:id', requireRole('admin'), (req: AuthRequest, res: Response) => {
@@ -2901,6 +3198,31 @@ app.get('/api/push/vapid-public-key', (_req: Request, res: Response) => {
   res.json({ publicKey });
 });
 
+app.get('/api/push/status', optionalAuth, (req: AuthRequest, res: Response) => {
+  const endpoint = typeof req.query.endpoint === 'string' ? req.query.endpoint.trim() : '';
+  const actor = resolveReactionActor(req, res, false);
+  let subscribed = false;
+
+  if (endpoint) {
+    const row = db
+      .prepare('SELECT active FROM push_subscriptions WHERE endpoint = ?')
+      .get(endpoint) as { active: number } | undefined;
+    subscribed = Boolean(row && Number(row.active) === 1);
+  } else if (actor?.userId) {
+    const row = db
+      .prepare('SELECT 1 FROM push_subscriptions WHERE user_id = ? AND COALESCE(active, 1) = 1 LIMIT 1')
+      .get(actor.userId);
+    subscribed = Boolean(row);
+  } else if (actor?.visitorId) {
+    const row = db
+      .prepare('SELECT 1 FROM push_subscriptions WHERE visitor_id = ? AND COALESCE(active, 1) = 1 LIMIT 1')
+      .get(actor.visitorId);
+    subscribed = Boolean(row);
+  }
+
+  res.json({ subscribed });
+});
+
 app.post('/api/push/subscribe', optionalAuth, (req: AuthRequest, res: Response) => {
   const schema = z.object({
     endpoint: z.string().url(),
@@ -2908,6 +3230,7 @@ app.post('/api/push/subscribe', optionalAuth, (req: AuthRequest, res: Response) 
       p256dh: z.string().min(10),
       auth: z.string().min(6),
     }),
+    platform: z.enum(['android', 'ios', 'desktop']).optional(),
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
@@ -2915,32 +3238,56 @@ app.post('/api/push/subscribe', optionalAuth, (req: AuthRequest, res: Response) 
     return;
   }
 
+  const actor = resolveReactionActor(req, res, !req.user);
+  const visitorId = actor?.visitorId || null;
   const now = new Date().toISOString();
+  const ua = String(req.headers['user-agent'] || '').slice(0, 250);
+  const platform =
+    parsed.data.platform ||
+    (/android/i.test(ua) ? 'android' : /iphone|ipad|ipod/i.test(ua) ? 'ios' : 'desktop');
+
   db.prepare(
-    `INSERT INTO push_subscriptions (id, user_id, endpoint, p256dh, auth, user_agent, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(endpoint) DO UPDATE SET
-       user_id = COALESCE(excluded.user_id, push_subscriptions.user_id),
-       p256dh = excluded.p256dh,
-       auth = excluded.auth,
-       user_agent = excluded.user_agent`
+    `INSERT INTO push_subscriptions (
+      id, user_id, visitor_id, endpoint, p256dh, auth, user_agent, platform,
+      active, last_error, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?)
+    ON CONFLICT(endpoint) DO UPDATE SET
+      user_id = COALESCE(excluded.user_id, push_subscriptions.user_id),
+      visitor_id = COALESCE(excluded.visitor_id, push_subscriptions.visitor_id),
+      p256dh = excluded.p256dh,
+      auth = excluded.auth,
+      user_agent = excluded.user_agent,
+      platform = COALESCE(excluded.platform, push_subscriptions.platform),
+      active = 1,
+      last_error = NULL,
+      updated_at = excluded.updated_at`
   ).run(
     crypto.randomUUID(),
     req.user?.id || null,
+    visitorId,
     parsed.data.endpoint,
     parsed.data.keys.p256dh,
     parsed.data.keys.auth,
-    String(req.headers['user-agent'] || '').slice(0, 250),
+    ua,
+    platform,
+    now,
     now
   );
 
-  res.status(201).json({ ok: true });
+  const subRow = db
+    .prepare('SELECT id FROM push_subscriptions WHERE endpoint = ?')
+    .get(parsed.data.endpoint) as { id: string } | undefined;
+
+  res.status(201).json({ ok: true, subscription_id: subRow?.id || null, active: true });
 });
 
 app.post('/api/push/unsubscribe', (req: Request, res: Response) => {
-  const endpoint = String(req.body?.endpoint || '');
+  const endpoint = String(req.body?.endpoint || '').trim();
   if (endpoint) {
-    db.prepare('DELETE FROM push_subscriptions WHERE endpoint = ?').run(endpoint);
+    db.prepare('UPDATE push_subscriptions SET active = 0, updated_at = ? WHERE endpoint = ?').run(
+      new Date().toISOString(),
+      endpoint
+    );
   }
   res.json({ ok: true });
 });
@@ -2982,11 +3329,14 @@ app.get('/api/admin/overview', requireRole('admin'), (_req: AuthRequest, res: Re
     db.prepare('SELECT COUNT(*) as c FROM users WHERE created_at >= ?').get(sevenDaysAgo) as { c: number }
   ).c;
   const pushSubscribers = (
-    db.prepare('SELECT COUNT(*) as c FROM push_subscriptions').get() as { c: number }
+    db.prepare('SELECT COUNT(*) as c FROM push_subscriptions WHERE COALESCE(active, 1) = 1').get() as {
+      c: number;
+    }
   ).c;
   const dispatchLogs = db
     .prepare('SELECT * FROM push_dispatch_logs ORDER BY created_at DESC LIMIT 20')
     .all();
+  const pushJobs = listRecentPushJobs(20);
   const systemLogs = db
     .prepare('SELECT * FROM system_logs ORDER BY created_at DESC LIMIT 30')
     .all();
@@ -3017,10 +3367,20 @@ app.get('/api/admin/overview', requireRole('admin'), (_req: AuthRequest, res: Re
       push_subscribers: pushSubscribers,
     },
     dispatch_logs: dispatchLogs,
+    push_jobs: pushJobs,
     system_logs: systemLogs,
     backups,
     student_progress: studentProgress,
   });
+});
+
+app.get('/api/admin/push-jobs/:id', requireRole('admin'), (req: Request, res: Response) => {
+  const job = getPushJobSummary(String(req.params.id));
+  if (!job) {
+    res.status(404).json({ error: 'Push job not found.' });
+    return;
+  }
+  res.json({ job });
 });
 
 app.get('/api/admin/users', requireRole('admin'), (_req: Request, res: Response) => {
@@ -3269,16 +3629,18 @@ app.post('/api/admin/notifications/send', requireRole('admin'), async (req: Auth
     return;
   }
 
+  const now = new Date().toISOString();
   const result = await dispatchNotification({
     title: d.title,
     body: d.body,
     category: d.category as keyof NotificationPreferences,
-    linkUrl: d.link_url || '/',
+    linkUrl: d.link_url || '/signals',
     targetUserIds: d.target_user_ids && d.target_user_ids.length > 0 ? d.target_user_ids : null,
+    publishedAt: now,
     broadcastWs,
   });
 
-  res.status(201).json({ scheduled: false, result });
+  res.status(201).json({ scheduled: false, result, push_job: result.push_job });
 });
 
 app.get('/api/admin/reports', requireRole('admin', 'moderator'), (_req: Request, res: Response) => {
@@ -3384,14 +3746,43 @@ if (!process.env.VERCEL) {
         .all(nowIso) as Array<Record<string, unknown>>;
 
       for (const u of dueUpdates) {
-        db.prepare('UPDATE market_updates SET published = 1, updated_at = ? WHERE id = ?').run(nowIso, String(u.id));
+        const uid = String(u.id);
+        db.prepare('UPDATE market_updates SET published = 1, updated_at = ? WHERE id = ?').run(nowIso, uid);
         const hydrated = { ...u, pinned: Boolean(u.pinned), published: true, reactions: {}, user_reacted: [], bookmarked: false };
         broadcastWs('update:created', hydrated);
+
+        const category = String(u.category || 'Market Update');
+        const isAnnouncement =
+          category === 'Platform Announcement' || category === 'Risk Warning';
+        const mirrorContent = [
+          `${category}: ${String(u.title)}`,
+          String(u.content),
+          u.external_link ? `Reference: ${String(u.external_link)}` : '',
+        ]
+          .filter(Boolean)
+          .join('\n\n');
+
+        const mirrored = publishMirrorToSignalChannel({
+          sourceType: 'market_update',
+          sourceId: uid,
+          authorName: String(u.author_name || 'MeridianFX'),
+          messageType: isAnnouncement ? 'announcement' : 'update',
+          content: mirrorContent,
+          imageUrl: u.image_url ? String(u.image_url) : null,
+          imageName: String(u.title),
+          pinned: Boolean(u.pinned),
+          createdAt: nowIso,
+        });
+
         await dispatchNotification({
-          title: `${String(u.category)}: ${String(u.title)}`,
+          title: `${category}: ${String(u.title)}`,
           body: String(u.content).slice(0, 140),
-          category: 'market_updates',
-          linkUrl: '/updates',
+          category: isAnnouncement ? 'announcements' : 'market_updates',
+          linkUrl: mirrored ? `/signals?message=${mirrored.message.id}` : '/signals',
+          signalMessageId: mirrored?.message.id || null,
+          imageUrl: u.image_url ? String(u.image_url) : null,
+          publishedAt: nowIso,
+          dedupKey: `market_update:${uid}`,
           broadcastWs,
         });
       }
@@ -3416,6 +3807,8 @@ if (!process.env.VERCEL) {
           category: n.category as keyof NotificationPreferences,
           linkUrl: n.link_url,
           targetUserIds: n.target_user_ids ? (JSON.parse(n.target_user_ids) as string[]) : null,
+          publishedAt: nowIso,
+          dedupKey: `scheduled_notif:${n.id}`,
           broadcastWs,
         });
       }
@@ -3437,6 +3830,8 @@ if (!process.env.VERCEL) {
           body: `${String(l.category)} lesson is now available in the Trading Academy.`,
           category: 'academy',
           linkUrl: '/academy',
+          publishedAt: nowIso,
+          dedupKey: `lesson_publish:${String(l.id)}`,
           broadcastWs,
         });
       }
@@ -3451,6 +3846,15 @@ if (!process.env.VERCEL) {
       logSystemEvent('error', 'scheduler', String(err));
     }
   }, 30_000);
+
+  // Fast 10-second Push Delivery Retry Worker (zero duplicates guaranteed via SQLite delivery state)
+  setInterval(async () => {
+    try {
+      await processPendingPushDeliveries({ broadcastWs });
+    } catch (err) {
+      logSystemEvent('error', 'push-worker', String(err));
+    }
+  }, 10_000);
 }
 
 // ---------- Frontend Serving (Vite Dev Middleware vs Production Static) ----------

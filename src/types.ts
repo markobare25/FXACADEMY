@@ -62,7 +62,7 @@ export interface TradingSignal {
 }
 
 export type SignalChatMessageType = 'signal' | 'update' | 'analysis' | 'announcement';
-export type SignalChatStatus = 'active' | 'completed';
+export type SignalChatStatus = 'draft' | 'active' | 'completed';
 export type SignalReactionType = 'love' | 'like' | 'fire' | 'hundred' | 'dislike';
 
 export interface SignalReactionsMap {
@@ -86,9 +86,28 @@ export interface SignalChatMessage {
   edited_at?: string | null;
   completed_at?: string | null;
   completed_summary?: string | null;
+  source_type?: string | null;
+  source_id?: string | null;
   created_at: string;
   reactions: SignalReactionsMap;
   user_reaction: SignalReactionType | null;
+}
+
+export interface PushJobSummary {
+  id: string;
+  dedup_key: string;
+  signal_message_id: string | null;
+  title: string;
+  category: string;
+  link_url: string;
+  published_at: string;
+  status: 'queued' | 'processing' | 'completed' | 'partial' | 'failed';
+  total_targeted: number;
+  queued_count: number;
+  delivered_count: number;
+  failed_count: number;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface RegistrationTrendPoint {

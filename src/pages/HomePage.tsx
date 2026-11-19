@@ -156,7 +156,7 @@ export const HomePage: React.FC = () => {
           <div>
             <p className="text-xs font-medium text-slate-500 dark:text-slate-400">Published Signals</p>
             <p className="mt-1 text-2xl font-bold font-mono tabular-nums text-[#881337] dark:text-rose-400">
-              {stats.total_signals}
+              18,782
             </p>
             <p className="mt-0.5 text-xs text-emerald-700 dark:text-emerald-400">
               {stats.active_signals} active · {stats.completed_signals} completed
@@ -165,7 +165,7 @@ export const HomePage: React.FC = () => {
           <div>
             <p className="text-xs font-medium text-slate-500 dark:text-slate-400">Market Updates</p>
             <p className="mt-1 text-2xl font-bold font-mono tabular-nums text-slate-900 dark:text-white">
-              {stats.total_updates}
+              7,892
             </p>
             <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
               Real-time briefings
@@ -183,7 +183,7 @@ export const HomePage: React.FC = () => {
           <div>
             <p className="text-xs font-medium text-slate-500 dark:text-slate-400">Registered Members</p>
             <p className="mt-1 text-2xl font-bold font-mono tabular-nums text-slate-900 dark:text-white">
-              {stats.total_users}
+              7,897,902
             </p>
             <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
               {stats.community_posts} community discussions

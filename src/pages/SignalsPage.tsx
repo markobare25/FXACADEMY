@@ -26,7 +26,9 @@ import {
 } from 'lucide-react';
 import { usePlatform, type SignalChatWsEvent } from '../context/PlatformContext';
 import { apiFetch, formatLocalDateTime, getOrCreateVisitorId, uploadMediaFile } from '../lib/api';
+import { getCurrentPushSubscription } from '../lib/pushClient';
 import type {
+  PushJobSummary,
   SignalChatMessage,
   SignalChatMessageType,
   SignalReactionType,
@@ -163,8 +165,10 @@ export const SignalsPage: React.FC = () => {
     onlineCount,
     wsConnected,
     unreadCount,
+    showNotifModal,
     setShowNotifModal,
     subscribeSignalChatEvents,
+    subscribePushJobEvents,
   } = usePlatform();
   const isAdmin = user?.role === 'admin';
 
@@ -208,7 +212,19 @@ export const SignalsPage: React.FC = () => {
   const [attachmentPreview, setAttachmentPreview] = useState<string | null>(null);
   const [uploadingImage, setUploadingImage] = useState(false);
   const [sendingMessage, setSendingMessage] = useState(false);
+  const [savingDraft, setSavingDraft] = useState(false);
   const [composerError, setComposerError] = useState<string | null>(null);
+
+  // Admin Drafts & Publish Confirmation state
+  const [draftMessages, setDraftMessages] = useState<SignalChatMessage[]>([]);
+  const [showDrafts, setShowDrafts] = useState(false);
+  const [publishingDraftId, setPublishingDraftId] = useState<string | null>(null);
+  const [publishConfirmation, setPublishConfirmation] = useState<{
+    messageId: string;
+    label: string;
+    pushJob: PushJobSummary | null;
+  } | null>(null);
+  const [pushSubscribed, setPushSubscribed] = useState(false);
 
   // Message editing / archiving / deleting / lightbox state
   const [editingMsgId, setEditingMsgId] = useState<string | null>(null);
@@ -233,6 +249,7 @@ export const SignalsPage: React.FC = () => {
   const viewerKeyRef = useRef<string | null>(null);
   const prevUserIdRef = useRef<string | null | undefined>(undefined);
   const messageRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  const handledDeepLinkRef = useRef<string | null>(null);
 
   useEffect(() => {
     setRealOnlineCount(onlineCount);
@@ -347,9 +364,64 @@ export const SignalsPage: React.FC = () => {
     }
   }, []);
 
+  const fetchDraftMessages = useCallback(async () => {
+    if (!isAdmin) return;
+    try {
+      const res = await apiFetch<{ messages: SignalChatMessage[] }>(
+        '/api/signals/messages?status=draft&limit=50'
+      );
+      setDraftMessages(res.messages);
+    } catch {
+      // ignore
+    }
+  }, [isAdmin]);
+
   useEffect(() => {
     fetchActiveMessages(false);
   }, [fetchActiveMessages]);
+
+  useEffect(() => {
+    if (isAdmin) {
+      fetchDraftMessages();
+    } else {
+      setDraftMessages([]);
+    }
+  }, [isAdmin, fetchDraftMessages]);
+
+  // Refresh push subscription indicator when page loads or modal closes
+  useEffect(() => {
+    getCurrentPushSubscription()
+      .then((sub) => setPushSubscribed(Boolean(sub)))
+      .catch(() => setPushSubscribed(false));
+  }, [showNotifModal]);
+
+  // Keep push confirmation counts updated live via WebSocket
+  useEffect(() => {
+    return subscribePushJobEvents((job) => {
+      setPublishConfirmation((cur) => {
+        if (!cur || !cur.pushJob || cur.pushJob.id !== job.id) return cur;
+        return { ...cur, pushJob: job };
+      });
+    });
+  }, [subscribePushJobEvents]);
+
+  // Poll briefly while any push deliveries are still queued/retrying
+  useEffect(() => {
+    const jobId = publishConfirmation?.pushJob?.id;
+    const queued = publishConfirmation?.pushJob?.queued_count ?? 0;
+    if (!isAdmin || !jobId || queued <= 0) return;
+
+    const timer = window.setInterval(() => {
+      apiFetch<{ job: PushJobSummary }>(`/api/admin/push-jobs/${jobId}`)
+        .then((res) => {
+          setPublishConfirmation((cur) =>
+            cur?.pushJob?.id === jobId ? { ...cur, pushJob: res.job } : cur
+          );
+        })
+        .catch(() => undefined);
+    }, 3000);
+    return () => clearInterval(timer);
+  }, [isAdmin, publishConfirmation?.pushJob?.id, publishConfirmation?.pushJob?.queued_count]);
 
   useEffect(() => {
     const curId = user?.id ?? null;
@@ -573,15 +645,16 @@ export const SignalsPage: React.FC = () => {
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
-  const handleSendMessage = async (e?: React.FormEvent) => {
+  const handleSendMessage = async (e?: React.FormEvent, asDraft = false) => {
     if (e) e.preventDefault();
-    if (!isAdmin || sendingMessage || uploadingImage) return;
+    if (!isAdmin || sendingMessage || savingDraft || uploadingImage) return;
     if (!composerText.trim() && !attachmentUrl) {
       setComposerError('Type a message or attach an image.');
       return;
     }
 
-    setSendingMessage(true);
+    if (asDraft) setSavingDraft(true);
+    else setSendingMessage(true);
     setComposerError(null);
     const requestId =
       typeof crypto !== 'undefined' && crypto.randomUUID
@@ -589,37 +662,85 @@ export const SignalsPage: React.FC = () => {
         : `${Date.now()}-${Math.random()}`;
 
     try {
-      const res = await apiFetch<{ message: SignalChatMessage }>('/api/signals/messages', {
-        method: 'POST',
-        body: JSON.stringify({
-          content: composerText.trim(),
-          image_url: attachmentUrl,
-          image_name: attachmentName,
-          message_type: composerType,
-          pinned: composerPinned,
-          send_push: composerPush,
-          client_request_id: requestId,
-        }),
-      });
-      setActiveMessages((prev) =>
-        prev.some((m) => m.id === res.message.id) ? prev : [...prev, res.message]
+      const res = await apiFetch<{ message: SignalChatMessage; push_job?: PushJobSummary | null }>(
+        '/api/signals/messages',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            content: composerText.trim(),
+            image_url: attachmentUrl,
+            image_name: attachmentName,
+            message_type: composerType,
+            status: asDraft ? 'draft' : 'active',
+            pinned: !asDraft && composerPinned,
+            send_push: asDraft ? false : composerPush,
+            client_request_id: requestId,
+          }),
+        }
       );
-      if (res.message.pinned) {
-        setPinnedMessages((prev) =>
-          prev.some((m) => m.id === res.message.id) ? prev : [res.message, ...prev]
+
+      if (res.message.status === 'draft') {
+        setDraftMessages((prev) => [res.message, ...prev]);
+        setShowDrafts(true);
+      } else {
+        setActiveMessages((prev) =>
+          prev.some((m) => m.id === res.message.id) ? prev : [...prev, res.message]
         );
+        if (res.message.pinned) {
+          setPinnedMessages((prev) =>
+            prev.some((m) => m.id === res.message.id) ? prev : [res.message, ...prev]
+          );
+        }
+        setPublishConfirmation({
+          messageId: res.message.id,
+          label: 'Published publicly to Signals Channel',
+          pushJob: res.push_job || null,
+        });
       }
+
       setComposerText('');
       setComposerPinned(false);
       handleCancelAttachment();
-      requestAnimationFrame(() => {
-        scrollToBottom(true);
-        composerInputRef.current?.focus();
-      });
+      if (!asDraft) {
+        requestAnimationFrame(() => {
+          scrollToBottom(true);
+          composerInputRef.current?.focus();
+        });
+      }
     } catch (err) {
       setComposerError(err instanceof Error ? err.message : 'Unable to publish message.');
     } finally {
       setSendingMessage(false);
+      setSavingDraft(false);
+    }
+  };
+
+  const handlePublishDraft = async (draft: SignalChatMessage) => {
+    if (!isAdmin || publishingDraftId) return;
+    setPublishingDraftId(draft.id);
+    setComposerError(null);
+    try {
+      const res = await apiFetch<{ message: SignalChatMessage; push_job?: PushJobSummary | null }>(
+        `/api/signals/messages/${draft.id}`,
+        {
+          method: 'PATCH',
+          body: JSON.stringify({ status: 'active', send_push: true }),
+        }
+      );
+      setDraftMessages((prev) => prev.filter((d) => d.id !== draft.id));
+      setActiveMessages((prev) =>
+        prev.some((m) => m.id === res.message.id) ? prev : [...prev, res.message]
+      );
+      setPublishConfirmation({
+        messageId: res.message.id,
+        label: 'Draft published publicly to Signals Channel',
+        pushJob: res.push_job || null,
+      });
+      requestAnimationFrame(() => scrollToBottom(true));
+    } catch (err) {
+      setComposerError(err instanceof Error ? err.message : 'Unable to publish draft.');
+    } finally {
+      setPublishingDraftId(null);
     }
   };
 
@@ -762,19 +883,84 @@ export const SignalsPage: React.FC = () => {
     await apiFetch(`/api/signals/messages/${msgId}`, { method: 'DELETE' });
     setActiveMessages((prev) => prev.filter((m) => m.id !== msgId));
     setPinnedMessages((prev) => prev.filter((m) => m.id !== msgId));
+    setDraftMessages((prev) => prev.filter((m) => m.id !== msgId));
     setCompletedMessages((prev) => prev.filter((m) => m.id !== msgId));
     setSelectedCompleted((cur) => (cur?.id === msgId ? null : cur));
     setConfirmDeleteId(null);
   };
 
-  const jumpToMessage = (msgId: string) => {
+  const jumpToMessage = useCallback((msgId: string) => {
     const node = messageRefs.current.get(msgId);
     if (node) {
       node.scrollIntoView({ behavior: 'smooth', block: 'center' });
       setHighlightedMsgId(msgId);
-      setTimeout(() => setHighlightedMsgId((cur) => (cur === msgId ? null : cur)), 1800);
+      setTimeout(() => setHighlightedMsgId((cur) => (cur === msgId ? null : cur)), 2400);
     }
-  };
+  }, []);
+
+  const focusSignalMessageById = useCallback(
+    async (msgId: string) => {
+      if (!msgId) return;
+      const inActive = activeMessages.some((m) => m.id === msgId);
+      if (inActive) {
+        setView('chat');
+        requestAnimationFrame(() => jumpToMessage(msgId));
+        return;
+      }
+
+      try {
+        const res = await apiFetch<{ message: SignalChatMessage }>(
+          `/api/signals/messages/${encodeURIComponent(msgId)}`
+        );
+        if (res.message.status === 'completed') {
+          setView('completed');
+          setSelectedCompleted(res.message);
+        } else if (res.message.status === 'active') {
+          setView('chat');
+          setActiveMessages((prev) =>
+            prev.some((m) => m.id === res.message.id)
+              ? prev
+              : [...prev, res.message].sort((a, b) => a.created_at.localeCompare(b.created_at))
+          );
+          requestAnimationFrame(() => {
+            setTimeout(() => jumpToMessage(msgId), 60);
+          });
+        }
+      } catch {
+        // ignore unknown/deleted target id
+      }
+    },
+    [activeMessages, jumpToMessage]
+  );
+
+  // Handle deep-linked ?message=<id> from push notifications or direct URLs
+  useEffect(() => {
+    if (activeLoading) return;
+    const params = new URLSearchParams(window.location.search);
+    const targetId = params.get('message');
+    if (targetId && handledDeepLinkRef.current !== targetId) {
+      handledDeepLinkRef.current = targetId;
+      focusSignalMessageById(targetId);
+    }
+  }, [activeLoading, focusSignalMessageById]);
+
+  useEffect(() => {
+    const onLocationOrHighlight = (evt: Event) => {
+      const customDetail = (evt as CustomEvent<{ messageId?: string }>).detail;
+      const params = new URLSearchParams(window.location.search);
+      const targetId = customDetail?.messageId || params.get('message');
+      if (targetId) {
+        handledDeepLinkRef.current = targetId;
+        focusSignalMessageById(targetId);
+      }
+    };
+    window.addEventListener('mfx:locationchange', onLocationOrHighlight);
+    window.addEventListener('mfx:highlight-signal-message', onLocationOrHighlight);
+    return () => {
+      window.removeEventListener('mfx:locationchange', onLocationOrHighlight);
+      window.removeEventListener('mfx:highlight-signal-message', onLocationOrHighlight);
+    };
+  }, [focusSignalMessageById]);
 
   // Group Active messages with day separators
   const activeWithDividers = useMemo(() => {
@@ -842,8 +1028,25 @@ export const SignalsPage: React.FC = () => {
               </div>
             </div>
 
-            {/* Channel Header Toolbar: Info */}
-            <div className="flex items-center gap-1.5 shrink-0">
+            {/* Channel Header Toolbar: Push Alerts + Info */}
+            <div className="flex items-center gap-1 shrink-0">
+              <button
+                type="button"
+                onClick={() => setShowNotifModal(true)}
+                aria-label={pushSubscribed ? 'Push notifications active' : 'Enable push notifications'}
+                title={pushSubscribed ? 'Push alerts enabled on this device' : 'Enable real-time push alerts'}
+                className={`relative min-h-[38px] px-2.5 flex items-center justify-center gap-1.5 rounded-lg text-xs font-semibold transition-colors ${
+                  pushSubscribed
+                    ? 'text-[#15803D] dark:text-emerald-400 bg-emerald-50/80 dark:bg-emerald-950/30 hover:bg-emerald-100/80'
+                    : 'text-[#881337] dark:text-rose-300 bg-rose-50/70 dark:bg-rose-950/30 hover:bg-rose-100/70'
+                }`}
+              >
+                {pushSubscribed ? <BellRing className="w-4 h-4" /> : <Bell className="w-4 h-4" />}
+                <span className="hidden sm:inline">
+                  {pushSubscribed ? 'Alerts On' : 'Get Alerts'}
+                </span>
+              </button>
+
               <button
                 type="button"
                 onClick={() => setShowChannelInfo(true)}
@@ -991,6 +1194,11 @@ export const SignalsPage: React.FC = () => {
                               <span className="text-[11px] font-medium text-[#15803D] dark:text-emerald-400">
                                 · {MESSAGE_TYPE_LABELS[msg.message_type] || 'Update'}
                               </span>
+                              {isAdmin && (
+                                <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-500">
+                                  · Published
+                                </span>
+                              )}
                               {msg.pinned && (
                                 <span className="inline-flex items-center gap-0.5 text-[11px] font-semibold text-[#881337] dark:text-rose-400">
                                   · <Pin className="w-3 h-3" /> Pinned
@@ -1208,10 +1416,84 @@ export const SignalsPage: React.FC = () => {
           {/* Fixed Bottom Composer (Admin Only) */}
           {isAdmin && (
             <form
-              onSubmit={handleSendMessage}
+              onSubmit={(e) => handleSendMessage(e, false)}
               className="border-t border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0F172A] px-3 sm:px-5 py-2.5 space-y-2 shrink-0 z-20"
             >
               <div className="mx-auto max-w-3xl space-y-2">
+                {/* Post-Publish Public & Push Delivery Confirmation Banner */}
+                {publishConfirmation && (
+                  <div className="rounded-xl border border-emerald-200 dark:border-emerald-900/50 bg-emerald-50/90 dark:bg-emerald-950/30 px-3 py-2 flex flex-wrap items-center justify-between gap-2 text-xs">
+                    <div className="space-y-0.5 min-w-0">
+                      <p className="font-bold text-[#15803D] dark:text-emerald-400 flex items-center gap-1.5">
+                        <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                        <span>{publishConfirmation.label}</span>
+                      </p>
+                      <p className="text-[11px] text-slate-600 dark:text-slate-300 font-mono tabular-nums">
+                        {publishConfirmation.pushJob
+                          ? `Push queued: ${publishConfirmation.pushJob.queued_count} · Delivered: ${publishConfirmation.pushJob.delivered_count} · Failures: ${publishConfirmation.pushJob.failed_count} (Targeted: ${publishConfirmation.pushJob.total_targeted})`
+                          : 'Push notification skipped for this post.'}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setPublishConfirmation(null)}
+                      className="p-1 text-slate-400 hover:text-slate-700 dark:hover:text-white shrink-0"
+                      aria-label="Dismiss publish confirmation"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                )}
+
+                {/* Admin Drafts Strip */}
+                {showDrafts && draftMessages.length > 0 && (
+                  <div className="rounded-xl border border-amber-200 dark:border-amber-900/50 bg-amber-50/70 dark:bg-amber-950/20 p-2.5 space-y-2 max-h-44 overflow-y-auto">
+                    <div className="flex items-center justify-between text-[11px] font-bold text-amber-800 dark:text-amber-300">
+                      <span>Private Admin Drafts ({draftMessages.length}) — not visible publicly</span>
+                      <button
+                        type="button"
+                        onClick={() => setShowDrafts(false)}
+                        className="underline font-semibold"
+                      >
+                        Hide
+                      </button>
+                    </div>
+                    {draftMessages.map((draft) => (
+                      <div
+                        key={draft.id}
+                        className="rounded-lg bg-white dark:bg-slate-900 border border-amber-200/70 dark:border-slate-800 px-3 py-2 flex items-center justify-between gap-2 text-xs"
+                      >
+                        <div className="min-w-0">
+                          <span className="text-[10px] font-bold uppercase text-amber-600 dark:text-amber-400 mr-1.5">
+                            [Draft · {MESSAGE_TYPE_LABELS[draft.message_type]}]
+                          </span>
+                          <span className="text-slate-700 dark:text-slate-200 truncate block">
+                            {draft.content || draft.image_name || 'Image attachment'}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          <button
+                            type="button"
+                            disabled={publishingDraftId === draft.id}
+                            onClick={() => handlePublishDraft(draft)}
+                            className="rounded-md bg-[#15803D] px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-[#166534] disabled:opacity-60"
+                          >
+                            {publishingDraftId === draft.id ? 'Publishing...' : 'Publish & Notify'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteMessage(draft.id)}
+                            className="p-1 text-slate-400 hover:text-red-600"
+                            aria-label="Delete draft"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
                 {/* Compact Composer Controls Strip */}
                 <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
                   <div className="flex items-center gap-1.5">
@@ -1239,6 +1521,16 @@ export const SignalsPage: React.FC = () => {
                       <Pin className="w-3 h-3" />
                       <span>{composerPinned ? 'Pinned' : 'Pin'}</span>
                     </button>
+
+                    {draftMessages.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setShowDrafts((s) => !s)}
+                        className="inline-flex items-center gap-1 rounded-lg border border-amber-300 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/30 px-2 py-1 text-[11px] font-semibold text-amber-800 dark:text-amber-300"
+                      >
+                        <span>Drafts ({draftMessages.length})</span>
+                      </button>
+                    )}
                   </div>
 
                   <label className="inline-flex items-center gap-1.5 text-[11px] text-slate-600 dark:text-slate-300 cursor-pointer">
@@ -1248,7 +1540,7 @@ export const SignalsPage: React.FC = () => {
                       onChange={(e) => setComposerPush(e.target.checked)}
                       className="accent-[#881337] w-3.5 h-3.5"
                     />
-                    <span>Push Alert</span>
+                    <span>Auto Push Alert</span>
                   </label>
                 </div>
 
@@ -1300,7 +1592,7 @@ export const SignalsPage: React.FC = () => {
                   <button
                     type="button"
                     onClick={() => fileInputRef.current?.click()}
-                    disabled={uploadingImage || sendingMessage}
+                    disabled={uploadingImage || sendingMessage || savingDraft}
                     title="Attach image or chart screenshot"
                     aria-label="Attach image"
                     className="min-h-[44px] min-w-[44px] flex items-center justify-center rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-200 hover:text-[#881337] disabled:opacity-50 shrink-0 transition-colors"
@@ -1320,7 +1612,7 @@ export const SignalsPage: React.FC = () => {
                     onKeyDown={(e) => {
                       if (e.key === 'Enter' && !e.shiftKey && window.innerWidth >= 768) {
                         e.preventDefault();
-                        handleSendMessage();
+                        handleSendMessage(undefined, false);
                       }
                     }}
                     placeholder="Broadcast message, signal, or market update..."
@@ -1328,11 +1620,23 @@ export const SignalsPage: React.FC = () => {
                   />
 
                   <button
+                    type="button"
+                    disabled={
+                      sendingMessage || savingDraft || uploadingImage || (!composerText.trim() && !attachmentUrl)
+                    }
+                    onClick={() => handleSendMessage(undefined, true)}
+                    title="Save privately as draft without publishing"
+                    className="min-h-[44px] px-2.5 sm:px-3 rounded-xl border border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-200 font-semibold text-xs hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50 shrink-0 transition-colors"
+                  >
+                    {savingDraft ? 'Saving...' : 'Draft'}
+                  </button>
+
+                  <button
                     type="submit"
                     disabled={
-                      sendingMessage || uploadingImage || (!composerText.trim() && !attachmentUrl)
+                      sendingMessage || savingDraft || uploadingImage || (!composerText.trim() && !attachmentUrl)
                     }
-                    aria-label="Send message"
+                    aria-label="Publish live message"
                     className="min-h-[44px] min-w-[44px] sm:px-4 rounded-xl bg-[#881337] text-white font-semibold text-xs sm:text-sm inline-flex items-center justify-center gap-1.5 hover:bg-[#6B0F2B] disabled:opacity-50 shrink-0 transition-colors"
                   >
                     {sendingMessage ? (
@@ -1340,7 +1644,7 @@ export const SignalsPage: React.FC = () => {
                     ) : (
                       <Send className="w-4 h-4" />
                     )}
-                    <span className="hidden sm:inline">Send</span>
+                    <span className="hidden sm:inline">Publish</span>
                   </button>
                 </div>
               </div>

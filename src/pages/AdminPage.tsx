@@ -23,11 +23,14 @@ import { usePlatform } from '../context/PlatformContext';
 import { apiFetch, formatLocalDateTime, uploadMediaFile } from '../lib/api';
 import { AdminAcademyManager } from '../components/admin/AdminAcademyManager';
 import { AdminRegistrationsPanel } from '../components/admin/AdminRegistrationsPanel';
+import { CheckCircle2, ExternalLink } from 'lucide-react';
 import type {
   MarketUpdate,
   MarketUpdateCategory,
   PlatformSettings,
+  PushJobSummary,
   RegistrationAnalyticsPayload,
+  SignalChatMessage,
   SignalDirection,
   SignalStatus,
   TradingSignal,
@@ -66,6 +69,7 @@ interface OverviewPayload {
     failed_count: number;
     created_at: string;
   }>;
+  push_jobs?: PushJobSummary[];
   system_logs: Array<{
     id: string;
     level: string;
@@ -85,7 +89,8 @@ interface OverviewPayload {
 }
 
 export const AdminPage: React.FC = () => {
-  const { user, authLoading, settings, signals, refreshAll, navigate } = usePlatform();
+  const { user, authLoading, settings, signals, refreshAll, navigate, subscribePushJobEvents } =
+    usePlatform();
   const [tab, setTab] = useState<AdminTab>('overview');
   const [overview, setOverview] = useState<OverviewPayload | null>(null);
   const [registrations, setRegistrations] = useState<RegistrationAnalyticsPayload | null>(null);
@@ -107,6 +112,11 @@ export const AdminPage: React.FC = () => {
   >([]);
   const [toast, setToast] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [publishReceipt, setPublishReceipt] = useState<{
+    title: string;
+    signalMessageId: string | null;
+    pushJob: PushJobSummary | null;
+  } | null>(null);
 
   // Signal Form State
   const [editingSignalId, setEditingSignalId] = useState<string | null>(null);
@@ -202,6 +212,41 @@ export const AdminPage: React.FC = () => {
     loadAdminData();
   }, [loadAdminData]);
 
+  useEffect(() => {
+    return subscribePushJobEvents((job) => {
+      setPublishReceipt((cur) =>
+        cur?.pushJob?.id === job.id ? { ...cur, pushJob: job } : cur
+      );
+      setOverview((cur) => {
+        if (!cur?.push_jobs) return cur;
+        const exists = cur.push_jobs.some((j) => j.id === job.id);
+        return {
+          ...cur,
+          push_jobs: exists
+            ? cur.push_jobs.map((j) => (j.id === job.id ? job : j))
+            : [job, ...cur.push_jobs],
+        };
+      });
+    });
+  }, [subscribePushJobEvents]);
+
+  useEffect(() => {
+    const jobId = publishReceipt?.pushJob?.id;
+    const queued = publishReceipt?.pushJob?.queued_count ?? 0;
+    if (!jobId || queued <= 0) return;
+
+    const timer = window.setInterval(() => {
+      apiFetch<{ job: PushJobSummary }>(`/api/admin/push-jobs/${jobId}`)
+        .then((res) => {
+          setPublishReceipt((cur) =>
+            cur?.pushJob?.id === jobId ? { ...cur, pushJob: res.job } : cur
+          );
+        })
+        .catch(() => undefined);
+    }, 3000);
+    return () => clearInterval(timer);
+  }, [publishReceipt?.pushJob?.id, publishReceipt?.pushJob?.queued_count]);
+
   const notifyOk = (msg: string) => {
     setErrorMsg(null);
     setToast(msg);
@@ -260,17 +305,35 @@ export const AdminPage: React.FC = () => {
     e.preventDefault();
     try {
       if (editingSignalId) {
-        await apiFetch(`/api/signals/${editingSignalId}`, {
+        const res = await apiFetch<{
+          signal_message?: SignalChatMessage | null;
+          push_job?: PushJobSummary | null;
+        }>(`/api/signals/${editingSignalId}`, {
           method: 'PATCH',
           body: JSON.stringify(sigForm),
         });
         notifyOk('Signal updated and synced to all connected clients.');
+        if (res.signal_message || res.push_job) {
+          setPublishReceipt({
+            title: `${sigForm.pair} status update published publicly`,
+            signalMessageId: res.signal_message?.id || null,
+            pushJob: res.push_job || null,
+          });
+        }
       } else {
-        await apiFetch('/api/signals', {
+        const res = await apiFetch<{
+          signal_message?: SignalChatMessage | null;
+          push_job?: PushJobSummary | null;
+        }>('/api/signals', {
           method: 'POST',
           body: JSON.stringify(sigForm),
         });
-        notifyOk('New trading signal published and pushed.');
+        notifyOk('New trading signal published publicly to Signals Channel.');
+        setPublishReceipt({
+          title: `${sigForm.direction} ${sigForm.pair} published publicly`,
+          signalMessageId: res.signal_message?.id || null,
+          pushJob: res.push_job || null,
+        });
       }
       setEditingSignalId(null);
       setSigForm({
@@ -299,11 +362,19 @@ export const AdminPage: React.FC = () => {
 
   const handleQuickSignalStatus = async (sig: TradingSignal, nextStatus: SignalStatus) => {
     try {
-      await apiFetch(`/api/signals/${sig.id}`, {
+      const res = await apiFetch<{
+        signal_message?: SignalChatMessage | null;
+        push_job?: PushJobSummary | null;
+      }>(`/api/signals/${sig.id}`, {
         method: 'PATCH',
         body: JSON.stringify({ status: nextStatus, send_push: true }),
       });
       notifyOk(`${sig.pair} status updated to ${nextStatus}.`);
+      setPublishReceipt({
+        title: `${sig.pair} (${nextStatus}) posted publicly to Signals Channel`,
+        signalMessageId: res.signal_message?.id || null,
+        pushJob: res.push_job || null,
+      });
       await loadAdminData();
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Failed to update status.');
@@ -314,7 +385,10 @@ export const AdminPage: React.FC = () => {
     e.preventDefault();
     if (!followUpSignalId) return;
     try {
-      await apiFetch(`/api/signals/${followUpSignalId}/updates`, {
+      const res = await apiFetch<{
+        signal_message?: SignalChatMessage | null;
+        push_job?: PushJobSummary | null;
+      }>(`/api/signals/${followUpSignalId}/updates`, {
         method: 'POST',
         body: JSON.stringify({
           note: followUpNote,
@@ -324,7 +398,12 @@ export const AdminPage: React.FC = () => {
       });
       setFollowUpSignalId(null);
       setFollowUpNote('');
-      notifyOk('Follow-up update published.');
+      notifyOk('Follow-up update published publicly.');
+      setPublishReceipt({
+        title: `Signal follow-up (${followUpStatus}) published publicly`,
+        signalMessageId: res.signal_message?.id || null,
+        pushJob: res.push_job || null,
+      });
       await loadAdminData();
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Failed to post follow-up.');
@@ -340,14 +419,19 @@ export const AdminPage: React.FC = () => {
   // --- Update Handlers ---
   const handlePublishUpdate = async (e: React.FormEvent) => {
     e.preventDefault();
+    const isScheduled = Boolean(updForm.scheduled_at);
     try {
-      await apiFetch('/api/updates', {
+      const res = await apiFetch<{
+        signal_message?: SignalChatMessage | null;
+        push_job?: PushJobSummary | null;
+      }>('/api/updates', {
         method: 'POST',
         body: JSON.stringify({
           ...updForm,
           scheduled_at: updForm.scheduled_at ? new Date(updForm.scheduled_at).toISOString() : null,
         }),
       });
+      const publishedTitle = updForm.title;
       setUpdForm({
         title: '',
         content: '',
@@ -361,7 +445,14 @@ export const AdminPage: React.FC = () => {
         scheduled_at: '',
         send_push: true,
       });
-      notifyOk(updForm.scheduled_at ? 'Update scheduled.' : 'Market update published live.');
+      notifyOk(isScheduled ? 'Update scheduled.' : 'Market update published live to Updates & Signals Channel.');
+      if (!isScheduled) {
+        setPublishReceipt({
+          title: `"${publishedTitle}" published publicly`,
+          signalMessageId: res.signal_message?.id || null,
+          pushJob: res.push_job || null,
+        });
+      }
       await Promise.all([refreshAll(), loadAdminData()]);
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Failed to publish update.');
@@ -386,7 +477,10 @@ export const AdminPage: React.FC = () => {
   const handleSendBroadcast = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
-      await apiFetch('/api/admin/notifications/send', {
+      const res = await apiFetch<{
+        scheduled: boolean;
+        push_job?: PushJobSummary | null;
+      }>('/api/admin/notifications/send', {
         method: 'POST',
         body: JSON.stringify({
           title: notifForm.title,
@@ -400,8 +494,16 @@ export const AdminPage: React.FC = () => {
             : null,
         }),
       });
+      const sentTitle = notifForm.title;
       setNotifForm((f) => ({ ...f, title: '', body: '', scheduled_at: '' }));
-      notifyOk(notifForm.scheduled_at ? 'Notification scheduled.' : 'Push notification dispatched.');
+      notifyOk(res.scheduled ? 'Notification scheduled.' : 'Push notification queued & dispatched.');
+      if (!res.scheduled && res.push_job) {
+        setPublishReceipt({
+          title: `Broadcast "${sentTitle}" dispatched`,
+          signalMessageId: res.push_job.signal_message_id || null,
+          pushJob: res.push_job,
+        });
+      }
       await loadAdminData();
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Failed to send notification.');
@@ -535,6 +637,57 @@ export const AdminPage: React.FC = () => {
       {toast && (
         <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-2.5 text-xs font-semibold text-emerald-600 dark:text-emerald-400">
           {toast}
+        </div>
+      )}
+      {publishReceipt && (
+        <div className="rounded-2xl border border-emerald-200 dark:border-emerald-900/50 bg-emerald-50/80 dark:bg-emerald-950/25 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div className="space-y-1">
+            <p className="text-xs font-bold text-[#15803D] dark:text-emerald-400 flex items-center gap-1.5">
+              <CheckCircle2 className="w-4 h-4 shrink-0" />
+              <span>{publishReceipt.title}</span>
+            </p>
+            {publishReceipt.pushJob ? (
+              <div className="flex flex-wrap items-center gap-3 text-[11px] font-mono tabular-nums text-slate-700 dark:text-slate-300">
+                <span>Queued: {publishReceipt.pushJob.queued_count}</span>
+                <span className="text-[#15803D] dark:text-emerald-400 font-semibold">
+                  Delivered: {publishReceipt.pushJob.delivered_count}
+                </span>
+                <span
+                  className={
+                    publishReceipt.pushJob.failed_count > 0
+                      ? 'text-red-600 dark:text-red-400 font-semibold'
+                      : ''
+                  }
+                >
+                  Failures: {publishReceipt.pushJob.failed_count}
+                </span>
+                <span>Targeted: {publishReceipt.pushJob.total_targeted}</span>
+              </div>
+            ) : (
+              <p className="text-[11px] text-slate-600 dark:text-slate-400">
+                Visible immediately in public Signals Channel (push alert not selected).
+              </p>
+            )}
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            {publishReceipt.signalMessageId && (
+              <button
+                type="button"
+                onClick={() => navigate(`/signals?message=${publishReceipt.signalMessageId}`)}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-[#881337] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#6B0F2B]"
+              >
+                <ExternalLink className="w-3.5 h-3.5" />
+                <span>View in Signals</span>
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => setPublishReceipt(null)}
+              className="rounded-lg border border-slate-300 dark:border-slate-700 px-2.5 py-1.5 text-xs text-slate-600 dark:text-slate-300"
+            >
+              Dismiss
+            </button>
+          </div>
         </div>
       )}
       {errorMsg && (
@@ -1284,21 +1437,49 @@ export const AdminPage: React.FC = () => {
               Active registered push endpoints: <strong>{overview?.stats.push_subscribers ?? 0}</strong>
             </p>
             <div className="divide-y divide-slate-100 dark:divide-slate-800 max-h-96 overflow-y-auto text-xs">
-              {(overview?.dispatch_logs || []).map((log) => (
-                <div key={log.id} className="py-2.5 flex items-center justify-between gap-3">
-                  <div className="min-w-0">
-                    <p className="font-semibold text-slate-900 dark:text-white truncate">
-                      {log.title}
-                    </p>
-                    <p className="text-slate-500">
-                      {log.category} · {formatLocalDateTime(log.created_at)}
-                    </p>
-                  </div>
-                  <span className="font-mono tabular-nums text-emerald-600 dark:text-emerald-400 shrink-0">
-                    {log.delivered_count}/{log.total_targeted} sent
-                  </span>
-                </div>
-              ))}
+              {(overview?.push_jobs && overview.push_jobs.length > 0
+                ? overview.push_jobs.map((job) => (
+                    <div key={job.id} className="py-2.5 flex items-center justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className="font-semibold text-slate-900 dark:text-white truncate">
+                          {job.title}
+                        </p>
+                        <p className="text-slate-500">
+                          {job.category} · {job.status} · {formatLocalDateTime(job.created_at)}
+                        </p>
+                      </div>
+                      <div className="text-right font-mono tabular-nums shrink-0 text-[11px]">
+                        <span className="text-emerald-600 dark:text-emerald-400 font-semibold">
+                          {job.delivered_count} sent
+                        </span>
+                        {job.queued_count > 0 && (
+                          <span className="ml-2 text-amber-600 dark:text-amber-400">
+                            {job.queued_count} queued
+                          </span>
+                        )}
+                        {job.failed_count > 0 && (
+                          <span className="ml-2 text-red-600 dark:text-red-400">
+                            {job.failed_count} failed
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  ))
+                : (overview?.dispatch_logs || []).map((log) => (
+                    <div key={log.id} className="py-2.5 flex items-center justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className="font-semibold text-slate-900 dark:text-white truncate">
+                          {log.title}
+                        </p>
+                        <p className="text-slate-500">
+                          {log.category} · {formatLocalDateTime(log.created_at)}
+                        </p>
+                      </div>
+                      <span className="font-mono tabular-nums text-emerald-600 dark:text-emerald-400 shrink-0">
+                        {log.delivered_count}/{log.total_targeted} sent
+                      </span>
+                    </div>
+                  )))}
             </div>
           </div>
         </div>

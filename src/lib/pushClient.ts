@@ -11,6 +11,19 @@ function urlBase64ToUint8Array(base64String: string): Uint8Array {
   return outputArray;
 }
 
+export function detectPushPlatform(): 'android' | 'ios' | 'desktop' {
+  if (typeof navigator === 'undefined') return 'desktop';
+  const ua = navigator.userAgent.toLowerCase();
+  if (/android/.test(ua)) return 'android';
+  if (
+    /iphone|ipad|ipod/.test(ua) ||
+    (navigator.platform === 'MacIntel' && (navigator.maxTouchPoints || 0) > 1)
+  ) {
+    return 'ios';
+  }
+  return 'desktop';
+}
+
 export function isPushSupported(): boolean {
   return (
     typeof window !== 'undefined' &&
@@ -27,6 +40,37 @@ export async function getCurrentPushSubscription(): Promise<PushSubscription | n
     return await registration.pushManager.getSubscription();
   } catch {
     return null;
+  }
+}
+
+export async function syncExistingPushSubscriptionIfGranted(): Promise<boolean> {
+  if (!isPushSupported() || Notification.permission !== 'granted') return false;
+  try {
+    const sub = await getCurrentPushSubscription();
+    if (!sub) return false;
+    const json = sub.toJSON();
+    if (!json.endpoint || !json.keys?.p256dh || !json.keys?.auth) return false;
+
+    const status = await apiFetch<{ subscribed: boolean }>(
+      `/api/push/status?endpoint=${encodeURIComponent(json.endpoint)}`
+    ).catch(() => ({ subscribed: false }));
+
+    if (!status.subscribed) {
+      await apiFetch('/api/push/subscribe', {
+        method: 'POST',
+        body: JSON.stringify({
+          endpoint: json.endpoint,
+          keys: {
+            p256dh: json.keys.p256dh,
+            auth: json.keys.auth,
+          },
+          platform: detectPushPlatform(),
+        }),
+      });
+    }
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -48,7 +92,10 @@ export async function subscribeToPushNotifications(): Promise<{
     return {
       ok: false,
       permission,
-      error: 'Notification permission was not granted in browser settings.',
+      error:
+        permission === 'denied'
+          ? 'Notifications are blocked in your browser or device settings. Enable them to receive instant signal alerts.'
+          : 'Notification permission was not granted.',
     };
   }
 
@@ -77,6 +124,7 @@ export async function subscribeToPushNotifications(): Promise<{
           p256dh: json.keys.p256dh,
           auth: json.keys.auth,
         },
+        platform: detectPushPlatform(),
       }),
     });
 

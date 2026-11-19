@@ -7,6 +7,10 @@ import {
   setCachedUser,
   setStoredToken,
 } from '../lib/api';
+import {
+  isPushSupported,
+  syncExistingPushSubscriptionIfGranted,
+} from '../lib/pushClient';
 import type {
   AcademyResumeState,
   AppNotification,
@@ -14,6 +18,7 @@ import type {
   MarketUpdate,
   PlatformSettings,
   PublicStats,
+  PushJobSummary,
   SignalChatMessage,
   SignalReactionType,
   SignalReactionsMap,
@@ -64,6 +69,7 @@ interface PlatformContextValue {
   onlineCount: number;
   wsConnected: boolean;
   subscribeSignalChatEvents: (listener: (event: SignalChatWsEvent) => void) => () => void;
+  subscribePushJobEvents: (listener: (job: PushJobSummary) => void) => () => void;
 }
 
 const DEFAULT_SETTINGS: PlatformSettings = {
@@ -134,6 +140,7 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   const hasConnectedOnceRef = useRef<boolean>(false);
   const authEpochRef = useRef<number>(0);
   const signalChatListenersRef = useRef<Set<(event: SignalChatWsEvent) => void>>(new Set());
+  const pushJobListenersRef = useRef<Set<(job: PushJobSummary) => void>>(new Set());
 
   const subscribeSignalChatEvents = useCallback((listener: (event: SignalChatWsEvent) => void) => {
     signalChatListenersRef.current.add(listener);
@@ -142,10 +149,27 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     };
   }, []);
 
+  const subscribePushJobEvents = useCallback((listener: (job: PushJobSummary) => void) => {
+    pushJobListenersRef.current.add(listener);
+    return () => {
+      pushJobListenersRef.current.delete(listener);
+    };
+  }, []);
+
   const emitSignalChatEvent = useCallback((event: SignalChatWsEvent) => {
     for (const fn of signalChatListenersRef.current) {
       try {
         fn(event);
+      } catch {
+        // isolate listener errors
+      }
+    }
+  }, []);
+
+  const emitPushJobEvent = useCallback((job: PushJobSummary) => {
+    for (const fn of pushJobListenersRef.current) {
+      try {
+        fn(job);
       } catch {
         // isolate listener errors
       }
@@ -307,7 +331,66 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   useEffect(() => {
     initializeAuth();
     refreshPublicData();
+    syncExistingPushSubscriptionIfGranted().catch(() => undefined);
   }, [initializeAuth, refreshPublicData]);
+
+  // Keep already-granted push subscription synced when auth user changes
+  useEffect(() => {
+    if (!authLoading) {
+      syncExistingPushSubscriptionIfGranted().catch(() => undefined);
+    }
+  }, [user?.id, authLoading]);
+
+  // Listen for Service Worker notification clicks & PWA install to encourage notifications
+  useEffect(() => {
+    const promptKey = 'mfx_post_install_notif_prompted_v1';
+
+    const maybeEncourageAfterInstall = () => {
+      try {
+        if (!isPushSupported()) return;
+        if (Notification.permission !== 'default') return;
+        if (localStorage.getItem(promptKey) === '1') return;
+        localStorage.setItem(promptKey, '1');
+        setShowNotifModal(true);
+      } catch {
+        // ignore storage errors
+      }
+    };
+
+    const isStandaloneNow =
+      window.matchMedia('(display-mode: standalone)').matches ||
+      (window.navigator as unknown as { standalone?: boolean }).standalone === true;
+
+    let standaloneTimer: number | undefined;
+    if (isStandaloneNow) {
+      standaloneTimer = window.setTimeout(maybeEncourageAfterInstall, 1200);
+    }
+
+    const onSwMessage = (evt: MessageEvent) => {
+      const data = evt.data as { type?: string; url?: string; messageId?: string | null } | undefined;
+      if (data?.type === 'mfx:open-notification-url' && data.url) {
+        navigate(data.url);
+        if (data.messageId) {
+          window.dispatchEvent(
+            new CustomEvent('mfx:highlight-signal-message', { detail: { messageId: data.messageId } })
+          );
+        }
+      }
+    };
+
+    window.addEventListener('mfx:pwa-installed', maybeEncourageAfterInstall);
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.addEventListener('message', onSwMessage);
+    }
+
+    return () => {
+      if (standaloneTimer) clearTimeout(standaloneTimer);
+      window.removeEventListener('mfx:pwa-installed', maybeEncourageAfterInstall);
+      if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.removeEventListener('message', onSwMessage);
+      }
+    };
+  }, [navigate]);
 
   // Synchronize auth state across open browser tabs without redirect loops
   useEffect(() => {
@@ -457,6 +540,10 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
               refreshNotifications();
               break;
             }
+            case 'push:job_updated': {
+              emitPushJobEvent(msg.data as PushJobSummary);
+              break;
+            }
           }
         } catch {
           // ignore malformed messages
@@ -479,7 +566,7 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
       wsRef.current?.close();
     };
-  }, [refreshPublicData, refreshNotifications, emitSignalChatEvent]);
+  }, [refreshPublicData, refreshNotifications, emitSignalChatEvent, emitPushJobEvent]);
 
   const login = async (email: string, password: string): Promise<User> => {
     authEpochRef.current += 1;
@@ -568,6 +655,7 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         onlineCount,
         wsConnected,
         subscribeSignalChatEvents,
+        subscribePushJobEvents,
       }}
     >
       {children}

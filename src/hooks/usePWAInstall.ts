@@ -95,6 +95,7 @@ function initGlobalListeners() {
       isInstalled: true,
       showGuideModal: false,
     });
+    window.dispatchEvent(new Event('mfx:pwa-installed'));
   });
 
   const mediaQuery = window.matchMedia('(display-mode: standalone)');
@@ -102,6 +103,7 @@ function initGlobalListeners() {
     if (evt.matches) {
       writeStorage(INSTALLED_KEY, true);
       emit({ isInstalled: true, deferredPrompt: null, showGuideModal: false });
+      window.dispatchEvent(new Event('mfx:pwa-installed'));
     }
   };
   mediaQuery.addEventListener?.('change', onDisplayChange);
