@@ -139,6 +139,10 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   const reconnectTimer = useRef<number | null>(null);
   const hasConnectedOnceRef = useRef<boolean>(false);
   const authEpochRef = useRef<number>(0);
+  const initInFlightRef = useRef<{ epoch: number; promise: Promise<void> } | null>(null);
+  const lastAuthSyncAtRef = useRef<number>(0);
+  const isLoggingOutRef = useRef<boolean>(false);
+  const authChannelRef = useRef<BroadcastChannel | null>(null);
   const signalChatListenersRef = useRef<Set<(event: SignalChatWsEvent) => void>>(new Set());
   const pushJobListenersRef = useRef<Set<(job: PushJobSummary) => void>>(new Set());
 
@@ -302,40 +306,71 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     }
   }, []);
 
-  const initializeAuth = useCallback(async () => {
-    const epoch = authEpochRef.current;
+  const clearLocalSessionState = useCallback(() => {
+    setStoredToken(null);
+    setCachedUser(null);
     try {
-      const meRes = await apiFetch<{ user: User | null; session_token?: string }>('/api/auth/me');
-      if (authEpochRef.current !== epoch) return;
-
-      if (meRes.user) {
-        if (meRes.session_token) {
-          setStoredToken(meRes.session_token);
-        }
-        setUser(meRes.user);
-        setCachedUser(meRes.user);
-        await refreshNotifications();
-      } else {
-        setStoredToken(null);
-        setCachedUser(null);
-        setUser(null);
-        setNotifications([]);
-        setUnreadCount(0);
-      }
+      localStorage.removeItem('mfx_token');
     } catch {
-      // Network or transient server error: preserve cached user if token still exists
-      if (authEpochRef.current === epoch) {
-        const cached = getStoredToken() ? getCachedUser() : null;
-        if (cached) {
-          setUser(cached);
-        }
-      }
-    } finally {
-      if (authEpochRef.current === epoch) {
-        setAuthLoading(false);
-      }
+      // ignore
     }
-  }, [refreshNotifications]);
+    setUser(null);
+    setResumeState(null);
+    setNotifications([]);
+    setUnreadCount(0);
+    syncAppBadge(0);
+  }, [syncAppBadge]);
+
+  const initializeAuth = useCallback(
+    async (force = false) => {
+      const epoch = authEpochRef.current;
+      if (
+        !force &&
+        initInFlightRef.current &&
+        initInFlightRef.current.epoch === epoch
+      ) {
+        return initInFlightRef.current.promise;
+      }
+
+      const run = (async () => {
+        try {
+          const meRes = await apiFetch<{ user: User | null; session_token?: string }>('/api/auth/me');
+          if (authEpochRef.current !== epoch) return;
+
+          lastAuthSyncAtRef.current = Date.now();
+          if (meRes.user) {
+            if (meRes.session_token) {
+              setStoredToken(meRes.session_token);
+            }
+            setUser(meRes.user);
+            setCachedUser(meRes.user);
+            await refreshNotifications();
+          } else {
+            clearLocalSessionState();
+          }
+        } catch {
+          // Network or transient server error: preserve cached user if token still exists
+          if (authEpochRef.current === epoch) {
+            const cached = getStoredToken() ? getCachedUser() : null;
+            if (cached) {
+              setUser(cached);
+            }
+          }
+        } finally {
+          if (initInFlightRef.current?.epoch === epoch) {
+            initInFlightRef.current = null;
+          }
+          if (authEpochRef.current === epoch) {
+            setAuthLoading(false);
+          }
+        }
+      })();
+
+      initInFlightRef.current = { epoch, promise: run };
+      return run;
+    },
+    [refreshNotifications, clearLocalSessionState]
+  );
 
   const refreshAll = useCallback(async () => {
     await refreshPublicData();
@@ -405,25 +440,65 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     };
   }, [navigate]);
 
-  // Synchronize auth state across open browser tabs without redirect loops
+  // Synchronize auth state across open browser tabs, focus return, and 401 checks without redirect loops
   useEffect(() => {
+    if (typeof BroadcastChannel !== 'undefined') {
+      try {
+        const ch = new BroadcastChannel('mfx_auth_sync');
+        authChannelRef.current = ch;
+        ch.onmessage = (evt) => {
+          const msg = evt.data as { type?: string } | undefined;
+          if (msg?.type === 'logout') {
+            authEpochRef.current += 1;
+            initInFlightRef.current = null;
+            clearLocalSessionState();
+            setAuthLoading(false);
+          } else if (msg?.type === 'login') {
+            initializeAuth(true);
+          }
+        };
+      } catch {
+        // ignore if unsupported
+      }
+    }
+
     const onStorage = (e: StorageEvent) => {
       if (e.key !== TOKEN_KEY || e.newValue === e.oldValue) return;
       if (!e.newValue) {
         authEpochRef.current += 1;
-        setCachedUser(null);
-        setUser(null);
-        setResumeState(null);
-        setNotifications([]);
-        setUnreadCount(0);
+        initInFlightRef.current = null;
+        clearLocalSessionState();
         setAuthLoading(false);
       } else {
+        initializeAuth(true);
+      }
+    };
+
+    const onVisibleOrFocus = () => {
+      if (document.visibilityState === 'hidden') return;
+      if (Date.now() - lastAuthSyncAtRef.current < 30_000) return;
+      if (getStoredToken() || user) {
         initializeAuth();
       }
     };
+
+    const onUnauthorized = () => {
+      initializeAuth(true);
+    };
+
     window.addEventListener('storage', onStorage);
-    return () => window.removeEventListener('storage', onStorage);
-  }, [initializeAuth]);
+    window.addEventListener('focus', onVisibleOrFocus);
+    document.addEventListener('visibilitychange', onVisibleOrFocus);
+    window.addEventListener('mfx:auth-401', onUnauthorized);
+    return () => {
+      window.removeEventListener('storage', onStorage);
+      window.removeEventListener('focus', onVisibleOrFocus);
+      document.removeEventListener('visibilitychange', onVisibleOrFocus);
+      window.removeEventListener('mfx:auth-401', onUnauthorized);
+      authChannelRef.current?.close();
+      authChannelRef.current = null;
+    };
+  }, [initializeAuth, clearLocalSessionState, user]);
 
   // Real-Time WebSocket Sync with auto-reconnect (never resets auth state)
   useEffect(() => {
@@ -583,20 +658,28 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
   const login = async (email: string, password: string): Promise<User> => {
     authEpochRef.current += 1;
+    initInFlightRef.current = null;
     const res = await apiFetch<{ user: User; token: string }>('/api/auth/login', {
       method: 'POST',
       body: JSON.stringify({ email: email.trim().toLowerCase(), password }),
     });
+    lastAuthSyncAtRef.current = Date.now();
     setStoredToken(res.token);
     setCachedUser(res.user);
     setUser(res.user);
     setAuthLoading(false);
+    try {
+      authChannelRef.current?.postMessage({ type: 'login' });
+    } catch {
+      // ignore
+    }
     await Promise.all([refreshPublicData(), refreshNotifications()]);
     return res.user;
   };
 
   const register = async (name: string, email: string, password: string) => {
     authEpochRef.current += 1;
+    initInFlightRef.current = null;
     const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
     const res = await apiFetch<{ user: User; token: string; verification_code?: string }>(
       '/api/auth/register',
@@ -610,30 +693,54 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         }),
       }
     );
+    lastAuthSyncAtRef.current = Date.now();
     setStoredToken(res.token);
     setCachedUser(res.user);
     setUser(res.user);
     setAuthLoading(false);
+    try {
+      authChannelRef.current?.postMessage({ type: 'login' });
+    } catch {
+      // ignore
+    }
     await Promise.all([refreshPublicData(), refreshNotifications()]);
     return { user: res.user, verification_code: res.verification_code };
   };
 
   const logout = async () => {
-    authEpochRef.current += 1;
-    await apiFetch('/api/auth/logout', { method: 'POST' }).catch(() => undefined);
-    setStoredToken(null);
-    setCachedUser(null);
+    if (isLoggingOutRef.current) return;
+    isLoggingOutRef.current = true;
     try {
-      localStorage.removeItem('mfx_token');
-    } catch {
-      // ignore
+      authEpochRef.current += 1;
+      initInFlightRef.current = null;
+      const currentToken = getStoredToken();
+
+      // Clear local session state immediately so UI never exposes protected pages
+      clearLocalSessionState();
+      setAuthLoading(false);
+
+      try {
+        authChannelRef.current?.postMessage({ type: 'logout' });
+      } catch {
+        // ignore
+      }
+
+      await fetch('/api/auth/logout', {
+        method: 'POST',
+        credentials: 'include',
+        keepalive: true,
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Requested-With': 'MeridianFX',
+          ...(currentToken ? { Authorization: `Bearer ${currentToken}` } : {}),
+        },
+        body: JSON.stringify(currentToken ? { token: currentToken } : {}),
+      }).catch(() => undefined);
+
+      navigate('/login');
+    } finally {
+      isLoggingOutRef.current = false;
     }
-    setUser(null);
-    setAuthLoading(false);
-    setResumeState(null);
-    setNotifications([]);
-    setUnreadCount(0);
-    navigate('/login');
   };
 
   return (

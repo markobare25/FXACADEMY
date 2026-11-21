@@ -21,6 +21,9 @@ import {
 } from './server/db.ts';
 import {
   type AuthRequest,
+  cleanupExpiredAuthRecords,
+  createUserSession,
+  extendOrCreateSession,
   extractAuthContext,
   logUserActivity,
   mapDbUser,
@@ -30,7 +33,8 @@ import {
   rateLimit,
   requireAuth,
   requireRole,
-  signToken,
+  revokeAllUserSessions,
+  revokeToken,
   signVisitorCookie,
   verifyVisitorCookie,
 } from './server/auth.ts';
@@ -157,6 +161,7 @@ function setSessionCookie(req: Request, res: Response, token: string): void {
     httpOnly: true,
     sameSite: isHttps ? 'none' : 'lax',
     secure: isHttps,
+    ...(isHttps ? { partitioned: true } : {}),
     maxAge: 30 * 24 * 60 * 60 * 1000,
     path: '/',
   });
@@ -168,9 +173,55 @@ function clearSessionCookie(req: Request, res: Response): void {
     httpOnly: true,
     sameSite: isHttps ? 'none' : 'lax',
     secure: isHttps,
+    ...(isHttps ? { partitioned: true } : {}),
     path: '/',
   });
+  if (isHttps) {
+    // Also clear any non-partitioned legacy cookie variant
+    res.clearCookie('mfx_session', {
+      httpOnly: true,
+      sameSite: 'none',
+      secure: true,
+      path: '/',
+    });
+  }
 }
+
+// Verify Origin/Host or X-Requested-With on cookie-authenticated state-changing API requests
+app.use('/api', (req: Request, res: Response, next: NextFunction) => {
+  const method = req.method.toUpperCase();
+  if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') {
+    next();
+    return;
+  }
+  const authHeader = req.headers.authorization || '';
+  const hasBearer = authHeader.startsWith('Bearer ') && authHeader.length > 10;
+  if (hasBearer || req.headers['x-requested-with']) {
+    next();
+    return;
+  }
+  const cookies = parseCookies(req.headers.cookie);
+  if (!cookies['mfx_session']) {
+    next();
+    return;
+  }
+  const originHeader = req.headers.origin || req.headers.referer;
+  const hostHeader = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim().toLowerCase();
+  if (originHeader && hostHeader) {
+    try {
+      const originHost = new URL(String(originHeader)).host.toLowerCase();
+      if (originHost === hostHeader) {
+        next();
+        return;
+      }
+    } catch {
+      // fall through to deny
+    }
+    res.status(403).json({ error: 'Cross-origin request rejected.' });
+    return;
+  }
+  next();
+});
 
 function getPlatformSettings(): PlatformSettings {
   const rows = db.prepare('SELECT key, value FROM platform_settings').all() as Array<{
@@ -313,7 +364,12 @@ app.post('/api/auth/register', rateLimit(30, 60_000), (req: Request, res: Respon
   logUserActivity(userId, 'Account Registered', 'New MeridianFX trader account created.', req.ip);
 
   const userRow = db.prepare('SELECT * FROM users WHERE id = ?').get(userId) as Record<string, unknown>;
-  const token = signToken({ sub: userId, role: 'user' }, 60 * 60 * 24 * 30);
+  const { token } = createUserSession(
+    userId,
+    'user',
+    { userAgent: String(req.headers['user-agent'] || ''), ip: req.ip },
+    60 * 60 * 24 * 30
+  );
   setSessionCookie(req, res, token);
 
   res.status(201).json({
@@ -381,13 +437,29 @@ app.post('/api/auth/login', rateLimit(40, 60_000), (req: Request, res: Response)
   logUserActivity(String(row.id), 'Sign In', 'Authenticated session started.', req.ip);
 
   const user = mapDbUser({ ...row, last_login_at: now });
-  const token = signToken({ sub: user.id, role: user.role }, 60 * 60 * 24 * 30);
+  const { token } = createUserSession(
+    user.id,
+    user.role,
+    { userAgent: String(req.headers['user-agent'] || ''), ip: req.ip },
+    60 * 60 * 24 * 30
+  );
   setSessionCookie(req, res, token);
 
   res.json({ user, token });
 });
 
 app.post('/api/auth/logout', optionalAuth, (req: AuthRequest, res: Response) => {
+  const authHeader = req.headers.authorization;
+  const bearerToken =
+    authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+  const cookies = parseCookies(req.headers.cookie);
+  const cookieToken = cookies['mfx_session'] || '';
+  const bodyToken = typeof req.body?.token === 'string' ? req.body.token.trim() : '';
+
+  revokeToken(bearerToken);
+  if (cookieToken && cookieToken !== bearerToken) revokeToken(cookieToken);
+  if (bodyToken && bodyToken !== bearerToken && bodyToken !== cookieToken) revokeToken(bodyToken);
+
   if (req.user) {
     logUserActivity(req.user.id, 'Sign Out', 'Session terminated.', req.ip);
   }
@@ -396,8 +468,12 @@ app.post('/api/auth/logout', optionalAuth, (req: AuthRequest, res: Response) => 
 });
 
 app.get('/api/auth/me', (req: Request, res: Response) => {
+  const cookies = parseCookies(req.headers.cookie);
   const ctx = extractAuthContext(req);
   if (!ctx.user) {
+    if (cookies['mfx_session']) {
+      clearSessionCookie(req, res);
+    }
     res.json({ user: null });
     return;
   }
@@ -407,11 +483,16 @@ app.get('/api/auth/me', (req: Request, res: Response) => {
   const needsSlidingRefresh = Boolean(ctx.expiresAt && ctx.expiresAt - nowSec < 7 * 24 * 60 * 60);
 
   if (needsSlidingRefresh) {
-    syncToken = signToken({ sub: ctx.user.id, role: ctx.user.role }, 60 * 60 * 24 * 30);
+    syncToken = extendOrCreateSession(
+      ctx.jti,
+      ctx.user.id,
+      ctx.user.role,
+      { userAgent: String(req.headers['user-agent'] || ''), ip: req.ip },
+      60 * 60 * 24 * 30
+    );
     setSessionCookie(req, res, syncToken);
   } else if (ctx.source === 'bearer' && ctx.token) {
-    const cookies = parseCookies(req.headers.cookie);
-    if (!cookies['mfx_session']) {
+    if (cookies['mfx_session'] !== ctx.token) {
       setSessionCookie(req, res, ctx.token);
     }
   } else if (ctx.source === 'cookie' && ctx.token) {
@@ -564,6 +645,7 @@ app.post('/api/auth/reset-password', rateLimit(10, 60_000), (req: Request, res: 
     hashPassword(parsed.data.new_password),
     user.id
   );
+  revokeAllUserSessions(user.id);
   logUserActivity(user.id, 'Password Reset Completed', 'Password updated via verified recovery.', req.ip);
 
   res.json({ ok: true });
@@ -624,6 +706,8 @@ app.patch('/api/users/password', requireAuth, (req: AuthRequest, res: Response) 
     hashPassword(parsed.data.new_password),
     req.user!.id
   );
+  const ctx = extractAuthContext(req);
+  revokeAllUserSessions(req.user!.id, ctx.jti);
   logUserActivity(req.user!.id, 'Password Changed', 'User changed account password.', req.ip);
   res.json({ ok: true });
 });
@@ -692,6 +776,7 @@ app.delete('/api/users/account', requireAuth, (req: AuthRequest, res: Response) 
       return;
     }
   }
+  revokeAllUserSessions(req.user!.id);
   db.prepare('DELETE FROM users WHERE id = ?').run(req.user!.id);
   clearSessionCookie(req, res);
   res.json({ ok: true });
@@ -3787,6 +3872,10 @@ app.patch('/api/admin/users/:id', requireRole('admin'), (req: AuthRequest, res: 
     req.params.id
   );
 
+  if (parsed.data.status === 'suspended' || (parsed.data.role && parsed.data.role !== target.role)) {
+    revokeAllUserSessions(String(req.params.id));
+  }
+
   const updated = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id) as Record<
     string,
     unknown
@@ -4053,10 +4142,11 @@ if (!process.env.VERCEL) {
         });
       }
 
-      // 3. Automated daily backup snapshot
+      // 3. Automated daily backup snapshot & expired auth cleanup
       const today = nowIso.slice(0, 10);
       if (today !== lastAutoBackupDay) {
         createDatabaseBackup();
+        cleanupExpiredAuthRecords();
         lastAutoBackupDay = today;
       }
     } catch (err) {

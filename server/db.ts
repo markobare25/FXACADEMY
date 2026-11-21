@@ -74,8 +74,30 @@ export function initDatabase(): void {
       notification_prefs TEXT NOT NULL DEFAULT '{"signals":true,"signal_updates":true,"signal_chat":true,"market_updates":true,"academy":true,"economic_calendar":true,"announcements":true,"sound_enabled":true}',
       watchlist TEXT NOT NULL DEFAULT '["EURUSD","GBPUSD","XAUUSD","BTCUSD"]',
       needs_password_setup INTEGER NOT NULL DEFAULT 0,
+      tokens_valid_after TEXT,
       created_at TEXT NOT NULL,
       last_login_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS user_sessions (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      user_agent TEXT,
+      ip_address TEXT,
+      created_at TEXT NOT NULL,
+      last_seen_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      revoked_at TEXT,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_user_sessions_user ON user_sessions(user_id, revoked_at);
+    CREATE INDEX IF NOT EXISTS idx_user_sessions_exp ON user_sessions(expires_at);
+
+    CREATE TABLE IF NOT EXISTS revoked_tokens (
+      token_hash TEXT PRIMARY KEY,
+      expires_at TEXT NOT NULL,
+      revoked_at TEXT NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS email_verifications (
@@ -566,6 +588,7 @@ export function initDatabase(): void {
   ensureColumn('push_subscriptions', 'last_error', 'TEXT');
   ensureColumn('push_subscriptions', 'last_success_at', 'TEXT');
   ensureColumn('push_subscriptions', 'updated_at', 'TEXT');
+  ensureColumn('users', 'tokens_valid_after', 'TEXT');
   ensureColumn('push_jobs', 'sound', 'INTEGER NOT NULL DEFAULT 1');
 
   db.exec(`

@@ -3,6 +3,21 @@ import { CheckCircle2, Eye, EyeOff, KeyRound, MailCheck, ShieldAlert } from 'luc
 import { usePlatform } from '../context/PlatformContext';
 import { apiFetch } from '../lib/api';
 
+function getSafeRedirectTarget(): string | null {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const raw = params.get('redirect');
+    if (!raw || !raw.startsWith('/') || raw.startsWith('//')) return null;
+    const basePath = raw.split('?')[0];
+    if (basePath === '/login' || basePath === '/register' || basePath === '/forgot-password') {
+      return null;
+    }
+    return raw;
+  } catch {
+    return null;
+  }
+}
+
 export const LoginPage: React.FC = () => {
   const { user, authLoading, login, logout, navigate } = usePlatform();
   const [email, setEmail] = useState('');
@@ -10,6 +25,7 @@ export const LoginPage: React.FC = () => {
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const redirectTarget = getSafeRedirectTarget();
 
   if (!authLoading && user) {
     return (
@@ -52,11 +68,16 @@ export const LoginPage: React.FC = () => {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (loading) return;
     setLoading(true);
     setError(null);
     try {
       const loggedUser = await login(email.trim(), password);
-      navigate(loggedUser.role === 'admin' ? '/signals' : '/dashboard');
+      if (redirectTarget && (redirectTarget !== '/admin' || loggedUser.role === 'admin')) {
+        navigate(redirectTarget);
+      } else {
+        navigate(loggedUser.role === 'admin' ? '/signals' : '/dashboard');
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unable to sign in.');
     } finally {
@@ -71,6 +92,11 @@ export const LoginPage: React.FC = () => {
         <p className="mt-1.5 text-sm text-slate-500 dark:text-slate-400">
           Access live trading signals, saved courses, and personalized alerts.
         </p>
+        {redirectTarget && (
+          <div className="mt-3 rounded-lg border border-amber-200 dark:border-amber-800/60 bg-amber-50 dark:bg-amber-950/20 px-3 py-2 text-xs text-amber-800 dark:text-amber-300">
+            Please sign in to access <span className="font-mono font-semibold">{redirectTarget}</span>.
+          </div>
+        )}
 
         <form onSubmit={handleSubmit} className="mt-6 space-y-4">
           <div>
@@ -203,11 +229,17 @@ export const RegisterPage: React.FC = () => {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (loading) return;
     setLoading(true);
     setError(null);
     try {
       const res = await register(name, email, password);
-      navigate(res.user.role === 'admin' ? '/signals' : '/dashboard');
+      const redirectTarget = getSafeRedirectTarget();
+      if (redirectTarget && redirectTarget !== '/admin') {
+        navigate(redirectTarget);
+      } else {
+        navigate(res.user.role === 'admin' ? '/signals' : '/dashboard');
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Registration failed.');
     } finally {

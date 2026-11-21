@@ -6,6 +6,7 @@ const CACHED_USER_KEY = 'mfx_cached_user_v1';
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 let memoryVisitorId: string | null = null;
+let memoryAuthToken: string | null = null;
 
 function generateUuidV4(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -38,17 +39,24 @@ export function getOrCreateVisitorId(): string {
 export function getStoredToken(): string | null {
   try {
     const raw = localStorage.getItem(TOKEN_KEY);
-    if (!raw || raw === 'null' || raw === 'undefined') return null;
-    if (raw.split('.').length !== 3) return null;
-    return raw;
-  } catch {
+    if (raw && raw !== 'null' && raw !== 'undefined' && raw.split('.').length === 3) {
+      memoryAuthToken = raw;
+      return raw;
+    }
+    if (memoryAuthToken && memoryAuthToken.split('.').length === 3) {
+      return memoryAuthToken;
+    }
     return null;
+  } catch {
+    return memoryAuthToken && memoryAuthToken.split('.').length === 3 ? memoryAuthToken : null;
   }
 }
 
 export function setStoredToken(token: string | null): void {
+  const valid = Boolean(token && token !== 'null' && token !== 'undefined' && token.split('.').length === 3);
+  memoryAuthToken = valid ? token : null;
   try {
-    if (token && token !== 'null' && token !== 'undefined' && token.split('.').length === 3) {
+    if (valid && token) {
       localStorage.setItem(TOKEN_KEY, token);
     } else {
       localStorage.removeItem(TOKEN_KEY);
@@ -89,6 +97,9 @@ export async function apiFetch<T = unknown>(
   if (!headers.has('Content-Type') && !(options.body instanceof FormData)) {
     headers.set('Content-Type', 'application/json');
   }
+  if (!headers.has('X-Requested-With')) {
+    headers.set('X-Requested-With', 'MeridianFX');
+  }
   if (token && !headers.has('Authorization')) {
     headers.set('Authorization', `Bearer ${token}`);
   }
@@ -96,10 +107,12 @@ export async function apiFetch<T = unknown>(
     headers.set('X-Visitor-Id', visitorId);
   }
 
+  const isAuthEndpoint = url.startsWith('/api/auth/');
   const res = await fetch(url, {
     ...options,
     headers,
     credentials: 'include',
+    ...(isAuthEndpoint ? { cache: 'no-store' as RequestCache } : {}),
   });
 
   const text = await res.text();
@@ -111,6 +124,9 @@ export async function apiFetch<T = unknown>(
   }
 
   if (!res.ok) {
+    if (res.status === 401 && token && !url.startsWith('/api/auth/login') && !url.startsWith('/api/auth/register')) {
+      window.dispatchEvent(new CustomEvent('mfx:auth-401'));
+    }
     const errMsg = (data as { error?: string }).error || `Request failed (${res.status})`;
     throw new Error(errMsg);
   }

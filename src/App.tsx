@@ -31,6 +31,38 @@ const SessionRestoreSpinner: React.FC = () => (
   </div>
 );
 
+const ProtectedRoute: React.FC<{
+  targetPath: string;
+  children: React.ReactNode;
+}> = ({ targetPath, children }) => {
+  const { user, authLoading, navigate } = usePlatform();
+
+  React.useEffect(() => {
+    if (!authLoading && !user) {
+      navigate(`/login?redirect=${encodeURIComponent(targetPath)}`);
+    }
+  }, [authLoading, user, targetPath, navigate]);
+
+  if (authLoading && !user) {
+    return <SessionRestoreSpinner />;
+  }
+
+  if (!user) {
+    return (
+      <div className="mx-auto max-w-md py-12">
+        <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-8 text-center space-y-3">
+          <h1 className="text-lg font-bold text-slate-900 dark:text-white">Authentication Required</h1>
+          <p className="text-sm text-slate-500 dark:text-slate-400">
+            Access denied. Redirecting to sign in...
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  return <>{children}</>;
+};
+
 const RouteView: React.FC = () => {
   const { route, user, authLoading, showNotifModal, setShowNotifModal } = usePlatform();
 
@@ -50,7 +82,11 @@ const RouteView: React.FC = () => {
       case '/forgot-password':
         return <ForgotPasswordPage />;
       case '/dashboard':
-        return authLoading && !user ? <SessionRestoreSpinner /> : <DashboardPage />;
+        return (
+          <ProtectedRoute targetPath="/dashboard">
+            <DashboardPage />
+          </ProtectedRoute>
+        );
       case '/signals':
         return <SignalsPage />;
       case '/updates':
@@ -66,11 +102,19 @@ const RouteView: React.FC = () => {
       case '/notifications':
         return authLoading && !user ? <SessionRestoreSpinner /> : <NotificationsPage />;
       case '/profile':
-        return authLoading && !user ? <SessionRestoreSpinner /> : <ProfilePage />;
+        return (
+          <ProtectedRoute targetPath="/profile">
+            <ProfilePage />
+          </ProtectedRoute>
+        );
       case '/legal':
         return <LegalPage />;
       case '/admin':
-        return authLoading && !user ? <SessionRestoreSpinner /> : <AdminPage />;
+        return (
+          <ProtectedRoute targetPath="/admin">
+            <AdminPage />
+          </ProtectedRoute>
+        );
       default:
         return <HomePage />;
     }
