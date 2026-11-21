@@ -71,7 +71,7 @@ export function initDatabase(): void {
       avatar_url TEXT,
       bio TEXT,
       timezone TEXT DEFAULT 'UTC',
-      notification_prefs TEXT NOT NULL DEFAULT '{"signals":true,"signal_updates":true,"market_updates":true,"academy":true,"economic_calendar":true,"announcements":true}',
+      notification_prefs TEXT NOT NULL DEFAULT '{"signals":true,"signal_updates":true,"signal_chat":true,"market_updates":true,"academy":true,"economic_calendar":true,"announcements":true,"sound_enabled":true}',
       watchlist TEXT NOT NULL DEFAULT '["EURUSD","GBPUSD","XAUUSD","BTCUSD"]',
       needs_password_setup INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
@@ -418,6 +418,9 @@ export function initDatabase(): void {
       auth TEXT NOT NULL,
       user_agent TEXT,
       platform TEXT,
+      prefs_json TEXT NOT NULL DEFAULT '{"signals":true,"signal_updates":true,"signal_chat":true,"market_updates":true,"academy":true,"economic_calendar":true,"announcements":true,"sound_enabled":true}',
+      sound_enabled INTEGER NOT NULL DEFAULT 1,
+      failure_count INTEGER NOT NULL DEFAULT 0,
       active INTEGER NOT NULL DEFAULT 1,
       last_error TEXT,
       last_success_at TEXT,
@@ -436,6 +439,7 @@ export function initDatabase(): void {
       link_url TEXT NOT NULL DEFAULT '/signals',
       image_url TEXT,
       published_at TEXT NOT NULL,
+      sound INTEGER NOT NULL DEFAULT 1,
       status TEXT NOT NULL DEFAULT 'queued',
       total_targeted INTEGER NOT NULL DEFAULT 0,
       queued_count INTEGER NOT NULL DEFAULT 0,
@@ -556,9 +560,13 @@ export function initDatabase(): void {
   ensureColumn('push_subscriptions', 'visitor_id', 'TEXT');
   ensureColumn('push_subscriptions', 'active', 'INTEGER NOT NULL DEFAULT 1');
   ensureColumn('push_subscriptions', 'platform', 'TEXT');
+  ensureColumn('push_subscriptions', 'prefs_json', 'TEXT');
+  ensureColumn('push_subscriptions', 'sound_enabled', 'INTEGER NOT NULL DEFAULT 1');
+  ensureColumn('push_subscriptions', 'failure_count', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('push_subscriptions', 'last_error', 'TEXT');
   ensureColumn('push_subscriptions', 'last_success_at', 'TEXT');
   ensureColumn('push_subscriptions', 'updated_at', 'TEXT');
+  ensureColumn('push_jobs', 'sound', 'INTEGER NOT NULL DEFAULT 1');
 
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_signal_messages_source

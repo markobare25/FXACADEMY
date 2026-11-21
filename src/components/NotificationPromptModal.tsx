@@ -3,18 +3,28 @@ import {
   BellOff,
   BellRing,
   CheckCircle2,
-  ShieldAlert,
-  TrendingUp,
+  MessageSquareText,
   Newspaper,
+  Send,
+  ShieldAlert,
   Smartphone,
+  TrendingUp,
+  Volume2,
+  VolumeX,
   X,
 } from 'lucide-react';
 import {
+  DEFAULT_DEVICE_PREFS,
   getCurrentPushSubscription,
+  getDevicePushPreferences,
   isPushSupported,
+  saveDevicePushPreferences,
+  sendTestPushNotification,
   subscribeToPushNotifications,
   unsubscribeFromPushNotifications,
 } from '../lib/pushClient';
+import { usePlatform } from '../context/PlatformContext';
+import type { NotificationPreferences } from '../types';
 
 interface Props {
   open: boolean;
@@ -23,8 +33,13 @@ interface Props {
 }
 
 export const NotificationPromptModal: React.FC<Props> = ({ open, onClose, onSuccess }) => {
+  const { user, setUser } = usePlatform();
   const [loading, setLoading] = useState(false);
+  const [testing, setTesting] = useState(false);
   const [subscribed, setSubscribed] = useState(false);
+  const [prefs, setPrefs] = useState<NotificationPreferences>(
+    user?.notification_prefs || DEFAULT_DEVICE_PREFS
+  );
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
@@ -33,7 +48,12 @@ export const NotificationPromptModal: React.FC<Props> = ({ open, onClose, onSucc
     setErrorMsg(null);
     setStatusMsg(null);
     getCurrentPushSubscription().then((sub) => setSubscribed(Boolean(sub)));
-  }, [open]);
+    getDevicePushPreferences()
+      .then((res) => setPrefs(res.prefs))
+      .catch(() => {
+        if (user?.notification_prefs) setPrefs(user.notification_prefs);
+      });
+  }, [open, user?.notification_prefs]);
 
   if (!open) return null;
 
@@ -41,20 +61,36 @@ export const NotificationPromptModal: React.FC<Props> = ({ open, onClose, onSucc
     typeof window !== 'undefined' && 'Notification' in window ? Notification.permission : 'default';
   const supported = isPushSupported();
 
+  const handleTogglePref = async (key: keyof NotificationPreferences, val: boolean) => {
+    const next = { ...prefs, [key]: val };
+    setPrefs(next);
+    if (subscribed || user) {
+      try {
+        const res = await saveDevicePushPreferences({ [key]: val });
+        setPrefs(res.prefs);
+        if (user) {
+          setUser({ ...user, notification_prefs: res.prefs });
+        }
+      } catch (err) {
+        setErrorMsg(err instanceof Error ? err.message : 'Failed to save preference.');
+      }
+    }
+  };
+
   const handleEnable = async () => {
     setLoading(true);
     setErrorMsg(null);
-    const res = await subscribeToPushNotifications();
+    const res = await subscribeToPushNotifications(prefs);
     setLoading(false);
 
     if (res.ok) {
       setSubscribed(true);
-      setStatusMsg('Push alerts are now active on this device — no login required.');
+      if (res.prefs) {
+        setPrefs(res.prefs);
+        if (user) setUser({ ...user, notification_prefs: res.prefs });
+      }
+      setStatusMsg('Push alerts are now active on this device — works even when closed.');
       onSuccess?.();
-      setTimeout(() => {
-        setStatusMsg(null);
-        onClose();
-      }, 1200);
     } else {
       setErrorMsg(res.error || 'Could not enable push notifications.');
     }
@@ -69,6 +105,20 @@ export const NotificationPromptModal: React.FC<Props> = ({ open, onClose, onSucc
     setStatusMsg('Push alerts disabled on this device. All posts remain visible in Signals.');
   };
 
+  const handleSendTest = async () => {
+    setTesting(true);
+    setErrorMsg(null);
+    setStatusMsg(null);
+    try {
+      await sendTestPushNotification();
+      setStatusMsg('Test push sent! Minimize or lock your screen if testing background delivery.');
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Failed to send test push notification.');
+    } finally {
+      setTesting(false);
+    }
+  };
+
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/45 backdrop-blur-sm p-4"
@@ -76,7 +126,7 @@ export const NotificationPromptModal: React.FC<Props> = ({ open, onClose, onSucc
       aria-modal="true"
       aria-label="Enable Real-Time Market Alerts"
     >
-      <div className="w-full max-w-lg rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-6 shadow-2xl">
+      <div className="w-full max-w-lg max-h-[90vh] overflow-y-auto rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-6 shadow-2xl">
         <div className="flex items-start justify-between gap-4">
           <div className="flex items-center gap-3">
             <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-[#881337]/10 text-[#881337] dark:text-rose-400">
@@ -87,7 +137,7 @@ export const NotificationPromptModal: React.FC<Props> = ({ open, onClose, onSucc
                 Instant MeridianFX Alerts
               </h3>
               <p className="text-xs text-slate-500 dark:text-slate-400">
-                Works for all visitors & app users — even when the app is closed
+                Native OS banners & lock-screen delivery — even when closed
               </p>
             </div>
           </div>
@@ -101,39 +151,107 @@ export const NotificationPromptModal: React.FC<Props> = ({ open, onClose, onSucc
           </button>
         </div>
 
-        <div className="mt-5 space-y-3 text-sm">
-          <div className="flex items-start gap-3 rounded-xl border border-slate-200 dark:border-slate-800 p-3.5">
-            <TrendingUp className="h-5 w-5 text-emerald-700 dark:text-emerald-400 shrink-0 mt-0.5" />
-            <div>
-              <p className="font-semibold text-slate-900 dark:text-white">
-                Trading Signals, Chart Analysis & TP/SL Outcomes
-              </p>
-              <p className="text-xs text-slate-600 dark:text-slate-400 mt-0.5">
-                Get immediate notifications whenever the MeridianFX desk posts in the public Signals channel.
-              </p>
+        <div className="mt-4 space-y-2.5 text-sm">
+          <label className="flex items-center justify-between gap-3 rounded-xl border border-slate-200 dark:border-slate-800 p-3 cursor-pointer">
+            <div className="flex items-start gap-3">
+              <TrendingUp className="h-5 w-5 text-emerald-700 dark:text-emerald-400 shrink-0 mt-0.5" />
+              <div>
+                <p className="font-semibold text-slate-900 dark:text-white">
+                  Forex Signals & TP/SL Updates
+                </p>
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  Pair, BUY/SELL direction, entry, stop loss & target hits.
+                </p>
+              </div>
             </div>
-          </div>
+            <input
+              type="checkbox"
+              checked={prefs.signals}
+              onChange={(e) => {
+                const checked = e.target.checked;
+                handleTogglePref('signals', checked);
+                handleTogglePref('signal_updates', checked);
+              }}
+              className="w-4 h-4 accent-[#881337]"
+            />
+          </label>
 
-          <div className="flex items-start gap-3 rounded-xl border border-slate-200 dark:border-slate-800 p-3.5">
-            <Newspaper className="h-5 w-5 text-[#881337] dark:text-rose-400 shrink-0 mt-0.5" />
-            <div>
-              <p className="font-semibold text-slate-900 dark:text-white">
-                Market Updates, Breaking Alerts & Announcements
-              </p>
-              <p className="text-xs text-slate-600 dark:text-slate-400 mt-0.5">
-                Tap any alert to jump directly to the published post in the Signals channel.
-              </p>
+          <label className="flex items-center justify-between gap-3 rounded-xl border border-slate-200 dark:border-slate-800 p-3 cursor-pointer">
+            <div className="flex items-start gap-3">
+              <MessageSquareText className="h-5 w-5 text-[#881337] dark:text-rose-400 shrink-0 mt-0.5" />
+              <div>
+                <p className="font-semibold text-slate-900 dark:text-white">
+                  Signal Chat Channel
+                </p>
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  Instant alerts with preview whenever a desk message is posted.
+                </p>
+              </div>
             </div>
-          </div>
+            <input
+              type="checkbox"
+              checked={prefs.signal_chat}
+              onChange={(e) => handleTogglePref('signal_chat', e.target.checked)}
+              className="w-4 h-4 accent-[#881337]"
+            />
+          </label>
 
-          <div className="flex items-start gap-3 rounded-xl border border-slate-200 dark:border-slate-800 p-3.5">
+          <label className="flex items-center justify-between gap-3 rounded-xl border border-slate-200 dark:border-slate-800 p-3 cursor-pointer">
+            <div className="flex items-start gap-3">
+              <Newspaper className="h-5 w-5 text-[#881337] dark:text-rose-400 shrink-0 mt-0.5" />
+              <div>
+                <p className="font-semibold text-slate-900 dark:text-white">
+                  Market Updates & Announcements
+                </p>
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  Breaking macro news, session briefings & platform broadcasts.
+                </p>
+              </div>
+            </div>
+            <input
+              type="checkbox"
+              checked={prefs.market_updates}
+              onChange={(e) => {
+                const checked = e.target.checked;
+                handleTogglePref('market_updates', checked);
+                handleTogglePref('announcements', checked);
+              }}
+              className="w-4 h-4 accent-[#881337]"
+            />
+          </label>
+
+          <label className="flex items-center justify-between gap-3 rounded-xl border border-slate-200 dark:border-slate-800 p-3 cursor-pointer">
+            <div className="flex items-start gap-3">
+              {prefs.sound_enabled ? (
+                <Volume2 className="h-5 w-5 text-emerald-700 dark:text-emerald-400 shrink-0 mt-0.5" />
+              ) : (
+                <VolumeX className="h-5 w-5 text-slate-400 shrink-0 mt-0.5" />
+              )}
+              <div>
+                <p className="font-semibold text-slate-900 dark:text-white">
+                  Notification Sound & Vibration
+                </p>
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  Play OS chime & vibrate on incoming alerts (silent mode if off).
+                </p>
+              </div>
+            </div>
+            <input
+              type="checkbox"
+              checked={prefs.sound_enabled}
+              onChange={(e) => handleTogglePref('sound_enabled', e.target.checked)}
+              className="w-4 h-4 accent-[#881337]"
+            />
+          </label>
+
+          <div className="flex items-start gap-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-900/40 p-3">
             <Smartphone className="h-5 w-5 text-emerald-700 dark:text-emerald-400 shrink-0 mt-0.5" />
             <div>
-              <p className="font-semibold text-slate-900 dark:text-white">
-                Android, Desktop & iOS Web App Support
+              <p className="font-semibold text-slate-900 dark:text-white text-xs">
+                Android, Desktop & iPhone/iPad (iOS 16.4+)
               </p>
-              <p className="text-xs text-slate-600 dark:text-slate-400 mt-0.5">
-                On iPhone/iPad (iOS 16.4+), add MeridianFX to your Home Screen via Safari Share first to unlock lock-screen push alerts.
+              <p className="text-[11px] text-slate-600 dark:text-slate-400 mt-0.5">
+                On iPhone/iPad, tap Safari Share → Add to Home Screen first, then open the installed app to enable lock-screen alerts.
               </p>
             </div>
           </div>
@@ -165,14 +283,26 @@ export const NotificationPromptModal: React.FC<Props> = ({ open, onClose, onSucc
           </div>
         )}
 
-        <div className="mt-5 flex flex-col-reverse sm:flex-row items-center justify-end gap-3">
+        <div className="mt-5 flex flex-col-reverse sm:flex-row items-center justify-end gap-2.5">
           <button
             type="button"
             onClick={onClose}
             className="w-full sm:w-auto rounded-lg border border-slate-300 dark:border-slate-700 px-4 py-2.5 text-sm font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors min-h-[44px]"
           >
-            {subscribed ? 'Close' : 'Maybe Later'}
+            {subscribed ? 'Done' : 'Maybe Later'}
           </button>
+
+          {subscribed && (
+            <button
+              type="button"
+              disabled={testing}
+              onClick={handleSendTest}
+              className="w-full sm:w-auto inline-flex items-center justify-center gap-1.5 rounded-lg border border-emerald-300 dark:border-emerald-700 bg-emerald-50 dark:bg-emerald-950/30 px-4 py-2.5 text-sm font-semibold text-[#15803D] dark:text-emerald-400 hover:bg-emerald-100 disabled:opacity-60 transition-colors min-h-[44px]"
+            >
+              <Send className="h-4 w-4" />
+              <span>{testing ? 'Sending...' : 'Test Push'}</span>
+            </button>
+          )}
 
           {subscribed ? (
             <button
@@ -182,7 +312,7 @@ export const NotificationPromptModal: React.FC<Props> = ({ open, onClose, onSucc
               className="w-full sm:w-auto inline-flex items-center justify-center gap-2 rounded-lg border border-rose-300 dark:border-rose-800 bg-rose-50 dark:bg-rose-950/30 px-4 py-2.5 text-sm font-semibold text-[#881337] dark:text-rose-300 hover:bg-rose-100 disabled:opacity-60 transition-colors min-h-[44px]"
             >
               <BellOff className="h-4 w-4" />
-              <span>{loading ? 'Updating...' : 'Unsubscribe Device'}</span>
+              <span>{loading ? 'Updating...' : 'Disable Push'}</span>
             </button>
           ) : (
             <button

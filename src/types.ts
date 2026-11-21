@@ -3,10 +3,27 @@ export type UserRole = 'user' | 'moderator' | 'admin';
 export interface NotificationPreferences {
   signals: boolean;
   signal_updates: boolean;
+  signal_chat: boolean;
   market_updates: boolean;
   academy: boolean;
   economic_calendar: boolean;
   announcements: boolean;
+  sound_enabled: boolean;
+}
+
+export interface PushSubscriptionSummary {
+  id: string;
+  user_id: string | null;
+  user_name: string | null;
+  user_email: string | null;
+  platform: 'android' | 'ios' | 'desktop' | string;
+  active: boolean;
+  sound_enabled: boolean;
+  failure_count: number;
+  last_error: string | null;
+  last_success_at: string | null;
+  created_at: string;
+  updated_at: string | null;
 }
 
 export interface User {

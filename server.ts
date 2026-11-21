@@ -24,6 +24,7 @@ import {
   extractAuthContext,
   logUserActivity,
   mapDbUser,
+  normalizeNotificationPrefs,
   optionalAuth,
   parseCookies,
   rateLimit,
@@ -34,12 +35,17 @@ import {
   verifyVisitorCookie,
 } from './server/auth.ts';
 import {
+  cleanupInactivePushSubscriptions,
   dispatchNotification,
   ensureVapidKeys,
   getPushJobSummary,
+  listPushSubscriptions,
   listRecentPushJobs,
   processPendingPushDeliveries,
+  sendDirectTestPush,
   setPushWsBroadcaster,
+  type PushCategory,
+  type PushTargetGroup,
 } from './server/push.ts';
 import { getEconomicCalendar, getMarketCandles, getMarketQuotes } from './server/markets.ts';
 import type {
@@ -624,12 +630,14 @@ app.patch('/api/users/password', requireAuth, (req: AuthRequest, res: Response) 
 
 app.patch('/api/users/notifications-prefs', requireAuth, (req: AuthRequest, res: Response) => {
   const schema = z.object({
-    signals: z.boolean(),
-    signal_updates: z.boolean(),
-    market_updates: z.boolean(),
-    academy: z.boolean(),
-    economic_calendar: z.boolean(),
-    announcements: z.boolean(),
+    signals: z.boolean().optional(),
+    signal_updates: z.boolean().optional(),
+    signal_chat: z.boolean().optional(),
+    market_updates: z.boolean().optional(),
+    academy: z.boolean().optional(),
+    economic_calendar: z.boolean().optional(),
+    announcements: z.boolean().optional(),
+    sound_enabled: z.boolean().optional(),
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
@@ -637,13 +645,18 @@ app.patch('/api/users/notifications-prefs', requireAuth, (req: AuthRequest, res:
     return;
   }
 
-  db.prepare('UPDATE users SET notification_prefs = ? WHERE id = ?').run(
-    JSON.stringify(parsed.data),
-    req.user!.id
-  );
-  logUserActivity(req.user!.id, 'Notification Preferences Updated', 'Updated push category alerts.', req.ip);
+  const currentPrefs = normalizeNotificationPrefs(req.user!.notification_prefs);
+  const nextPrefs = normalizeNotificationPrefs({ ...currentPrefs, ...parsed.data });
+  const prefsJson = JSON.stringify(nextPrefs);
+
+  db.prepare('UPDATE users SET notification_prefs = ? WHERE id = ?').run(prefsJson, req.user!.id);
+  db.prepare(
+    'UPDATE push_subscriptions SET prefs_json = ?, sound_enabled = ?, updated_at = ? WHERE user_id = ?'
+  ).run(prefsJson, nextPrefs.sound_enabled ? 1 : 0, new Date().toISOString(), req.user!.id);
+
+  logUserActivity(req.user!.id, 'Notification Preferences Updated', 'Updated push category alerts & sound.', req.ip);
   const updated = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user!.id) as Record<string, unknown>;
-  res.json({ user: mapDbUser(updated) });
+  res.json({ user: mapDbUser(updated), prefs: nextPrefs });
 });
 
 app.patch('/api/users/watchlist', requireAuth, (req: AuthRequest, res: Response) => {
@@ -886,35 +899,33 @@ function publishMirrorToSignalChannel(params: {
   return { message: hydrated, created: String(row.id) === id };
 }
 
-function mapMessageTypeToPushCategory(
-  messageType: string
-): keyof NotificationPreferences {
-  if (messageType === 'signal') return 'signals';
-  if (messageType === 'announcement') return 'announcements';
-  return 'market_updates';
+function mapMessageTypeToPushCategory(_messageType: string): PushCategory {
+  return 'signal_chat';
 }
 
 function buildSignalChannelPushPreview(
   messageType: string,
   content: string,
-  hasImage: boolean
+  hasImage: boolean,
+  authorName?: string
 ): string {
   const label =
     messageType === 'signal'
-      ? 'Trading Signal'
+      ? 'Signal'
       : messageType === 'analysis'
-        ? 'Chart Analysis'
+        ? 'Analysis'
         : messageType === 'announcement'
           ? 'Announcement'
-          : 'Market Update';
+          : 'Desk';
+  const sender = (authorName || 'MeridianFX').trim();
   const snippet = content.replace(/\s+/g, ' ').trim();
   if (snippet) {
-    return `${label}: ${snippet.slice(0, 140)}`;
+    return `${sender} (${label}): ${snippet.slice(0, 160)}`;
   }
   if (hasImage) {
-    return `${label}: New trading chart shared in MeridianFX Signals.`;
+    return `${sender} (${label}): Shared a new chart image in Signal Chat.`;
   }
-  return `${label}: New update posted in MeridianFX Signals.`;
+  return `${sender} (${label}): New message posted in Signal Chat.`;
 }
 
 app.get('/api/signals/messages', optionalAuth, (req: AuthRequest, res: Response) => {
@@ -1097,11 +1108,12 @@ app.post('/api/signals/messages', requireRole('admin'), async (req: AuthRequest,
     const preview = buildSignalChannelPushPreview(
       d.message_type,
       trimmedContent,
-      Boolean(d.image_url)
+      Boolean(d.image_url),
+      req.user!.name
     );
     if (d.send_push !== false) {
       const dispatchRes = await dispatchNotification({
-        title: 'MeridianFX',
+        title: 'MeridianFX · Signal Chat',
         body: preview,
         category: mapMessageTypeToPushCategory(d.message_type),
         linkUrl: `/signals?message=${id}`,
@@ -1217,9 +1229,14 @@ app.patch('/api/signals/messages/:id', requireRole('admin'), async (req: AuthReq
   if (publishingFromDraft) {
     broadcastWs('signals_chat:created', hydrated);
     if (d.send_push !== false) {
-      const preview = buildSignalChannelPushPreview(nextType, nextContent, Boolean(nextImageUrl));
+      const preview = buildSignalChannelPushPreview(
+        nextType,
+        nextContent,
+        Boolean(nextImageUrl),
+        String(existing.author_name || req.user!.name)
+      );
       const dispatchRes = await dispatchNotification({
-        title: 'MeridianFX',
+        title: 'MeridianFX · Signal Chat',
         body: preview,
         category: mapMessageTypeToPushCategory(nextType),
         linkUrl: `/signals?message=${hydrated.id}`,
@@ -1467,8 +1484,8 @@ app.post('/api/signals', requireRole('admin'), async (req: AuthRequest, res: Res
   let pushJob = null;
   if (d.send_push !== false) {
     const dispatchRes = await dispatchNotification({
-      title: `New ${d.direction} Signal: ${d.pair.toUpperCase()}`,
-      body: `Entry ${d.entry_price} · SL ${d.stop_loss} · TP1 ${d.tp1} (${d.timeframe})`,
+      title: `${d.direction} ${d.pair.toUpperCase()} · ${d.entry_price}`,
+      body: `Entry ${d.entry_price} · SL ${d.stop_loss} · TP1 ${d.tp1} (${d.timeframe} · ${d.classification})`,
       category: 'signals',
       linkUrl: targetUrl,
       signalMessageId: mirrored?.message.id || null,
@@ -1537,9 +1554,19 @@ app.patch('/api/signals/:id', requireRole('admin'), async (req: AuthRequest, res
   let pushJob = null;
   let mirroredMsg = null;
 
-  if (d.status && d.status !== existing.status) {
+  const statusChanged = Boolean(d.status && d.status !== existing.status);
+  const levelsOrNotesChanged = Boolean(
+    (d.stop_loss && d.stop_loss !== existing.stop_loss) ||
+      (d.entry_price && d.entry_price !== existing.entry_price) ||
+      (d.tp1 && d.tp1 !== existing.tp1) ||
+      (d.admin_remarks && d.admin_remarks !== existing.admin_remarks)
+  );
+
+  if (statusChanged || (d.send_push === true && levelsOrNotesChanged)) {
     const signalUpdateId = crypto.randomUUID();
-    const noteText = `Status updated to ${nextStatus}.${d.admin_remarks ? ` ${d.admin_remarks}` : ''}`;
+    const noteText = statusChanged
+      ? `Status updated to ${nextStatus}.${d.admin_remarks ? ` ${d.admin_remarks}` : ''}`
+      : `Trade parameters updated (Entry ${d.entry_price ?? existing.entry_price} · SL ${d.stop_loss ?? existing.stop_loss} · TP1 ${d.tp1 ?? existing.tp1}).${d.admin_remarks ? ` ${d.admin_remarks}` : ''}`;
     db.prepare(
       `INSERT INTO signal_updates (id, signal_id, note, status_snapshot, created_by, created_at)
        VALUES (?, ?, ?, ?, ?, ?)`
@@ -1558,8 +1585,12 @@ app.patch('/api/signals/:id', requireRole('admin'), async (req: AuthRequest, res
 
     if (d.send_push !== false) {
       const dispatchRes = await dispatchNotification({
-        title: `${nextPair} Signal Update: ${nextStatus}`,
-        body: d.admin_remarks || `${nextPair} status changed from ${String(existing.status)} to ${nextStatus}.`,
+        title: `${nextPair} Signal · ${nextStatus}`,
+        body:
+          d.admin_remarks ||
+          (statusChanged
+            ? `${nextPair} status changed from ${String(existing.status)} to ${nextStatus}.`
+            : noteText),
         category: 'signal_updates',
         linkUrl: mirrored ? `/signals?message=${mirrored.message.id}` : '/signals',
         signalMessageId: mirrored?.message.id || null,
@@ -1636,7 +1667,7 @@ app.post('/api/signals/:id/updates', requireRole('admin'), async (req: AuthReque
   let pushJob = null;
   if (parsed.data.send_push !== false) {
     const dispatchRes = await dispatchNotification({
-      title: `${String(existing.pair)} Update (${nextStatus})`,
+      title: `${String(existing.pair)} Signal · ${nextStatus}`,
       body: parsed.data.note,
       category: 'signal_updates',
       linkUrl: mirrored ? `/signals?message=${mirrored.message.id}` : '/signals',
@@ -3223,14 +3254,38 @@ app.get('/api/push/status', optionalAuth, (req: AuthRequest, res: Response) => {
   res.json({ subscribed });
 });
 
-app.post('/api/push/subscribe', optionalAuth, (req: AuthRequest, res: Response) => {
+const pushPrefsSchema = z.object({
+  signals: z.boolean().optional(),
+  signal_updates: z.boolean().optional(),
+  signal_chat: z.boolean().optional(),
+  market_updates: z.boolean().optional(),
+  academy: z.boolean().optional(),
+  economic_calendar: z.boolean().optional(),
+  announcements: z.boolean().optional(),
+  sound_enabled: z.boolean().optional(),
+});
+
+function isAllowedPushEndpointUrl(rawUrl: string): boolean {
+  try {
+    const u = new URL(rawUrl);
+    if (u.protocol === 'https:') return true;
+    if (u.protocol === 'http:' && (u.hostname === 'localhost' || u.hostname === '127.0.0.1')) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+app.post('/api/push/subscribe', optionalAuth, rateLimit(30, 60_000), (req: AuthRequest, res: Response) => {
   const schema = z.object({
-    endpoint: z.string().url(),
+    endpoint: z.string().url().refine(isAllowedPushEndpointUrl, 'Invalid push endpoint protocol.'),
     keys: z.object({
-      p256dh: z.string().min(10),
-      auth: z.string().min(6),
+      p256dh: z.string().min(10).max(512),
+      auth: z.string().min(6).max(256),
     }),
     platform: z.enum(['android', 'ios', 'desktop']).optional(),
+    old_endpoint: z.string().url().optional(),
+    prefs: pushPrefsSchema.optional(),
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
@@ -3246,11 +3301,29 @@ app.post('/api/push/subscribe', optionalAuth, (req: AuthRequest, res: Response) 
     parsed.data.platform ||
     (/android/i.test(ua) ? 'android' : /iphone|ipad|ipod/i.test(ua) ? 'ios' : 'desktop');
 
+  if (parsed.data.old_endpoint && parsed.data.old_endpoint !== parsed.data.endpoint) {
+    db.prepare('UPDATE push_subscriptions SET active = 0, updated_at = ? WHERE endpoint = ?').run(
+      now,
+      parsed.data.old_endpoint
+    );
+  }
+
+  const existingSub = db
+    .prepare('SELECT prefs_json, sound_enabled FROM push_subscriptions WHERE endpoint = ?')
+    .get(parsed.data.endpoint) as { prefs_json?: string; sound_enabled?: number } | undefined;
+
+  const effectivePrefs = normalizeNotificationPrefs({
+    ...(existingSub?.prefs_json ? normalizeNotificationPrefs(existingSub.prefs_json) : {}),
+    ...(req.user ? req.user.notification_prefs : {}),
+    ...(parsed.data.prefs || {}),
+  });
+  const prefsJson = JSON.stringify(effectivePrefs);
+
   db.prepare(
     `INSERT INTO push_subscriptions (
       id, user_id, visitor_id, endpoint, p256dh, auth, user_agent, platform,
-      active, last_error, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?)
+      prefs_json, sound_enabled, failure_count, active, last_error, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, NULL, ?, ?)
     ON CONFLICT(endpoint) DO UPDATE SET
       user_id = COALESCE(excluded.user_id, push_subscriptions.user_id),
       visitor_id = COALESCE(excluded.visitor_id, push_subscriptions.visitor_id),
@@ -3258,6 +3331,9 @@ app.post('/api/push/subscribe', optionalAuth, (req: AuthRequest, res: Response) 
       auth = excluded.auth,
       user_agent = excluded.user_agent,
       platform = COALESCE(excluded.platform, push_subscriptions.platform),
+      prefs_json = excluded.prefs_json,
+      sound_enabled = excluded.sound_enabled,
+      failure_count = 0,
       active = 1,
       last_error = NULL,
       updated_at = excluded.updated_at`
@@ -3270,6 +3346,8 @@ app.post('/api/push/subscribe', optionalAuth, (req: AuthRequest, res: Response) 
     parsed.data.keys.auth,
     ua,
     platform,
+    prefsJson,
+    effectivePrefs.sound_enabled ? 1 : 0,
     now,
     now
   );
@@ -3278,7 +3356,12 @@ app.post('/api/push/subscribe', optionalAuth, (req: AuthRequest, res: Response) 
     .prepare('SELECT id FROM push_subscriptions WHERE endpoint = ?')
     .get(parsed.data.endpoint) as { id: string } | undefined;
 
-  res.status(201).json({ ok: true, subscription_id: subRow?.id || null, active: true });
+  res.status(201).json({
+    ok: true,
+    subscription_id: subRow?.id || null,
+    active: true,
+    prefs: effectivePrefs,
+  });
 });
 
 app.post('/api/push/unsubscribe', (req: Request, res: Response) => {
@@ -3290,6 +3373,120 @@ app.post('/api/push/unsubscribe', (req: Request, res: Response) => {
     );
   }
   res.json({ ok: true });
+});
+
+app.get('/api/push/preferences', optionalAuth, (req: AuthRequest, res: Response) => {
+  const endpoint = typeof req.query.endpoint === 'string' ? req.query.endpoint.trim() : '';
+  const actor = resolveReactionActor(req, res, false);
+
+  let row: { prefs_json?: string; sound_enabled?: number; active?: number } | undefined;
+  if (endpoint) {
+    row = db
+      .prepare('SELECT prefs_json, sound_enabled, active FROM push_subscriptions WHERE endpoint = ?')
+      .get(endpoint) as typeof row;
+  } else if (actor?.userId) {
+    row = db
+      .prepare(
+        'SELECT prefs_json, sound_enabled, active FROM push_subscriptions WHERE user_id = ? AND COALESCE(active, 1) = 1 ORDER BY updated_at DESC LIMIT 1'
+      )
+      .get(actor.userId) as typeof row;
+  } else if (actor?.visitorId) {
+    row = db
+      .prepare(
+        'SELECT prefs_json, sound_enabled, active FROM push_subscriptions WHERE visitor_id = ? AND COALESCE(active, 1) = 1 ORDER BY updated_at DESC LIMIT 1'
+      )
+      .get(actor.visitorId) as typeof row;
+  }
+
+  const base = req.user ? req.user.notification_prefs : normalizeNotificationPrefs(row?.prefs_json);
+  const prefs = normalizeNotificationPrefs({
+    ...base,
+    ...(row?.sound_enabled !== undefined ? { sound_enabled: Boolean(row.sound_enabled) } : {}),
+  });
+  res.json({ prefs, subscribed: Boolean(row && row.active !== 0) });
+});
+
+app.patch('/api/push/preferences', optionalAuth, (req: AuthRequest, res: Response) => {
+  const schema = z.object({
+    endpoint: z.string().url().optional(),
+    prefs: pushPrefsSchema,
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid device notification preferences.' });
+    return;
+  }
+
+  const actor = resolveReactionActor(req, res, false);
+  const now = new Date().toISOString();
+  let existingRaw: unknown = req.user?.notification_prefs;
+
+  if (!existingRaw && parsed.data.endpoint) {
+    const sub = db
+      .prepare('SELECT prefs_json FROM push_subscriptions WHERE endpoint = ?')
+      .get(parsed.data.endpoint) as { prefs_json?: string } | undefined;
+    existingRaw = sub?.prefs_json;
+  }
+
+  const nextPrefs = normalizeNotificationPrefs({
+    ...normalizeNotificationPrefs(existingRaw),
+    ...parsed.data.prefs,
+  });
+  const prefsJson = JSON.stringify(nextPrefs);
+
+  if (parsed.data.endpoint) {
+    db.prepare(
+      'UPDATE push_subscriptions SET prefs_json = ?, sound_enabled = ?, updated_at = ? WHERE endpoint = ?'
+    ).run(prefsJson, nextPrefs.sound_enabled ? 1 : 0, now, parsed.data.endpoint);
+  }
+  if (req.user) {
+    db.prepare('UPDATE users SET notification_prefs = ? WHERE id = ?').run(prefsJson, req.user.id);
+    db.prepare(
+      'UPDATE push_subscriptions SET prefs_json = ?, sound_enabled = ?, updated_at = ? WHERE user_id = ?'
+    ).run(prefsJson, nextPrefs.sound_enabled ? 1 : 0, now, req.user.id);
+  } else if (!parsed.data.endpoint && actor?.visitorId) {
+    db.prepare(
+      'UPDATE push_subscriptions SET prefs_json = ?, sound_enabled = ?, updated_at = ? WHERE visitor_id = ?'
+    ).run(prefsJson, nextPrefs.sound_enabled ? 1 : 0, now, actor.visitorId);
+  }
+
+  res.json({ ok: true, prefs: nextPrefs });
+});
+
+app.post('/api/push/test', optionalAuth, rateLimit(8, 60_000), async (req: AuthRequest, res: Response) => {
+  const endpoint = typeof req.body?.endpoint === 'string' ? req.body.endpoint.trim() : '';
+  const actor = resolveReactionActor(req, res, false);
+
+  let sub: { id: string } | undefined;
+  if (endpoint) {
+    sub = db
+      .prepare('SELECT id FROM push_subscriptions WHERE endpoint = ? AND COALESCE(active, 1) = 1')
+      .get(endpoint) as { id: string } | undefined;
+  } else if (actor?.userId) {
+    sub = db
+      .prepare(
+        'SELECT id FROM push_subscriptions WHERE user_id = ? AND COALESCE(active, 1) = 1 ORDER BY updated_at DESC LIMIT 1'
+      )
+      .get(actor.userId) as { id: string } | undefined;
+  } else if (actor?.visitorId) {
+    sub = db
+      .prepare(
+        'SELECT id FROM push_subscriptions WHERE visitor_id = ? AND COALESCE(active, 1) = 1 ORDER BY updated_at DESC LIMIT 1'
+      )
+      .get(actor.visitorId) as { id: string } | undefined;
+  }
+
+  if (!sub) {
+    res.status(404).json({ error: 'No active push subscription found on this device. Enable notifications first.' });
+    return;
+  }
+
+  const result = await sendDirectTestPush(sub.id);
+  if (!result.ok) {
+    res.status(502).json({ error: result.error || 'Push delivery failed.', statusCode: result.statusCode });
+    return;
+  }
+  res.json({ ok: true, statusCode: result.statusCode });
 });
 
 // ---------- Contact Form ----------
@@ -3381,6 +3578,17 @@ app.get('/api/admin/push-jobs/:id', requireRole('admin'), (req: Request, res: Re
     return;
   }
   res.json({ job });
+});
+
+app.get('/api/admin/push-subscriptions', requireRole('admin'), (_req: Request, res: Response) => {
+  res.json(listPushSubscriptions(100));
+});
+
+app.post('/api/admin/push-subscriptions/prune', requireRole('admin'), (req: Request, res: Response) => {
+  const daysRaw = Number(req.body?.older_than_days ?? 0);
+  const days = Number.isFinite(daysRaw) && daysRaw >= 0 ? daysRaw : 0;
+  const result = cleanupInactivePushSubscriptions(days);
+  res.json({ ok: true, ...result });
 });
 
 app.get('/api/admin/users', requireRole('admin'), (_req: Request, res: Response) => {
@@ -3593,13 +3801,18 @@ app.post('/api/admin/notifications/send', requireRole('admin'), async (req: Auth
     category: z.enum([
       'signals',
       'signal_updates',
+      'signal_chat',
       'market_updates',
       'academy',
       'economic_calendar',
       'announcements',
     ]),
     link_url: z.string().max(200).optional(),
+    image_url: z.string().max(500).optional().nullable(),
+    target_group: z.enum(['all', 'registered', 'verified', 'admins_mods', 'selected']).optional(),
     target_user_ids: z.array(z.string()).optional().nullable(),
+    respect_prefs: z.boolean().optional(),
+    sound: z.boolean().optional(),
     scheduled_at: z.string().optional().nullable(),
   });
 
@@ -3633,9 +3846,13 @@ app.post('/api/admin/notifications/send', requireRole('admin'), async (req: Auth
   const result = await dispatchNotification({
     title: d.title,
     body: d.body,
-    category: d.category as keyof NotificationPreferences,
+    category: d.category as PushCategory,
     linkUrl: d.link_url || '/signals',
+    imageUrl: d.image_url || null,
+    targetGroup: (d.target_group || (d.target_user_ids?.length ? 'selected' : 'all')) as PushTargetGroup,
     targetUserIds: d.target_user_ids && d.target_user_ids.length > 0 ? d.target_user_ids : null,
+    respectPrefs: d.respect_prefs !== false,
+    sound: d.sound !== false,
     publishedAt: now,
     broadcastWs,
   });
@@ -3804,7 +4021,7 @@ if (!process.env.VERCEL) {
         await dispatchNotification({
           title: n.title,
           body: n.body,
-          category: n.category as keyof NotificationPreferences,
+          category: n.category as PushCategory,
           linkUrl: n.link_url,
           targetUserIds: n.target_user_ids ? (JSON.parse(n.target_user_ids) as string[]) : null,
           publishedAt: nowIso,

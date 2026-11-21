@@ -1,4 +1,16 @@
 import { apiFetch } from './api';
+import type { NotificationPreferences } from '../types';
+
+export const DEFAULT_DEVICE_PREFS: NotificationPreferences = {
+  signals: true,
+  signal_updates: true,
+  signal_chat: true,
+  market_updates: true,
+  academy: true,
+  economic_calendar: true,
+  announcements: true,
+  sound_enabled: true,
+};
 
 function urlBase64ToUint8Array(base64String: string): Uint8Array {
   const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
@@ -9,6 +21,32 @@ function urlBase64ToUint8Array(base64String: string): Uint8Array {
     outputArray[i] = rawData.charCodeAt(i);
   }
   return outputArray;
+}
+
+function uint8ArraysEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+async function getReadyServiceWorkerRegistration(timeoutMs = 6000): Promise<ServiceWorkerRegistration> {
+  const existing = await navigator.serviceWorker.getRegistration();
+  if (existing && existing.active) return existing;
+
+  return await Promise.race([
+    navigator.serviceWorker.ready,
+    new Promise<ServiceWorkerRegistration>((_, reject) =>
+      setTimeout(
+        () =>
+          reject(
+            new Error('Service worker is still initializing. Reload the page once and try again.')
+          ),
+        timeoutMs
+      )
+    ),
+  ]);
 }
 
 export function detectPushPlatform(): 'android' | 'ios' | 'desktop' {
@@ -36,7 +74,7 @@ export function isPushSupported(): boolean {
 export async function getCurrentPushSubscription(): Promise<PushSubscription | null> {
   if (!isPushSupported()) return null;
   try {
-    const registration = await navigator.serviceWorker.ready;
+    const registration = await getReadyServiceWorkerRegistration(3000);
     return await registration.pushManager.getSubscription();
   } catch {
     return null;
@@ -46,8 +84,27 @@ export async function getCurrentPushSubscription(): Promise<PushSubscription | n
 export async function syncExistingPushSubscriptionIfGranted(): Promise<boolean> {
   if (!isPushSupported() || Notification.permission !== 'granted') return false;
   try {
-    const sub = await getCurrentPushSubscription();
+    const registration = await getReadyServiceWorkerRegistration(4000);
+    let sub = await registration.pushManager.getSubscription();
     if (!sub) return false;
+
+    const { publicKey } = await apiFetch<{ publicKey: string }>('/api/push/vapid-public-key');
+    const expectedKey = urlBase64ToUint8Array(publicKey);
+    const currentKeyBuf = sub.options?.applicationServerKey;
+
+    let oldEndpoint: string | undefined;
+    if (currentKeyBuf) {
+      const currentKey = new Uint8Array(currentKeyBuf);
+      if (!uint8ArraysEqual(currentKey, expectedKey)) {
+        oldEndpoint = sub.endpoint;
+        await sub.unsubscribe().catch(() => undefined);
+        sub = await registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: expectedKey as unknown as BufferSource,
+        });
+      }
+    }
+
     const json = sub.toJSON();
     if (!json.endpoint || !json.keys?.p256dh || !json.keys?.auth) return false;
 
@@ -55,7 +112,7 @@ export async function syncExistingPushSubscriptionIfGranted(): Promise<boolean> 
       `/api/push/status?endpoint=${encodeURIComponent(json.endpoint)}`
     ).catch(() => ({ subscribed: false }));
 
-    if (!status.subscribed) {
+    if (!status.subscribed || oldEndpoint) {
       await apiFetch('/api/push/subscribe', {
         method: 'POST',
         body: JSON.stringify({
@@ -65,6 +122,7 @@ export async function syncExistingPushSubscriptionIfGranted(): Promise<boolean> 
             auth: json.keys.auth,
           },
           platform: detectPushPlatform(),
+          ...(oldEndpoint ? { old_endpoint: oldEndpoint } : {}),
         }),
       });
     }
@@ -74,9 +132,12 @@ export async function syncExistingPushSubscriptionIfGranted(): Promise<boolean> 
   }
 }
 
-export async function subscribeToPushNotifications(): Promise<{
+export async function subscribeToPushNotifications(
+  prefs?: Partial<NotificationPreferences>
+): Promise<{
   ok: boolean;
   permission: NotificationPermission;
+  prefs?: NotificationPreferences;
   error?: string;
 }> {
   if (!isPushSupported()) {
@@ -101,13 +162,25 @@ export async function subscribeToPushNotifications(): Promise<{
 
   try {
     const { publicKey } = await apiFetch<{ publicKey: string }>('/api/push/vapid-public-key');
-    const registration = await navigator.serviceWorker.ready;
+    const expectedKey = urlBase64ToUint8Array(publicKey);
+    const registration = await getReadyServiceWorkerRegistration();
 
     let subscription = await registration.pushManager.getSubscription();
+    let oldEndpoint: string | undefined;
+
+    if (subscription && subscription.options?.applicationServerKey) {
+      const currentKey = new Uint8Array(subscription.options.applicationServerKey);
+      if (!uint8ArraysEqual(currentKey, expectedKey)) {
+        oldEndpoint = subscription.endpoint;
+        await subscription.unsubscribe().catch(() => undefined);
+        subscription = null;
+      }
+    }
+
     if (!subscription) {
       subscription = await registration.pushManager.subscribe({
         userVisibleOnly: true,
-        applicationServerKey: urlBase64ToUint8Array(publicKey) as unknown as BufferSource,
+        applicationServerKey: expectedKey as unknown as BufferSource,
       });
     }
 
@@ -116,7 +189,7 @@ export async function subscribeToPushNotifications(): Promise<{
       throw new Error('Browser generated an incomplete push subscription.');
     }
 
-    await apiFetch('/api/push/subscribe', {
+    const res = await apiFetch<{ prefs?: NotificationPreferences }>('/api/push/subscribe', {
       method: 'POST',
       body: JSON.stringify({
         endpoint: json.endpoint,
@@ -125,10 +198,12 @@ export async function subscribeToPushNotifications(): Promise<{
           auth: json.keys.auth,
         },
         platform: detectPushPlatform(),
+        ...(oldEndpoint ? { old_endpoint: oldEndpoint } : {}),
+        ...(prefs ? { prefs } : {}),
       }),
     });
 
-    return { ok: true, permission };
+    return { ok: true, permission, prefs: res.prefs };
   } catch (err) {
     return {
       ok: false,
@@ -141,7 +216,7 @@ export async function subscribeToPushNotifications(): Promise<{
 export async function unsubscribeFromPushNotifications(): Promise<void> {
   if (!isPushSupported()) return;
   try {
-    const registration = await navigator.serviceWorker.ready;
+    const registration = await getReadyServiceWorkerRegistration(3000);
     const sub = await registration.pushManager.getSubscription();
     if (sub) {
       await apiFetch('/api/push/unsubscribe', {
@@ -153,4 +228,36 @@ export async function unsubscribeFromPushNotifications(): Promise<void> {
   } catch {
     // ignore errors
   }
+}
+
+export async function getDevicePushPreferences(): Promise<{
+  prefs: NotificationPreferences;
+  subscribed: boolean;
+}> {
+  const sub = await getCurrentPushSubscription();
+  const query = sub ? `?endpoint=${encodeURIComponent(sub.endpoint)}` : '';
+  return apiFetch<{ prefs: NotificationPreferences; subscribed: boolean }>(
+    `/api/push/preferences${query}`
+  );
+}
+
+export async function saveDevicePushPreferences(
+  prefs: Partial<NotificationPreferences>
+): Promise<{ ok: boolean; prefs: NotificationPreferences }> {
+  const sub = await getCurrentPushSubscription();
+  return apiFetch<{ ok: boolean; prefs: NotificationPreferences }>('/api/push/preferences', {
+    method: 'PATCH',
+    body: JSON.stringify({
+      ...(sub ? { endpoint: sub.endpoint } : {}),
+      prefs,
+    }),
+  });
+}
+
+export async function sendTestPushNotification(): Promise<{ ok: boolean; statusCode?: number }> {
+  const sub = await getCurrentPushSubscription();
+  return apiFetch<{ ok: boolean; statusCode?: number }>('/api/push/test', {
+    method: 'POST',
+    body: JSON.stringify(sub ? { endpoint: sub.endpoint } : {}),
+  });
 }

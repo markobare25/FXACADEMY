@@ -86,6 +86,40 @@ export function parseCookies(cookieHeader?: string): Record<string, string> {
   return out;
 }
 
+export const DEFAULT_NOTIFICATION_PREFS = {
+  signals: true,
+  signal_updates: true,
+  signal_chat: true,
+  market_updates: true,
+  academy: true,
+  economic_calendar: true,
+  announcements: true,
+  sound_enabled: true,
+};
+
+export function normalizeNotificationPrefs(raw: unknown) {
+  let parsed: Record<string, unknown> = {};
+  if (typeof raw === 'string' && raw.trim()) {
+    try {
+      parsed = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      parsed = {};
+    }
+  } else if (raw && typeof raw === 'object') {
+    parsed = raw as Record<string, unknown>;
+  }
+  return {
+    signals: parsed.signals !== false,
+    signal_updates: parsed.signal_updates !== false,
+    signal_chat: parsed.signal_chat !== false,
+    market_updates: parsed.market_updates !== false,
+    academy: parsed.academy !== false,
+    economic_calendar: parsed.economic_calendar !== false,
+    announcements: parsed.announcements !== false,
+    sound_enabled: parsed.sound_enabled !== false,
+  };
+}
+
 export function mapDbUser(row: Record<string, unknown>): User {
   return {
     id: String(row.id),
@@ -97,7 +131,7 @@ export function mapDbUser(row: Record<string, unknown>): User {
     avatar_url: row.avatar_url ? String(row.avatar_url) : null,
     bio: row.bio ? String(row.bio) : null,
     timezone: row.timezone ? String(row.timezone) : 'UTC',
-    notification_prefs: JSON.parse(String(row.notification_prefs || '{}')),
+    notification_prefs: normalizeNotificationPrefs(row.notification_prefs),
     watchlist: JSON.parse(String(row.watchlist || '[]')),
     created_at: String(row.created_at),
     last_login_at: row.last_login_at ? String(row.last_login_at) : null,

@@ -220,6 +220,18 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     window.scrollTo({ top: 0, behavior: 'instant' as ScrollBehavior });
   }, []);
 
+  const syncAppBadge = useCallback((count: number) => {
+    const nav = navigator as Navigator & {
+      setAppBadge?: (c?: number) => Promise<void>;
+      clearAppBadge?: () => Promise<void>;
+    };
+    if (count > 0 && typeof nav.setAppBadge === 'function') {
+      nav.setAppBadge(count).catch(() => undefined);
+    } else if (count === 0 && typeof nav.clearAppBadge === 'function') {
+      nav.clearAppBadge().catch(() => undefined);
+    }
+  }, []);
+
   const refreshNotifications = useCallback(async () => {
     try {
       const res = await apiFetch<{ notifications: AppNotification[]; unread_count: number }>(
@@ -227,10 +239,11 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       );
       setNotifications(res.notifications);
       setUnreadCount(res.unread_count);
+      syncAppBadge(res.unread_count);
     } catch {
       // unauthenticated or offline
     }
-  }, []);
+  }, [syncAppBadge]);
 
   const refreshPublicData = useCallback(async () => {
     try {

@@ -24,11 +24,13 @@ import { apiFetch, formatLocalDateTime, uploadMediaFile } from '../lib/api';
 import { AdminAcademyManager } from '../components/admin/AdminAcademyManager';
 import { AdminRegistrationsPanel } from '../components/admin/AdminRegistrationsPanel';
 import { CheckCircle2, ExternalLink } from 'lucide-react';
+import { sendTestPushNotification } from '../lib/pushClient';
 import type {
   MarketUpdate,
   MarketUpdateCategory,
   PlatformSettings,
   PushJobSummary,
+  PushSubscriptionSummary,
   RegistrationAnalyticsPayload,
   SignalChatMessage,
   SignalDirection,
@@ -163,10 +165,24 @@ export const AdminPage: React.FC = () => {
     body: '',
     category: 'announcements',
     link_url: '/signals',
-    targetMode: 'all' as 'all' | 'selected',
+    image_url: '',
+    targetMode: 'all' as 'all' | 'registered' | 'verified' | 'admins_mods' | 'selected',
     selectedUserIds: [] as string[],
+    respect_prefs: true,
+    sound: true,
     scheduled_at: '',
   });
+  const [pushSubsInfo, setPushSubsInfo] = useState<{
+    summary: {
+      total_active: number;
+      total_inactive: number;
+      android: number;
+      ios: number;
+      desktop: number;
+    };
+    subscriptions: PushSubscriptionSummary[];
+  } | null>(null);
+  const [testingAdminPush, setTestingAdminPush] = useState(false);
 
   // User search
   const [userSearch, setUserSearch] = useState('');
@@ -189,13 +205,23 @@ export const AdminPage: React.FC = () => {
   const loadAdminData = useCallback(async () => {
     if (user?.role !== 'admin') return;
     try {
-      const [ov, reg, upd, usr, rep, cnt] = await Promise.all([
+      const [ov, reg, upd, usr, rep, cnt, subs] = await Promise.all([
         apiFetch<OverviewPayload>('/api/admin/overview'),
         apiFetch<RegistrationAnalyticsPayload>('/api/admin/registrations'),
         apiFetch<{ updates: MarketUpdate[] }>('/api/updates?includeAll=true'),
         apiFetch<{ users: User[] }>('/api/admin/users'),
         apiFetch<{ reports: typeof reports }>('/api/admin/reports'),
         apiFetch<{ messages: typeof contacts }>('/api/admin/contacts'),
+        apiFetch<{
+          summary: {
+            total_active: number;
+            total_inactive: number;
+            android: number;
+            ios: number;
+            desktop: number;
+          };
+          subscriptions: PushSubscriptionSummary[];
+        }>('/api/admin/push-subscriptions'),
       ]);
       setOverview(ov);
       setRegistrations(reg);
@@ -203,6 +229,7 @@ export const AdminPage: React.FC = () => {
       setUsersList(usr.users);
       setReports(rep.reports);
       setContacts(cnt.messages);
+      setPushSubsInfo(subs);
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Failed to load admin data.');
     }
@@ -487,15 +514,19 @@ export const AdminPage: React.FC = () => {
           body: notifForm.body,
           category: notifForm.category,
           link_url: notifForm.link_url,
+          image_url: notifForm.image_url.trim() || null,
+          target_group: notifForm.targetMode,
           target_user_ids:
             notifForm.targetMode === 'selected' ? notifForm.selectedUserIds : null,
+          respect_prefs: notifForm.respect_prefs,
+          sound: notifForm.sound,
           scheduled_at: notifForm.scheduled_at
             ? new Date(notifForm.scheduled_at).toISOString()
             : null,
         }),
       });
       const sentTitle = notifForm.title;
-      setNotifForm((f) => ({ ...f, title: '', body: '', scheduled_at: '' }));
+      setNotifForm((f) => ({ ...f, title: '', body: '', image_url: '', scheduled_at: '' }));
       notifyOk(res.scheduled ? 'Notification scheduled.' : 'Push notification queued & dispatched.');
       if (!res.scheduled && res.push_job) {
         setPublishReceipt({
@@ -507,6 +538,33 @@ export const AdminPage: React.FC = () => {
       await loadAdminData();
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Failed to send notification.');
+    }
+  };
+
+  const handleTestAdminDevicePush = async () => {
+    setTestingAdminPush(true);
+    setErrorMsg(null);
+    try {
+      await sendTestPushNotification();
+      notifyOk('Test push notification sent to this admin device.');
+      await loadAdminData();
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'No active push subscription on this device.');
+    } finally {
+      setTestingAdminPush(false);
+    }
+  };
+
+  const handlePruneInactiveSubs = async () => {
+    try {
+      const res = await apiFetch<{ deleted: number }>('/api/admin/push-subscriptions/prune', {
+        method: 'POST',
+        body: JSON.stringify({ older_than_days: 0 }),
+      });
+      notifyOk(`Cleaned up ${res.deleted} inactive push token(s).`);
+      await loadAdminData();
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Failed to clean up push tokens.');
     }
   };
 
@@ -1322,164 +1380,286 @@ export const AdminPage: React.FC = () => {
 
       {/* D. PUSH NOTIFICATIONS */}
       {tab === 'notifications' && (
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-          <form
-            onSubmit={handleSendBroadcast}
-            className="lg:col-span-6 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5 space-y-4"
-          >
-            <h2 className="text-base font-bold text-slate-900 dark:text-white">
-              Dispatch Push & In-App Notification
-            </h2>
-            <input
-              type="text"
-              required
-              placeholder="Notification title"
-              value={notifForm.title}
-              onChange={(e) => setNotifForm({ ...notifForm, title: e.target.value })}
-              className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
-            />
-            <textarea
-              rows={3}
-              required
-              placeholder="Alert body message..."
-              value={notifForm.body}
-              onChange={(e) => setNotifForm({ ...notifForm, body: e.target.value })}
-              className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
-            />
-            <div className="grid grid-cols-2 gap-3">
-              <select
-                value={notifForm.category}
-                onChange={(e) => setNotifForm({ ...notifForm, category: e.target.value })}
-                className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs"
-              >
-                <option value="signals">Trading Signals</option>
-                <option value="signal_updates">Signal Updates</option>
-                <option value="market_updates">Market Updates</option>
-                <option value="academy">Academy</option>
-                <option value="economic_calendar">Economic Calendar</option>
-                <option value="announcements">Announcements</option>
-              </select>
+        <div className="space-y-6">
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+            <form
+              onSubmit={handleSendBroadcast}
+              className="lg:col-span-6 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5 space-y-4"
+            >
+              <h2 className="text-base font-bold text-slate-900 dark:text-white">
+                Compose Push & In-App Broadcast
+              </h2>
               <input
                 type="text"
-                placeholder="Deep link (e.g. /signals)"
-                value={notifForm.link_url}
-                onChange={(e) => setNotifForm({ ...notifForm, link_url: e.target.value })}
-                className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs font-mono"
+                required
+                placeholder="Notification title (e.g. London Session Liquidity Alert)"
+                value={notifForm.title}
+                onChange={(e) => setNotifForm({ ...notifForm, title: e.target.value })}
+                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
               />
-            </div>
-
-            <div className="flex items-center gap-4 text-xs">
-              <label className="inline-flex items-center gap-1.5">
+              <textarea
+                rows={3}
+                required
+                placeholder="Alert body message..."
+                value={notifForm.body}
+                onChange={(e) => setNotifForm({ ...notifForm, body: e.target.value })}
+                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
+              />
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <select
+                  value={notifForm.category}
+                  onChange={(e) => setNotifForm({ ...notifForm, category: e.target.value })}
+                  className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs"
+                >
+                  <option value="announcements">Platform Announcements</option>
+                  <option value="signals">Forex Signals</option>
+                  <option value="signal_updates">Signal Updates (TP/SL)</option>
+                  <option value="signal_chat">Signal Chat Channel</option>
+                  <option value="market_updates">Market Updates</option>
+                  <option value="academy">Academy Releases</option>
+                  <option value="economic_calendar">Economic Calendar</option>
+                </select>
                 <input
-                  type="radio"
-                  checked={notifForm.targetMode === 'all'}
-                  onChange={() => setNotifForm({ ...notifForm, targetMode: 'all' })}
+                  type="text"
+                  placeholder="Deep link (e.g. /signals or /updates)"
+                  value={notifForm.link_url}
+                  onChange={(e) => setNotifForm({ ...notifForm, link_url: e.target.value })}
+                  className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs font-mono"
                 />
-                <span>All Subscribed Users</span>
-              </label>
-              <label className="inline-flex items-center gap-1.5">
-                <input
-                  type="radio"
-                  checked={notifForm.targetMode === 'selected'}
-                  onChange={() => setNotifForm({ ...notifForm, targetMode: 'selected' })}
-                />
-                <span>Target Specific Users</span>
-              </label>
-            </div>
-
-            {notifForm.targetMode === 'selected' && (
-              <div className="max-h-36 overflow-y-auto rounded-lg border border-slate-200 dark:border-slate-800 p-2.5 space-y-1.5 text-xs">
-                {usersList.map((u) => (
-                  <label key={u.id} className="flex items-center gap-2">
-                    <input
-                      type="checkbox"
-                      checked={notifForm.selectedUserIds.includes(u.id)}
-                      onChange={(e) => {
-                        const next = e.target.checked
-                          ? [...notifForm.selectedUserIds, u.id]
-                          : notifForm.selectedUserIds.filter((id) => id !== u.id);
-                        setNotifForm({ ...notifForm, selectedUserIds: next });
-                      }}
-                    />
-                    <span>
-                      {u.name} ({u.email})
-                    </span>
-                  </label>
-                ))}
               </div>
-            )}
 
-            <div>
-              <label className="block text-[11px] text-slate-500 mb-1">
-                Schedule Delivery (optional)
-              </label>
               <input
-                type="datetime-local"
-                value={notifForm.scheduled_at}
-                onChange={(e) => setNotifForm({ ...notifForm, scheduled_at: e.target.value })}
-                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs"
+                type="text"
+                placeholder="Optional notification banner image URL (/uploads/...)"
+                value={notifForm.image_url}
+                onChange={(e) => setNotifForm({ ...notifForm, image_url: e.target.value })}
+                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs font-mono"
               />
-            </div>
 
-            <button
-              type="submit"
-              className="w-full rounded-lg bg-[#881337] py-2.5 text-sm font-semibold text-white hover:bg-[#6B0F2B] min-h-[44px]"
-            >
-              {notifForm.scheduled_at ? 'Schedule Notification' : 'Send Push Notification Now'}
-            </button>
-          </form>
+              <div>
+                <label className="block text-[11px] font-semibold text-slate-600 dark:text-slate-300 mb-1.5">
+                  Target Audience
+                </label>
+                <select
+                  value={notifForm.targetMode}
+                  onChange={(e) =>
+                    setNotifForm({
+                      ...notifForm,
+                      targetMode: e.target.value as typeof notifForm.targetMode,
+                    })
+                  }
+                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs"
+                >
+                  <option value="all">All Subscribed Devices (Visitors & Registered Users)</option>
+                  <option value="registered">All Registered Accounts</option>
+                  <option value="verified">Email-Verified Traders Only</option>
+                  <option value="admins_mods">Administrators & Moderators</option>
+                  <option value="selected">Specific Selected Users</option>
+                </select>
+              </div>
 
-          <div className="lg:col-span-6 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5 space-y-3">
-            <h2 className="text-base font-bold text-slate-900 dark:text-white">
-              Delivery & Subscription Statistics
-            </h2>
-            <p className="text-xs text-slate-500">
-              Active registered push endpoints: <strong>{overview?.stats.push_subscribers ?? 0}</strong>
-            </p>
-            <div className="divide-y divide-slate-100 dark:divide-slate-800 max-h-96 overflow-y-auto text-xs">
-              {(overview?.push_jobs && overview.push_jobs.length > 0
-                ? overview.push_jobs.map((job) => (
-                    <div key={job.id} className="py-2.5 flex items-center justify-between gap-3">
+              {notifForm.targetMode === 'selected' && (
+                <div className="max-h-36 overflow-y-auto rounded-lg border border-slate-200 dark:border-slate-800 p-2.5 space-y-1.5 text-xs">
+                  {usersList.map((u) => (
+                    <label key={u.id} className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={notifForm.selectedUserIds.includes(u.id)}
+                        onChange={(e) => {
+                          const next = e.target.checked
+                            ? [...notifForm.selectedUserIds, u.id]
+                            : notifForm.selectedUserIds.filter((id) => id !== u.id);
+                          setNotifForm({ ...notifForm, selectedUserIds: next });
+                        }}
+                      />
+                      <span>
+                        {u.name} ({u.email})
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              )}
+
+              <div className="flex flex-wrap items-center gap-4 text-xs">
+                <label className="inline-flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={notifForm.respect_prefs}
+                    onChange={(e) =>
+                      setNotifForm({ ...notifForm, respect_prefs: e.target.checked })
+                    }
+                    className="w-4 h-4 accent-[#881337]"
+                  />
+                  <span>Respect user category subscriptions</span>
+                </label>
+                <label className="inline-flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={notifForm.sound}
+                    onChange={(e) => setNotifForm({ ...notifForm, sound: e.target.checked })}
+                    className="w-4 h-4 accent-[#881337]"
+                  />
+                  <span>Play sound & vibration</span>
+                </label>
+              </div>
+
+              <div>
+                <label className="block text-[11px] text-slate-500 mb-1">
+                  Schedule Delivery (optional)
+                </label>
+                <input
+                  type="datetime-local"
+                  value={notifForm.scheduled_at}
+                  onChange={(e) => setNotifForm({ ...notifForm, scheduled_at: e.target.value })}
+                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs"
+                />
+              </div>
+
+              <button
+                type="submit"
+                className="w-full rounded-lg bg-[#881337] py-2.5 text-sm font-semibold text-white hover:bg-[#6B0F2B] min-h-[44px]"
+              >
+                {notifForm.scheduled_at ? 'Schedule Notification' : 'Send Push Notification Now'}
+              </button>
+            </form>
+
+            <div className="lg:col-span-6 space-y-5">
+              <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5 space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h2 className="text-base font-bold text-slate-900 dark:text-white">
+                    Device Endpoints & Delivery Health
+                  </h2>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      disabled={testingAdminPush}
+                      onClick={handleTestAdminDevicePush}
+                      className="rounded-lg border border-emerald-300 dark:border-emerald-700 bg-emerald-50 dark:bg-emerald-950/30 px-3 py-1.5 text-xs font-semibold text-[#15803D] dark:text-emerald-400 hover:bg-emerald-100 disabled:opacity-60"
+                    >
+                      {testingAdminPush ? 'Sending...' : 'Test My Device'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handlePruneInactiveSubs}
+                      className="rounded-lg border border-slate-300 dark:border-slate-700 px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800"
+                    >
+                      Prune Inactive ({pushSubsInfo?.summary.total_inactive ?? 0})
+                    </button>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-xs">
+                  <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-3">
+                    <p className="text-[11px] text-slate-500">Active Total</p>
+                    <p className="mt-0.5 text-lg font-bold font-mono text-slate-900 dark:text-white">
+                      {pushSubsInfo?.summary.total_active ?? overview?.stats.push_subscribers ?? 0}
+                    </p>
+                  </div>
+                  <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-3">
+                    <p className="text-[11px] text-slate-500">Android</p>
+                    <p className="mt-0.5 text-lg font-bold font-mono text-emerald-600 dark:text-emerald-400">
+                      {pushSubsInfo?.summary.android ?? 0}
+                    </p>
+                  </div>
+                  <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-3">
+                    <p className="text-[11px] text-slate-500">iOS PWA</p>
+                    <p className="mt-0.5 text-lg font-bold font-mono text-[#881337] dark:text-rose-400">
+                      {pushSubsInfo?.summary.ios ?? 0}
+                    </p>
+                  </div>
+                  <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-3">
+                    <p className="text-[11px] text-slate-500">Desktop</p>
+                    <p className="mt-0.5 text-lg font-bold font-mono text-slate-700 dark:text-slate-300">
+                      {pushSubsInfo?.summary.desktop ?? 0}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="divide-y divide-slate-100 dark:divide-slate-800 max-h-48 overflow-y-auto text-xs">
+                  {(pushSubsInfo?.subscriptions || []).slice(0, 20).map((sub) => (
+                    <div key={sub.id} className="py-2 flex items-center justify-between gap-2">
                       <div className="min-w-0">
-                        <p className="font-semibold text-slate-900 dark:text-white truncate">
-                          {job.title}
-                        </p>
-                        <p className="text-slate-500">
-                          {job.category} · {job.status} · {formatLocalDateTime(job.created_at)}
-                        </p>
-                      </div>
-                      <div className="text-right font-mono tabular-nums shrink-0 text-[11px]">
-                        <span className="text-emerald-600 dark:text-emerald-400 font-semibold">
-                          {job.delivered_count} sent
-                        </span>
-                        {job.queued_count > 0 && (
-                          <span className="ml-2 text-amber-600 dark:text-amber-400">
-                            {job.queued_count} queued
+                        <p className="font-medium text-slate-900 dark:text-white truncate">
+                          {sub.user_name ? `${sub.user_name} (${sub.user_email})` : 'Anonymous PWA Device'}{' '}
+                          <span className="uppercase text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300">
+                            {sub.platform}
                           </span>
-                        )}
-                        {job.failed_count > 0 && (
-                          <span className="ml-2 text-red-600 dark:text-red-400">
-                            {job.failed_count} failed
-                          </span>
-                        )}
-                      </div>
-                    </div>
-                  ))
-                : (overview?.dispatch_logs || []).map((log) => (
-                    <div key={log.id} className="py-2.5 flex items-center justify-between gap-3">
-                      <div className="min-w-0">
-                        <p className="font-semibold text-slate-900 dark:text-white truncate">
-                          {log.title}
                         </p>
-                        <p className="text-slate-500">
-                          {log.category} · {formatLocalDateTime(log.created_at)}
+                        <p className="text-[11px] text-slate-500 truncate">
+                          {sub.last_error
+                            ? `Last error: ${sub.last_error}`
+                            : sub.last_success_at
+                              ? `Last delivered: ${formatLocalDateTime(sub.last_success_at)}`
+                              : `Registered: ${formatLocalDateTime(sub.created_at)}`}
                         </p>
                       </div>
-                      <span className="font-mono tabular-nums text-emerald-600 dark:text-emerald-400 shrink-0">
-                        {log.delivered_count}/{log.total_targeted} sent
+                      <span
+                        className={`text-[10px] font-semibold px-2 py-0.5 rounded-full shrink-0 ${
+                          sub.active
+                            ? 'bg-emerald-50 text-[#15803D] dark:bg-emerald-500/15 dark:text-emerald-400'
+                            : 'bg-rose-50 text-[#881337] dark:bg-rose-500/15 dark:text-rose-400'
+                        }`}
+                      >
+                        {sub.active ? 'Active' : 'Invalid/Off'}
                       </span>
                     </div>
-                  )))}
+                  ))}
+                  {(!pushSubsInfo || pushSubsInfo.subscriptions.length === 0) && (
+                    <p className="py-3 text-xs text-slate-500">No device subscriptions registered yet.</p>
+                  )}
+                </div>
+              </div>
+
+              <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5 space-y-3">
+                <h2 className="text-base font-bold text-slate-900 dark:text-white">
+                  Recent Push Delivery Logs
+                </h2>
+                <div className="divide-y divide-slate-100 dark:divide-slate-800 max-h-64 overflow-y-auto text-xs">
+                  {(overview?.push_jobs && overview.push_jobs.length > 0
+                    ? overview.push_jobs.map((job) => (
+                        <div key={job.id} className="py-2.5 flex items-center justify-between gap-3">
+                          <div className="min-w-0">
+                            <p className="font-semibold text-slate-900 dark:text-white truncate">
+                              {job.title}
+                            </p>
+                            <p className="text-slate-500">
+                              {job.category} · {job.status} · {formatLocalDateTime(job.created_at)}
+                            </p>
+                          </div>
+                          <div className="text-right font-mono tabular-nums shrink-0 text-[11px]">
+                            <span className="text-emerald-600 dark:text-emerald-400 font-semibold">
+                              {job.delivered_count} sent
+                            </span>
+                            {job.queued_count > 0 && (
+                              <span className="ml-2 text-amber-600 dark:text-amber-400">
+                                {job.queued_count} queued
+                              </span>
+                            )}
+                            {job.failed_count > 0 && (
+                              <span className="ml-2 text-red-600 dark:text-red-400">
+                                {job.failed_count} failed
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      ))
+                    : (overview?.dispatch_logs || []).map((log) => (
+                        <div key={log.id} className="py-2.5 flex items-center justify-between gap-3">
+                          <div className="min-w-0">
+                            <p className="font-semibold text-slate-900 dark:text-white truncate">
+                              {log.title}
+                            </p>
+                            <p className="text-slate-500">
+                              {log.category} · {formatLocalDateTime(log.created_at)}
+                            </p>
+                          </div>
+                          <span className="font-mono tabular-nums text-emerald-600 dark:text-emerald-400 shrink-0">
+                            {log.delivered_count}/{log.total_targeted} sent
+                          </span>
+                        </div>
+                      )))}
+                </div>
+              </div>
             </div>
           </div>
         </div>

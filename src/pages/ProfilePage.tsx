@@ -3,7 +3,9 @@ import { BellRing, CheckCircle2, History, KeyRound, LogOut, ShieldAlert, Trash2,
 import { usePlatform } from '../context/PlatformContext';
 import { apiFetch, formatLocalDateTime } from '../lib/api';
 import {
+  DEFAULT_DEVICE_PREFS,
   getCurrentPushSubscription,
+  sendTestPushNotification,
   subscribeToPushNotifications,
   unsubscribeFromPushNotifications,
 } from '../lib/pushClient';
@@ -16,15 +18,9 @@ export const ProfilePage: React.FC = () => {
   const [bio, setBio] = useState(user?.bio || '');
   const [timezone, setTimezone] = useState(user?.timezone || 'UTC');
   const [prefs, setPrefs] = useState<NotificationPreferences>(
-    user?.notification_prefs || {
-      signals: true,
-      signal_updates: true,
-      market_updates: true,
-      academy: true,
-      economic_calendar: true,
-      announcements: true,
-    }
+    user?.notification_prefs || DEFAULT_DEVICE_PREFS
   );
+  const [testingPush, setTestingPush] = useState(false);
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [activity, setActivity] = useState<
@@ -108,13 +104,27 @@ export const ProfilePage: React.FC = () => {
       setPushSubscribed(false);
       setMessage('Push notifications disabled on this device.');
     } else {
-      const res = await subscribeToPushNotifications();
+      const res = await subscribeToPushNotifications(prefs);
       if (res.ok) {
         setPushSubscribed(true);
         setMessage('Push notifications enabled on this device.');
       } else {
         setError(res.error || 'Could not enable push notifications.');
       }
+    }
+  };
+
+  const handleSendTestPush = async () => {
+    setTestingPush(true);
+    setError(null);
+    setMessage(null);
+    try {
+      await sendTestPushNotification();
+      setMessage('Test push notification sent to this device.');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Test push delivery failed.');
+    } finally {
+      setTestingPush(false);
     }
   };
 
@@ -273,28 +283,42 @@ export const ProfilePage: React.FC = () => {
             </h2>
           </div>
 
-          <button
-            type="button"
-            onClick={handleToggleDevicePush}
-            className={`rounded-lg px-4 py-2 text-xs font-semibold transition-colors min-h-[40px] ${
-              pushSubscribed
-                ? 'bg-emerald-50 text-[#15803D] border border-emerald-200 dark:bg-emerald-600/15 dark:text-emerald-400 dark:border-emerald-500/30'
-                : 'bg-[#15803D] text-white hover:bg-[#166534]'
-            }`}
-          >
-            {pushSubscribed ? 'Device Push Active (Disable)' : 'Enable Push on This Device'}
-          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            {pushSubscribed && (
+              <button
+                type="button"
+                disabled={testingPush}
+                onClick={handleSendTestPush}
+                className="rounded-lg border border-slate-300 dark:border-slate-700 px-3.5 py-2 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-60 min-h-[40px]"
+              >
+                {testingPush ? 'Sending Test...' : 'Send Test Push'}
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={handleToggleDevicePush}
+              className={`rounded-lg px-4 py-2 text-xs font-semibold transition-colors min-h-[40px] ${
+                pushSubscribed
+                  ? 'bg-emerald-50 text-[#15803D] border border-emerald-200 dark:bg-emerald-600/15 dark:text-emerald-400 dark:border-emerald-500/30'
+                  : 'bg-[#15803D] text-white hover:bg-[#166534]'
+              }`}
+            >
+              {pushSubscribed ? 'Device Push Active (Disable)' : 'Enable Push on This Device'}
+            </button>
+          </div>
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2">
           {(
             [
-              { key: 'signals', label: 'New Trading Signals' },
+              { key: 'signals', label: 'New Forex Signals' },
               { key: 'signal_updates', label: 'TP Hit, SL Hit & Signal Updates' },
+              { key: 'signal_chat', label: 'Signal Chat Channel Messages' },
               { key: 'market_updates', label: 'Breaking Market Updates' },
+              { key: 'announcements', label: 'Platform Announcements' },
               { key: 'academy', label: 'New Academy Lessons' },
               { key: 'economic_calendar', label: 'Economic Calendar Reminders' },
-              { key: 'announcements', label: 'Platform Announcements' },
+              { key: 'sound_enabled', label: 'Notification Sounds & Vibration' },
             ] as const
           ).map((item) => (
             <label
