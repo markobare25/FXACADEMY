@@ -21,9 +21,9 @@ import {
 } from './server/db.ts';
 import {
   type AuthRequest,
+  REFRESH_REMEMBER_TTL_SEC,
   cleanupExpiredAuthRecords,
-  createUserSession,
-  extendOrCreateSession,
+  createAuthSession,
   extractAuthContext,
   logUserActivity,
   mapDbUser,
@@ -33,9 +33,12 @@ import {
   rateLimit,
   requireAuth,
   requireRole,
+  revokeAccessToken,
   revokeAllUserSessions,
-  revokeToken,
+  revokeRefreshToken,
+  rotateRefreshSession,
   signVisitorCookie,
+  validateStrongPassword,
   verifyVisitorCookie,
 } from './server/auth.ts';
 import {
@@ -155,35 +158,41 @@ function isHttpsRequest(req: Request): boolean {
   return Boolean(req.secure || proto === 'https');
 }
 
-function setSessionCookie(req: Request, res: Response, token: string): void {
+function setRefreshCookie(
+  req: Request,
+  res: Response,
+  refreshToken: string,
+  rememberMe: boolean
+): void {
   const isHttps = isHttpsRequest(req);
-  res.cookie('mfx_session', token, {
+  res.cookie('mfx_refresh', refreshToken, {
     httpOnly: true,
     sameSite: isHttps ? 'none' : 'lax',
     secure: isHttps,
     ...(isHttps ? { partitioned: true } : {}),
-    maxAge: 30 * 24 * 60 * 60 * 1000,
+    ...(rememberMe ? { maxAge: REFRESH_REMEMBER_TTL_SEC * 1000 } : {}),
     path: '/',
   });
 }
 
-function clearSessionCookie(req: Request, res: Response): void {
+function clearRefreshCookie(req: Request, res: Response): void {
   const isHttps = isHttpsRequest(req);
-  res.clearCookie('mfx_session', {
-    httpOnly: true,
-    sameSite: isHttps ? 'none' : 'lax',
-    secure: isHttps,
-    ...(isHttps ? { partitioned: true } : {}),
-    path: '/',
-  });
-  if (isHttps) {
-    // Also clear any non-partitioned legacy cookie variant
-    res.clearCookie('mfx_session', {
+  for (const cookieName of ['mfx_refresh', 'mfx_session']) {
+    res.clearCookie(cookieName, {
       httpOnly: true,
-      sameSite: 'none',
-      secure: true,
+      sameSite: isHttps ? 'none' : 'lax',
+      secure: isHttps,
+      ...(isHttps ? { partitioned: true } : {}),
       path: '/',
     });
+    if (isHttps) {
+      res.clearCookie(cookieName, {
+        httpOnly: true,
+        sameSite: 'none',
+        secure: true,
+        path: '/',
+      });
+    }
   }
 }
 
@@ -201,7 +210,7 @@ app.use('/api', (req: Request, res: Response, next: NextFunction) => {
     return;
   }
   const cookies = parseCookies(req.headers.cookie);
-  if (!cookies['mfx_session']) {
+  if (!cookies['mfx_refresh']) {
     next();
     return;
   }
@@ -319,7 +328,10 @@ app.use('/api/auth', (_req, res, next) => {
 const registerSchema = z.object({
   name: z.string().trim().min(2, 'Full name must be at least 2 characters.').max(80),
   email: z.string().trim().email('Please enter a valid email address.').max(160),
-  password: z.string().min(6, 'Password must be at least 6 characters.').max(128),
+  password: z.string().min(8, 'Password must be at least 8 characters.').max(128),
+  confirm_password: z.string().min(1, 'Please confirm your password.').optional(),
+  accept_terms: z.boolean().optional(),
+  remember_me: z.boolean().optional(),
   timezone: z.string().max(64).optional(),
 });
 
@@ -327,6 +339,22 @@ app.post('/api/auth/register', rateLimit(30, 60_000), (req: Request, res: Respon
   const parsed = registerSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid registration data.' });
+    return;
+  }
+
+  const passwordErr = validateStrongPassword(parsed.data.password);
+  if (passwordErr) {
+    res.status(400).json({ error: passwordErr });
+    return;
+  }
+
+  if (parsed.data.confirm_password !== undefined && parsed.data.password !== parsed.data.confirm_password) {
+    res.status(400).json({ error: 'Passwords do not match.' });
+    return;
+  }
+
+  if (parsed.data.accept_terms !== true) {
+    res.status(400).json({ error: 'You must accept the Terms and Conditions to create an account.' });
     return;
   }
 
@@ -347,53 +375,62 @@ app.post('/api/auth/register', rateLimit(30, 60_000), (req: Request, res: Respon
 
   const now = new Date().toISOString();
   const userId = crypto.randomUUID();
+  const rememberMe = parsed.data.remember_me !== false;
 
   db.prepare(
-    `INSERT INTO users (id, name, email, password_hash, role, status, email_verified, needs_password_setup, timezone, created_at, last_login_at)
-     VALUES (?, ?, ?, ?, 'user', 'active', 1, 0, ?, ?, ?)`
+    `INSERT INTO users (
+      id, name, email, password_hash, role, status, email_verified,
+      needs_password_setup, terms_accepted_at, timezone, created_at, last_login_at
+    ) VALUES (?, ?, ?, ?, 'user', 'active', 0, 0, ?, ?, ?, ?)`
   ).run(
     userId,
     parsed.data.name,
     email,
     hashPassword(parsed.data.password),
+    now,
     parsed.data.timezone || 'UTC',
     now,
     now
   );
 
+  const verifyToken = crypto.randomBytes(24).toString('hex');
+  const verifyCode = String(crypto.randomInt(100000, 999999));
+  db.prepare(
+    `INSERT INTO email_verifications (id, user_id, token, code, expires_at, used)
+     VALUES (?, ?, ?, ?, ?, 0)`
+  ).run(
+    crypto.randomUUID(),
+    userId,
+    verifyToken,
+    verifyCode,
+    new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
+  );
+
   logUserActivity(userId, 'Account Registered', 'New MeridianFX trader account created.', req.ip);
 
   const userRow = db.prepare('SELECT * FROM users WHERE id = ?').get(userId) as Record<string, unknown>;
-  const { token } = createUserSession(
-    userId,
-    'user',
-    { userAgent: String(req.headers['user-agent'] || ''), ip: req.ip },
-    60 * 60 * 24 * 30
-  );
-  setSessionCookie(req, res, token);
+  const session = createAuthSession(userId, 'user', {
+    rememberMe,
+    userAgent: String(req.headers['user-agent'] || ''),
+    ip: req.ip,
+  });
+  setRefreshCookie(req, res, session.refreshToken, session.rememberMe);
 
   res.status(201).json({
     user: mapDbUser(userRow),
-    token,
-  });
-});
-
-app.get('/api/auth/admin-status', (_req: Request, res: Response) => {
-  res.json({
-    is_designated_admin: false,
-    setup_required: false,
-  });
-});
-
-app.post('/api/auth/admin-setup', (_req: Request, res: Response) => {
-  res.status(403).json({
-    error: 'Administrator account uses permanent credentials. Please sign in normally.',
+    access_token: session.accessToken,
+    expires_in: session.expiresIn,
+    remember_me: session.rememberMe,
+    verification_code: verifyCode,
+    verification_token: verifyToken,
+    verification_url: `/verify-email?token=${encodeURIComponent(verifyToken)}&email=${encodeURIComponent(email)}`,
   });
 });
 
 const loginSchema = z.object({
   email: z.string().trim().email('Please enter a valid email address.'),
   password: z.string().min(1, 'Password is required.'),
+  remember_me: z.boolean().optional(),
 });
 
 app.post('/api/auth/login', rateLimit(40, 60_000), (req: Request, res: Response) => {
@@ -437,15 +474,52 @@ app.post('/api/auth/login', rateLimit(40, 60_000), (req: Request, res: Response)
   logUserActivity(String(row.id), 'Sign In', 'Authenticated session started.', req.ip);
 
   const user = mapDbUser({ ...row, last_login_at: now });
-  const { token } = createUserSession(
-    user.id,
-    user.role,
-    { userAgent: String(req.headers['user-agent'] || ''), ip: req.ip },
-    60 * 60 * 24 * 30
-  );
-  setSessionCookie(req, res, token);
+  const rememberMe = parsed.data.remember_me !== false;
+  const session = createAuthSession(user.id, user.role, {
+    rememberMe,
+    userAgent: String(req.headers['user-agent'] || ''),
+    ip: req.ip,
+  });
+  setRefreshCookie(req, res, session.refreshToken, session.rememberMe);
 
-  res.json({ user, token });
+  res.json({
+    user,
+    access_token: session.accessToken,
+    expires_in: session.expiresIn,
+    remember_me: session.rememberMe,
+  });
+});
+
+app.post('/api/auth/refresh', (req: Request, res: Response) => {
+  const cookies = parseCookies(req.headers.cookie);
+  const rawRefresh = cookies['mfx_refresh'] || '';
+  if (!rawRefresh) {
+    clearRefreshCookie(req, res);
+    res.status(401).json({ error: 'No active session found.' });
+    return;
+  }
+
+  const rotated = rotateRefreshSession(rawRefresh, {
+    userAgent: String(req.headers['user-agent'] || ''),
+    ip: req.ip,
+  });
+
+  if (!rotated) {
+    clearRefreshCookie(req, res);
+    res.status(401).json({ error: 'Session expired or revoked. Please sign in again.' });
+    return;
+  }
+
+  if (rotated.rotated) {
+    setRefreshCookie(req, res, rotated.refreshToken, rotated.rememberMe);
+  }
+
+  res.json({
+    user: rotated.user,
+    access_token: rotated.accessToken,
+    expires_in: rotated.expiresIn,
+    remember_me: rotated.rememberMe,
+  });
 });
 
 app.post('/api/auth/logout', optionalAuth, (req: AuthRequest, res: Response) => {
@@ -453,57 +527,36 @@ app.post('/api/auth/logout', optionalAuth, (req: AuthRequest, res: Response) => 
   const bearerToken =
     authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
   const cookies = parseCookies(req.headers.cookie);
-  const cookieToken = cookies['mfx_session'] || '';
-  const bodyToken = typeof req.body?.token === 'string' ? req.body.token.trim() : '';
+  const refreshToken = cookies['mfx_refresh'] || '';
 
-  revokeToken(bearerToken);
-  if (cookieToken && cookieToken !== bearerToken) revokeToken(cookieToken);
-  if (bodyToken && bodyToken !== bearerToken && bodyToken !== cookieToken) revokeToken(bodyToken);
-
-  if (req.user) {
-    logUserActivity(req.user.id, 'Sign Out', 'Session terminated.', req.ip);
+  if (bearerToken) {
+    revokeAccessToken(bearerToken);
   }
-  clearSessionCookie(req, res);
+  const revokedUserId = revokeRefreshToken(refreshToken);
+  const actorId = req.user?.id || revokedUserId;
+
+  if (actorId) {
+    logUserActivity(actorId, 'Sign Out', 'Session terminated.', req.ip);
+  }
+
+  clearRefreshCookie(req, res);
+  res.json({ ok: true });
+});
+
+app.post('/api/auth/logout-all', requireAuth, (req: AuthRequest, res: Response) => {
+  revokeAllUserSessions(req.user!.id);
+  logUserActivity(req.user!.id, 'Sign Out All Devices', 'All active sessions revoked.', req.ip);
+  clearRefreshCookie(req, res);
   res.json({ ok: true });
 });
 
 app.get('/api/auth/me', (req: Request, res: Response) => {
-  const cookies = parseCookies(req.headers.cookie);
   const ctx = extractAuthContext(req);
   if (!ctx.user) {
-    if (cookies['mfx_session']) {
-      clearSessionCookie(req, res);
-    }
-    res.json({ user: null });
+    res.status(401).json({ user: null, error: 'Authentication required.' });
     return;
   }
-
-  let syncToken: string | undefined;
-  const nowSec = Math.floor(Date.now() / 1000);
-  const needsSlidingRefresh = Boolean(ctx.expiresAt && ctx.expiresAt - nowSec < 7 * 24 * 60 * 60);
-
-  if (needsSlidingRefresh) {
-    syncToken = extendOrCreateSession(
-      ctx.jti,
-      ctx.user.id,
-      ctx.user.role,
-      { userAgent: String(req.headers['user-agent'] || ''), ip: req.ip },
-      60 * 60 * 24 * 30
-    );
-    setSessionCookie(req, res, syncToken);
-  } else if (ctx.source === 'bearer' && ctx.token) {
-    if (cookies['mfx_session'] !== ctx.token) {
-      setSessionCookie(req, res, ctx.token);
-    }
-  } else if (ctx.source === 'cookie' && ctx.token) {
-    // Provide token so clients whose localStorage was cleared (e.g. PWA restart) re-sync cleanly
-    syncToken = ctx.token;
-  }
-
-  res.json({
-    user: ctx.user,
-    ...(syncToken ? { session_token: syncToken } : {}),
-  });
+  res.json({ user: ctx.user });
 });
 
 app.post('/api/auth/verify-email', (req: Request, res: Response) => {
@@ -515,9 +568,9 @@ app.post('/api/auth/verify-email', (req: Request, res: Response) => {
   if (token) {
     record = db
       .prepare('SELECT * FROM email_verifications WHERE token = ? AND used = 0')
-      .get(token) as typeof record;
+      .get(token.trim()) as typeof record;
   } else if (code && email) {
-    const user = db.prepare('SELECT id FROM users WHERE email = ?').get(email.toLowerCase()) as
+    const user = db.prepare('SELECT id FROM users WHERE LOWER(email) = ?').get(email.trim().toLowerCase()) as
       | { id: string }
       | undefined;
     if (user) {
@@ -556,11 +609,20 @@ app.post('/api/auth/resend-verification', requireAuth, rateLimit(5, 60_000), (re
     new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
   );
 
-  res.json({ ok: true, verification_code: verifyCode, verification_token: verifyToken });
+  res.json({
+    ok: true,
+    verification_code: verifyCode,
+    verification_token: verifyToken,
+    verification_url: `/verify-email?token=${encodeURIComponent(verifyToken)}&email=${encodeURIComponent(user.email)}`,
+  });
 });
 
 app.post('/api/auth/forgot-password', rateLimit(10, 60_000), (req: Request, res: Response) => {
   const email = String(req.body?.email || '').trim().toLowerCase();
+  if (!email) {
+    res.status(400).json({ error: 'Please enter your email address.' });
+    return;
+  }
   if (email === DESIGNATED_ADMIN_EMAIL) {
     res.status(403).json({
       error: 'Administrator login credentials are permanent and cannot be reset.',
@@ -573,7 +635,10 @@ app.post('/api/auth/forgot-password', rateLimit(10, 60_000), (req: Request, res:
     | undefined;
 
   if (!user) {
-    res.json({ ok: true, message: 'If an account exists for that email, a reset code has been generated.' });
+    res.json({
+      ok: true,
+      message: 'If an account exists for that email, a password reset link and recovery code have been generated.',
+    });
     return;
   }
 
@@ -589,21 +654,24 @@ app.post('/api/auth/forgot-password', rateLimit(10, 60_000), (req: Request, res:
     resetCode,
     new Date(Date.now() + 60 * 60 * 1000).toISOString()
   );
-  logUserActivity(user.id, 'Password Reset Requested', 'Reset code issued.', req.ip);
+  logUserActivity(user.id, 'Password Reset Requested', 'Password reset token and code issued.', req.ip);
 
   res.json({
     ok: true,
-    message: 'Password reset code generated.',
+    message: 'Password reset link and recovery code generated.',
     reset_code: resetCode,
     reset_token: resetToken,
+    reset_url: `/reset-password?token=${encodeURIComponent(resetToken)}&email=${encodeURIComponent(email)}`,
   });
 });
 
 app.post('/api/auth/reset-password', rateLimit(10, 60_000), (req: Request, res: Response) => {
   const schema = z.object({
-    email: z.string().trim().email(),
-    code: z.string().trim().min(4),
-    new_password: z.string().min(6, 'New password must be at least 6 characters.').max(128),
+    email: z.string().trim().email().optional(),
+    code: z.string().trim().min(4).optional(),
+    token: z.string().trim().min(16).optional(),
+    new_password: z.string().min(8, 'New password must be at least 8 characters.').max(128),
+    confirm_password: z.string().optional(),
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
@@ -611,42 +679,74 @@ app.post('/api/auth/reset-password', rateLimit(10, 60_000), (req: Request, res: 
     return;
   }
 
-  const normalizedEmail = parsed.data.email.trim().toLowerCase();
-  if (normalizedEmail === DESIGNATED_ADMIN_EMAIL) {
+  const passwordErr = validateStrongPassword(parsed.data.new_password);
+  if (passwordErr) {
+    res.status(400).json({ error: passwordErr });
+    return;
+  }
+
+  if (
+    parsed.data.confirm_password !== undefined &&
+    parsed.data.new_password !== parsed.data.confirm_password
+  ) {
+    res.status(400).json({ error: 'Passwords do not match.' });
+    return;
+  }
+
+  let resetRow: { id: string; user_id: string; expires_at: string } | undefined;
+  let userRow: { id: string; email: string } | undefined;
+
+  if (parsed.data.token) {
+    resetRow = db
+      .prepare('SELECT id, user_id, expires_at FROM password_resets WHERE token = ? AND used = 0 LIMIT 1')
+      .get(parsed.data.token) as typeof resetRow;
+    if (resetRow) {
+      userRow = db
+        .prepare('SELECT id, email FROM users WHERE id = ?')
+        .get(resetRow.user_id) as typeof userRow;
+    }
+  } else if (parsed.data.email && parsed.data.code) {
+    const normalizedEmail = parsed.data.email.trim().toLowerCase();
+    if (normalizedEmail === DESIGNATED_ADMIN_EMAIL) {
+      res.status(403).json({
+        error: 'Administrator login credentials are permanent and cannot be modified.',
+      });
+      return;
+    }
+    userRow = db
+      .prepare('SELECT id, email FROM users WHERE LOWER(email) = ?')
+      .get(normalizedEmail) as typeof userRow;
+    if (userRow) {
+      resetRow = db
+        .prepare(
+          'SELECT id, user_id, expires_at FROM password_resets WHERE user_id = ? AND (code = ? OR token = ?) AND used = 0 ORDER BY expires_at DESC LIMIT 1'
+        )
+        .get(userRow.id, parsed.data.code, parsed.data.code) as typeof resetRow;
+    }
+  } else {
+    res.status(400).json({ error: 'A valid reset link token or email and recovery code is required.' });
+    return;
+  }
+
+  if (!userRow || !resetRow || new Date(resetRow.expires_at).getTime() < Date.now()) {
+    res.status(400).json({ error: 'Invalid or expired reset link or recovery code.' });
+    return;
+  }
+
+  if (userRow.email.toLowerCase() === DESIGNATED_ADMIN_EMAIL) {
     res.status(403).json({
       error: 'Administrator login credentials are permanent and cannot be modified.',
     });
     return;
   }
 
-  const user = db
-    .prepare('SELECT id, role FROM users WHERE LOWER(email) = ?')
-    .get(normalizedEmail) as { id: string; role: string } | undefined;
-  if (!user) {
-    res.status(400).json({ error: 'Invalid reset code or email.' });
-    return;
-  }
-
-  const resetRow = db
-    .prepare(
-      'SELECT * FROM password_resets WHERE user_id = ? AND (code = ? OR token = ?) AND used = 0 ORDER BY expires_at DESC LIMIT 1'
-    )
-    .get(user.id, parsed.data.code, parsed.data.code) as
-    | { id: string; expires_at: string }
-    | undefined;
-
-  if (!resetRow || new Date(resetRow.expires_at).getTime() < Date.now()) {
-    res.status(400).json({ error: 'Invalid or expired reset code.' });
-    return;
-  }
   db.prepare('UPDATE password_resets SET used = 1 WHERE id = ?').run(resetRow.id);
-
   db.prepare("UPDATE users SET password_hash = ?, needs_password_setup = 0, status = 'active' WHERE id = ?").run(
     hashPassword(parsed.data.new_password),
-    user.id
+    userRow.id
   );
-  revokeAllUserSessions(user.id);
-  logUserActivity(user.id, 'Password Reset Completed', 'Password updated via verified recovery.', req.ip);
+  revokeAllUserSessions(userRow.id);
+  logUserActivity(userRow.id, 'Password Reset Completed', 'Password updated via verified recovery.', req.ip);
 
   res.json({ ok: true });
 });
@@ -686,11 +786,17 @@ app.patch('/api/users/password', requireAuth, (req: AuthRequest, res: Response) 
 
   const schema = z.object({
     current_password: z.string().min(1),
-    new_password: z.string().min(6, 'New password must be at least 6 characters.').max(128),
+    new_password: z.string().min(8, 'New password must be at least 8 characters.').max(128),
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
-    res.status(400).json({ error: parsed.error.issues[0]?.message || 'New password must be at least 6 characters.' });
+    res.status(400).json({ error: parsed.error.issues[0]?.message || 'New password must be at least 8 characters.' });
+    return;
+  }
+
+  const passwordErr = validateStrongPassword(parsed.data.new_password);
+  if (passwordErr) {
+    res.status(400).json({ error: passwordErr });
     return;
   }
 
@@ -707,7 +813,7 @@ app.patch('/api/users/password', requireAuth, (req: AuthRequest, res: Response) 
     req.user!.id
   );
   const ctx = extractAuthContext(req);
-  revokeAllUserSessions(req.user!.id, ctx.jti);
+  revokeAllUserSessions(req.user!.id, ctx.sid);
   logUserActivity(req.user!.id, 'Password Changed', 'User changed account password.', req.ip);
   res.json({ ok: true });
 });
@@ -778,7 +884,7 @@ app.delete('/api/users/account', requireAuth, (req: AuthRequest, res: Response) 
   }
   revokeAllUserSessions(req.user!.id);
   db.prepare('DELETE FROM users WHERE id = ?').run(req.user!.id);
-  clearSessionCookie(req, res);
+  clearRefreshCookie(req, res);
   res.json({ ok: true });
 });
 
@@ -4031,6 +4137,11 @@ app.get('/api/admin/backups/:filename', requireRole('admin'), (req: Request, res
     return;
   }
   res.download(fullPath, safeName);
+});
+
+// Unmatched /api/* routes return JSON 404 rather than falling through to SPA HTML
+app.use('/api', (_req: Request, res: Response) => {
+  res.status(404).json({ error: 'API endpoint not found.' });
 });
 
 // Global API Error Handler

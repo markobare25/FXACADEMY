@@ -13,7 +13,7 @@ import { PWAInstallButton } from '../components/PWAInstallButton';
 import type { NotificationPreferences } from '../types';
 
 export const ProfilePage: React.FC = () => {
-  const { user, authLoading, setUser, navigate, logout, theme, toggleTheme } = usePlatform();
+  const { user, authLoading, setUser, navigate, logout, logoutAllSessions, theme, toggleTheme } = usePlatform();
   const [name, setName] = useState(user?.name || '');
   const [bio, setBio] = useState(user?.bio || '');
   const [timezone, setTimezone] = useState(user?.timezone || 'UTC');
@@ -185,6 +185,13 @@ export const ProfilePage: React.FC = () => {
           >
             <LogOut className="w-3.5 h-3.5" />
             <span>Sign Out</span>
+          </button>
+          <button
+            type="button"
+            onClick={logoutAllSessions}
+            className="rounded-lg border border-slate-300 dark:border-slate-700 px-3 py-2 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800"
+          >
+            Sign Out All Devices
           </button>
         </div>
       </div>
@@ -363,10 +370,10 @@ export const ProfilePage: React.FC = () => {
             <input
               type="password"
               required
-              minLength={6}
+              minLength={8}
               value={newPassword}
               onChange={(e) => setNewPassword(e.target.value)}
-              placeholder="New password (min 6 chars)"
+              placeholder="New password (8+ chars, letter & num)"
               className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3.5 py-2 text-base sm:text-sm text-slate-900 dark:text-white"
             />
             <button

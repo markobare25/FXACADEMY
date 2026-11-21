@@ -75,6 +75,7 @@ export function initDatabase(): void {
       watchlist TEXT NOT NULL DEFAULT '["EURUSD","GBPUSD","XAUUSD","BTCUSD"]',
       needs_password_setup INTEGER NOT NULL DEFAULT 0,
       tokens_valid_after TEXT,
+      terms_accepted_at TEXT,
       created_at TEXT NOT NULL,
       last_login_at TEXT
     );
@@ -82,6 +83,10 @@ export function initDatabase(): void {
     CREATE TABLE IF NOT EXISTS user_sessions (
       id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
+      refresh_token_hash TEXT,
+      prev_refresh_token_hash TEXT,
+      prev_grace_until TEXT,
+      remember_me INTEGER NOT NULL DEFAULT 1,
       user_agent TEXT,
       ip_address TEXT,
       created_at TEXT NOT NULL,
@@ -589,9 +594,16 @@ export function initDatabase(): void {
   ensureColumn('push_subscriptions', 'last_success_at', 'TEXT');
   ensureColumn('push_subscriptions', 'updated_at', 'TEXT');
   ensureColumn('users', 'tokens_valid_after', 'TEXT');
+  ensureColumn('users', 'terms_accepted_at', 'TEXT');
+  ensureColumn('user_sessions', 'refresh_token_hash', 'TEXT');
+  ensureColumn('user_sessions', 'prev_refresh_token_hash', 'TEXT');
+  ensureColumn('user_sessions', 'prev_grace_until', 'TEXT');
+  ensureColumn('user_sessions', 'remember_me', 'INTEGER NOT NULL DEFAULT 1');
   ensureColumn('push_jobs', 'sound', 'INTEGER NOT NULL DEFAULT 1');
 
   db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_user_sessions_refresh
+      ON user_sessions(refresh_token_hash);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_signal_messages_source
       ON signal_messages(source_type, source_id)
       WHERE source_type IS NOT NULL AND source_id IS NOT NULL;

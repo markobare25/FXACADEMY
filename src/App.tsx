@@ -8,6 +8,7 @@ import {
   ForgotPasswordPage,
   LoginPage,
   RegisterPage,
+  ResetPasswordPage,
   VerifyEmailPage,
 } from './pages/AuthPages';
 import { DashboardPage } from './pages/DashboardPage';
@@ -81,6 +82,8 @@ const RouteView: React.FC = () => {
         return <VerifyEmailPage />;
       case '/forgot-password':
         return <ForgotPasswordPage />;
+      case '/reset-password':
+        return <ResetPasswordPage />;
       case '/dashboard':
         return (
           <ProtectedRoute targetPath="/dashboard">

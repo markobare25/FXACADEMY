@@ -1,12 +1,25 @@
-import type { User } from '../types';
-
-export const TOKEN_KEY = 'mfx_auth_token';
 const VISITOR_ID_KEY = 'mfx_visitor_id';
-const CACHED_USER_KEY = 'mfx_cached_user_v1';
+const LEGACY_STORAGE_KEYS = ['mfx_auth_token', 'mfx_token', 'mfx_cached_user_v1'];
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 let memoryVisitorId: string | null = null;
-let memoryAuthToken: string | null = null;
+let memoryAccessToken: string | null = null;
+let memoryAccessExpiresAt = 0;
+
+let authRefreshHandler: (() => Promise<string | null>) | null = null;
+
+export function clearLegacyAuthStorage(): void {
+  try {
+    for (const key of LEGACY_STORAGE_KEYS) {
+      localStorage.removeItem(key);
+    }
+  } catch {
+    // ignore storage access errors
+  }
+}
+
+// Clear any stale legacy token/session artifacts on module boot
+clearLegacyAuthStorage();
 
 function generateUuidV4(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -36,62 +49,45 @@ export function getOrCreateVisitorId(): string {
   }
 }
 
-export function getStoredToken(): string | null {
-  try {
-    const raw = localStorage.getItem(TOKEN_KEY);
-    if (raw && raw !== 'null' && raw !== 'undefined' && raw.split('.').length === 3) {
-      memoryAuthToken = raw;
-      return raw;
-    }
-    if (memoryAuthToken && memoryAuthToken.split('.').length === 3) {
-      return memoryAuthToken;
-    }
-    return null;
-  } catch {
-    return memoryAuthToken && memoryAuthToken.split('.').length === 3 ? memoryAuthToken : null;
+export function getAccessToken(): string | null {
+  if (memoryAccessToken && memoryAccessToken.split('.').length === 3) {
+    return memoryAccessToken;
   }
+  return null;
 }
 
-export function setStoredToken(token: string | null): void {
+export function getAccessTokenRemainingMs(): number {
+  if (!memoryAccessToken || !memoryAccessExpiresAt) return 0;
+  return Math.max(0, memoryAccessExpiresAt - Date.now());
+}
+
+export function setAccessToken(token: string | null, expiresInSec = 900): void {
   const valid = Boolean(token && token !== 'null' && token !== 'undefined' && token.split('.').length === 3);
-  memoryAuthToken = valid ? token : null;
-  try {
-    if (valid && token) {
-      localStorage.setItem(TOKEN_KEY, token);
-    } else {
-      localStorage.removeItem(TOKEN_KEY);
-    }
-  } catch {
-    // ignore storage errors
+  if (valid && token) {
+    memoryAccessToken = token;
+    memoryAccessExpiresAt = Date.now() + Math.max(30, expiresInSec) * 1000;
+  } else {
+    memoryAccessToken = null;
+    memoryAccessExpiresAt = 0;
   }
+  clearLegacyAuthStorage();
 }
 
-export function getCachedUser(): User | null {
-  try {
-    const raw = localStorage.getItem(CACHED_USER_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as User | null;
-    if (!parsed || typeof parsed.id !== 'string' || typeof parsed.email !== 'string') return null;
-    return parsed;
-  } catch {
-    return null;
-  }
+export function clearAccessToken(): void {
+  memoryAccessToken = null;
+  memoryAccessExpiresAt = 0;
+  clearLegacyAuthStorage();
 }
 
-export function setCachedUser(user: User | null): void {
-  try {
-    if (user) localStorage.setItem(CACHED_USER_KEY, JSON.stringify(user));
-    else localStorage.removeItem(CACHED_USER_KEY);
-  } catch {
-    // ignore storage errors
-  }
+export function setAuthRefreshHandler(handler: (() => Promise<string | null>) | null): void {
+  authRefreshHandler = handler;
 }
 
-export async function apiFetch<T = unknown>(
-  url: string,
-  options: RequestInit = {}
-): Promise<T> {
-  const token = getStoredToken();
+function buildRequestHeaders(
+  options: RequestInit,
+  tokenOverride?: string | null
+): Headers {
+  const token = tokenOverride !== undefined ? tokenOverride : getAccessToken();
   const visitorId = getOrCreateVisitorId();
   const headers = new Headers(options.headers || {});
   if (!headers.has('Content-Type') && !(options.body instanceof FormData)) {
@@ -106,14 +102,40 @@ export async function apiFetch<T = unknown>(
   if (visitorId && !headers.has('X-Visitor-Id')) {
     headers.set('X-Visitor-Id', visitorId);
   }
+  return headers;
+}
 
+export async function apiFetch<T = unknown>(
+  url: string,
+  options: RequestInit = {}
+): Promise<T> {
   const isAuthEndpoint = url.startsWith('/api/auth/');
-  const res = await fetch(url, {
+  const skipAutoRefresh =
+    url.startsWith('/api/auth/login') ||
+    url.startsWith('/api/auth/register') ||
+    url.startsWith('/api/auth/refresh') ||
+    url.startsWith('/api/auth/logout') ||
+    url.startsWith('/api/auth/forgot-password') ||
+    url.startsWith('/api/auth/reset-password');
+
+  let res = await fetch(url, {
     ...options,
-    headers,
+    headers: buildRequestHeaders(options),
     credentials: 'include',
     ...(isAuthEndpoint ? { cache: 'no-store' as RequestCache } : {}),
   });
+
+  if (res.status === 401 && !skipAutoRefresh && authRefreshHandler) {
+    const refreshedToken = await authRefreshHandler().catch(() => null);
+    if (refreshedToken) {
+      res = await fetch(url, {
+        ...options,
+        headers: buildRequestHeaders(options, refreshedToken),
+        credentials: 'include',
+        ...(isAuthEndpoint ? { cache: 'no-store' as RequestCache } : {}),
+      });
+    }
+  }
 
   const text = await res.text();
   let data: unknown = {};
@@ -124,8 +146,8 @@ export async function apiFetch<T = unknown>(
   }
 
   if (!res.ok) {
-    if (res.status === 401 && token && !url.startsWith('/api/auth/login') && !url.startsWith('/api/auth/register')) {
-      window.dispatchEvent(new CustomEvent('mfx:auth-401'));
+    if (res.status === 401 && !skipAutoRefresh) {
+      window.dispatchEvent(new CustomEvent('mfx:auth-expired'));
     }
     const errMsg = (data as { error?: string }).error || `Request failed (${res.status})`;
     throw new Error(errMsg);

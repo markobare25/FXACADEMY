@@ -1,11 +1,11 @@
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
 import {
-  TOKEN_KEY,
   apiFetch,
-  getCachedUser,
-  getStoredToken,
-  setCachedUser,
-  setStoredToken,
+  clearAccessToken,
+  getAccessToken,
+  getAccessTokenRemainingMs,
+  setAccessToken,
+  setAuthRefreshHandler,
 } from '../lib/api';
 import {
   isPushSupported,
@@ -39,6 +39,21 @@ export type SignalChatWsEvent =
     }
   | { type: 'reconnected' };
 
+export interface RegisterPayload {
+  name: string;
+  email: string;
+  password: string;
+  confirmPassword: string;
+  acceptTerms: boolean;
+  rememberMe?: boolean;
+}
+
+export interface RegisterResult {
+  user: User;
+  verification_code?: string;
+  verification_url?: string;
+}
+
 interface PlatformContextValue {
   user: User | null;
   authLoading: boolean;
@@ -56,9 +71,10 @@ interface PlatformContextValue {
   unreadCount: number;
   showNotifModal: boolean;
   setShowNotifModal: (v: boolean) => void;
-  login: (email: string, password: string) => Promise<User>;
-  register: (name: string, email: string, password: string) => Promise<{ user: User; verification_code?: string }>;
+  login: (email: string, password: string, rememberMe?: boolean) => Promise<User>;
+  register: (payload: RegisterPayload) => Promise<RegisterResult>;
   logout: () => Promise<void>;
+  logoutAllSessions: () => Promise<void>;
   setUser: React.Dispatch<React.SetStateAction<User | null>>;
   refreshAll: () => Promise<void>;
   refreshNotifications: () => Promise<void>;
@@ -112,7 +128,7 @@ export function usePlatform(): PlatformContextValue {
 const OFFLINE_CACHE_KEY = 'mfx_offline_snapshot_v1';
 
 export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [user, setUser] = useState<User | null>(() => (getStoredToken() ? getCachedUser() : null));
+  const [user, setUser] = useState<User | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [theme, setTheme] = useState<'dark' | 'light'>(() => {
     try {
@@ -137,10 +153,10 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<number | null>(null);
+  const proactiveRefreshTimer = useRef<number | null>(null);
   const hasConnectedOnceRef = useRef<boolean>(false);
   const authEpochRef = useRef<number>(0);
-  const initInFlightRef = useRef<{ epoch: number; promise: Promise<void> } | null>(null);
-  const lastAuthSyncAtRef = useRef<number>(0);
+  const refreshInFlightRef = useRef<{ epoch: number; promise: Promise<string | null> } | null>(null);
   const isLoggingOutRef = useRef<boolean>(false);
   const authChannelRef = useRef<BroadcastChannel | null>(null);
   const signalChatListenersRef = useRef<Set<(event: SignalChatWsEvent) => void>>(new Set());
@@ -195,13 +211,6 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       // ignore
     }
   }, [theme]);
-
-  // Keep cached user profile aligned after initial auth check resolves
-  useEffect(() => {
-    if (!authLoading) {
-      setCachedUser(user);
-    }
-  }, [user, authLoading]);
 
   const toggleTheme = useCallback(() => {
     setTheme((t) => (t === 'dark' ? 'light' : 'dark'));
@@ -306,90 +315,122 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     }
   }, []);
 
-  const clearLocalSessionState = useCallback(() => {
-    setStoredToken(null);
-    setCachedUser(null);
-    try {
-      localStorage.removeItem('mfx_token');
-    } catch {
-      // ignore
+  const refreshAll = useCallback(async () => {
+    await refreshPublicData();
+  }, [refreshPublicData]);
+
+  const clearProactiveRefreshTimer = useCallback(() => {
+    if (proactiveRefreshTimer.current) {
+      clearTimeout(proactiveRefreshTimer.current);
+      proactiveRefreshTimer.current = null;
     }
+  }, []);
+
+  const clearLocalSessionState = useCallback(() => {
+    clearProactiveRefreshTimer();
+    clearAccessToken();
     setUser(null);
     setResumeState(null);
     setNotifications([]);
     setUnreadCount(0);
     syncAppBadge(0);
-  }, [syncAppBadge]);
+  }, [clearProactiveRefreshTimer, syncAppBadge]);
 
-  const initializeAuth = useCallback(
-    async (force = false) => {
-      const epoch = authEpochRef.current;
-      if (
-        !force &&
-        initInFlightRef.current &&
-        initInFlightRef.current.epoch === epoch
-      ) {
-        return initInFlightRef.current.promise;
-      }
+  const scheduleProactiveRefreshRef = useRef<(expiresInSec: number) => void>(() => undefined);
 
-      const run = (async () => {
-        try {
-          const meRes = await apiFetch<{ user: User | null; session_token?: string }>('/api/auth/me');
-          if (authEpochRef.current !== epoch) return;
+  const performSessionRefresh = useCallback(async (): Promise<string | null> => {
+    const epoch = authEpochRef.current;
+    if (refreshInFlightRef.current && refreshInFlightRef.current.epoch === epoch) {
+      return refreshInFlightRef.current.promise;
+    }
 
-          lastAuthSyncAtRef.current = Date.now();
-          if (meRes.user) {
-            if (meRes.session_token) {
-              setStoredToken(meRes.session_token);
-            }
-            setUser(meRes.user);
-            setCachedUser(meRes.user);
-            await refreshNotifications();
-          } else {
-            clearLocalSessionState();
-          }
-        } catch {
-          // Network or transient server error: preserve cached user if token still exists
-          if (authEpochRef.current === epoch) {
-            const cached = getStoredToken() ? getCachedUser() : null;
-            if (cached) {
-              setUser(cached);
-            }
-          }
-        } finally {
-          if (initInFlightRef.current?.epoch === epoch) {
-            initInFlightRef.current = null;
-          }
-          if (authEpochRef.current === epoch) {
-            setAuthLoading(false);
-          }
+    const run = (async (): Promise<string | null> => {
+      try {
+        const res = await fetch('/api/auth/refresh', {
+          method: 'POST',
+          credentials: 'include',
+          cache: 'no-store',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Requested-With': 'MeridianFX',
+          },
+        });
+
+        if (authEpochRef.current !== epoch) {
+          return getAccessToken();
         }
-      })();
 
-      initInFlightRef.current = { epoch, promise: run };
-      return run;
-    },
-    [refreshNotifications, clearLocalSessionState]
-  );
+        if (!res.ok) {
+          clearLocalSessionState();
+          return null;
+        }
 
-  const refreshAll = useCallback(async () => {
-    await refreshPublicData();
-  }, [refreshPublicData]);
+        const data = (await res.json()) as {
+          user?: User;
+          access_token?: string;
+          expires_in?: number;
+        };
+
+        if (!data.user || !data.access_token) {
+          clearLocalSessionState();
+          return null;
+        }
+
+        const expiresIn = typeof data.expires_in === 'number' ? data.expires_in : 900;
+        setAccessToken(data.access_token, expiresIn);
+        setUser(data.user);
+        scheduleProactiveRefreshRef.current(expiresIn);
+        refreshNotifications().catch(() => undefined);
+        return data.access_token;
+      } catch {
+        // Transient offline failure: keep current in-memory state until connectivity returns
+        return getAccessToken();
+      } finally {
+        if (refreshInFlightRef.current?.epoch === epoch) {
+          refreshInFlightRef.current = null;
+        }
+        if (authEpochRef.current === epoch) {
+          setAuthLoading(false);
+        }
+      }
+    })();
+
+    refreshInFlightRef.current = { epoch, promise: run };
+    return run;
+  }, [clearLocalSessionState, refreshNotifications]);
 
   useEffect(() => {
-    initializeAuth();
+    scheduleProactiveRefreshRef.current = (expiresInSec: number) => {
+      clearProactiveRefreshTimer();
+      // Renew 2 minutes before short-lived access token expires (minimum 30s delay)
+      const delayMs = Math.max(30_000, expiresInSec * 1000 - 120_000);
+      proactiveRefreshTimer.current = window.setTimeout(() => {
+        performSessionRefresh().catch(() => undefined);
+      }, delayMs);
+    };
+  }, [clearProactiveRefreshTimer, performSessionRefresh]);
+
+  // Register automatic 401 refresh handler & boot session from HttpOnly refresh cookie
+  useEffect(() => {
+    setAuthRefreshHandler(performSessionRefresh);
+    performSessionRefresh();
     refreshPublicData();
     syncExistingPushSubscriptionIfGranted().catch(() => undefined);
-  }, [initializeAuth, refreshPublicData]);
 
-  // Keep already-granted push subscription synced when auth user changes
+    return () => {
+      setAuthRefreshHandler(null);
+      clearProactiveRefreshTimer();
+    };
+  }, [performSessionRefresh, refreshPublicData, clearProactiveRefreshTimer]);
+
+  // Keep push subscription tied to current user state
   useEffect(() => {
     if (!authLoading) {
       syncExistingPushSubscriptionIfGranted().catch(() => undefined);
     }
   }, [user?.id, authLoading]);
 
-  // Listen for Service Worker notification clicks & PWA install to encourage notifications
+  // Listen for Service Worker notification clicks & PWA install prompt triggers
   useEffect(() => {
     const promptKey = 'mfx_post_install_notif_prompted_v1';
 
@@ -440,7 +481,7 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     };
   }, [navigate]);
 
-  // Synchronize auth state across open browser tabs, focus return, and 401 checks without redirect loops
+  // Cross-tab BroadcastChannel sync, tab visibility renewal, and expired-session cleanup
   useEffect(() => {
     if (typeof BroadcastChannel !== 'undefined') {
       try {
@@ -450,11 +491,13 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
           const msg = evt.data as { type?: string } | undefined;
           if (msg?.type === 'logout') {
             authEpochRef.current += 1;
-            initInFlightRef.current = null;
+            refreshInFlightRef.current = null;
             clearLocalSessionState();
             setAuthLoading(false);
           } else if (msg?.type === 'login') {
-            initializeAuth(true);
+            authEpochRef.current += 1;
+            refreshInFlightRef.current = null;
+            performSessionRefresh().catch(() => undefined);
           }
         };
       } catch {
@@ -462,43 +505,30 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       }
     }
 
-    const onStorage = (e: StorageEvent) => {
-      if (e.key !== TOKEN_KEY || e.newValue === e.oldValue) return;
-      if (!e.newValue) {
-        authEpochRef.current += 1;
-        initInFlightRef.current = null;
-        clearLocalSessionState();
-        setAuthLoading(false);
-      } else {
-        initializeAuth(true);
-      }
-    };
-
     const onVisibleOrFocus = () => {
       if (document.visibilityState === 'hidden') return;
-      if (Date.now() - lastAuthSyncAtRef.current < 30_000) return;
-      if (getStoredToken() || user) {
-        initializeAuth();
+      if (user && getAccessTokenRemainingMs() < 3 * 60_000) {
+        performSessionRefresh().catch(() => undefined);
       }
     };
 
-    const onUnauthorized = () => {
-      initializeAuth(true);
+    const onExpired = () => {
+      if (user) {
+        clearLocalSessionState();
+      }
     };
 
-    window.addEventListener('storage', onStorage);
     window.addEventListener('focus', onVisibleOrFocus);
     document.addEventListener('visibilitychange', onVisibleOrFocus);
-    window.addEventListener('mfx:auth-401', onUnauthorized);
+    window.addEventListener('mfx:auth-expired', onExpired);
     return () => {
-      window.removeEventListener('storage', onStorage);
       window.removeEventListener('focus', onVisibleOrFocus);
       document.removeEventListener('visibilitychange', onVisibleOrFocus);
-      window.removeEventListener('mfx:auth-401', onUnauthorized);
+      window.removeEventListener('mfx:auth-expired', onExpired);
       authChannelRef.current?.close();
       authChannelRef.current = null;
     };
-  }, [initializeAuth, clearLocalSessionState, user]);
+  }, [user, clearLocalSessionState, performSessionRefresh]);
 
   // Real-Time WebSocket Sync with auto-reconnect (never resets auth state)
   useEffect(() => {
@@ -656,18 +686,25 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     };
   }, [refreshPublicData, refreshNotifications, emitSignalChatEvent, emitPushJobEvent]);
 
-  const login = async (email: string, password: string): Promise<User> => {
+  const login = async (email: string, password: string, rememberMe = true): Promise<User> => {
     authEpochRef.current += 1;
-    initInFlightRef.current = null;
-    const res = await apiFetch<{ user: User; token: string }>('/api/auth/login', {
-      method: 'POST',
-      body: JSON.stringify({ email: email.trim().toLowerCase(), password }),
-    });
-    lastAuthSyncAtRef.current = Date.now();
-    setStoredToken(res.token);
-    setCachedUser(res.user);
+    refreshInFlightRef.current = null;
+    const res = await apiFetch<{ user: User; access_token: string; expires_in?: number }>(
+      '/api/auth/login',
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          email: email.trim().toLowerCase(),
+          password,
+          remember_me: rememberMe,
+        }),
+      }
+    );
+    const expiresIn = typeof res.expires_in === 'number' ? res.expires_in : 900;
+    setAccessToken(res.access_token, expiresIn);
     setUser(res.user);
     setAuthLoading(false);
+    scheduleProactiveRefreshRef.current(expiresIn);
     try {
       authChannelRef.current?.postMessage({ type: 'login' });
     } catch {
@@ -677,34 +714,44 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     return res.user;
   };
 
-  const register = async (name: string, email: string, password: string) => {
+  const register = async (payload: RegisterPayload): Promise<RegisterResult> => {
     authEpochRef.current += 1;
-    initInFlightRef.current = null;
+    refreshInFlightRef.current = null;
     const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
-    const res = await apiFetch<{ user: User; token: string; verification_code?: string }>(
-      '/api/auth/register',
-      {
-        method: 'POST',
-        body: JSON.stringify({
-          name: name.trim(),
-          email: email.trim().toLowerCase(),
-          password,
-          timezone,
-        }),
-      }
-    );
-    lastAuthSyncAtRef.current = Date.now();
-    setStoredToken(res.token);
-    setCachedUser(res.user);
+    const res = await apiFetch<{
+      user: User;
+      access_token: string;
+      expires_in?: number;
+      verification_code?: string;
+      verification_url?: string;
+    }>('/api/auth/register', {
+      method: 'POST',
+      body: JSON.stringify({
+        name: payload.name.trim(),
+        email: payload.email.trim().toLowerCase(),
+        password: payload.password,
+        confirm_password: payload.confirmPassword,
+        accept_terms: payload.acceptTerms,
+        remember_me: payload.rememberMe !== false,
+        timezone,
+      }),
+    });
+    const expiresIn = typeof res.expires_in === 'number' ? res.expires_in : 900;
+    setAccessToken(res.access_token, expiresIn);
     setUser(res.user);
     setAuthLoading(false);
+    scheduleProactiveRefreshRef.current(expiresIn);
     try {
       authChannelRef.current?.postMessage({ type: 'login' });
     } catch {
       // ignore
     }
     await Promise.all([refreshPublicData(), refreshNotifications()]);
-    return { user: res.user, verification_code: res.verification_code };
+    return {
+      user: res.user,
+      verification_code: res.verification_code,
+      verification_url: res.verification_url,
+    };
   };
 
   const logout = async () => {
@@ -712,10 +759,9 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     isLoggingOutRef.current = true;
     try {
       authEpochRef.current += 1;
-      initInFlightRef.current = null;
-      const currentToken = getStoredToken();
+      refreshInFlightRef.current = null;
+      const currentToken = getAccessToken();
 
-      // Clear local session state immediately so UI never exposes protected pages
       clearLocalSessionState();
       setAuthLoading(false);
 
@@ -734,13 +780,27 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
           'X-Requested-With': 'MeridianFX',
           ...(currentToken ? { Authorization: `Bearer ${currentToken}` } : {}),
         },
-        body: JSON.stringify(currentToken ? { token: currentToken } : {}),
+        body: '{}',
       }).catch(() => undefined);
 
       navigate('/login');
     } finally {
       isLoggingOutRef.current = false;
     }
+  };
+
+  const logoutAllSessions = async () => {
+    authEpochRef.current += 1;
+    refreshInFlightRef.current = null;
+    await apiFetch('/api/auth/logout-all', { method: 'POST' }).catch(() => undefined);
+    clearLocalSessionState();
+    setAuthLoading(false);
+    try {
+      authChannelRef.current?.postMessage({ type: 'logout' });
+    } catch {
+      // ignore
+    }
+    navigate('/login');
   };
 
   return (
@@ -765,6 +825,7 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         login,
         register,
         logout,
+        logoutAllSessions,
         setUser,
         refreshAll,
         refreshNotifications,

@@ -10,7 +10,7 @@ import {
   UserCheck,
   Users,
 } from 'lucide-react';
-import { formatLocalDateTime, getOrCreateVisitorId, getStoredToken } from '../../lib/api';
+import { formatLocalDateTime, getAccessToken, getOrCreateVisitorId } from '../../lib/api';
 import type { RegistrationAnalyticsPayload } from '../../types';
 
 interface AdminRegistrationsPanelProps {
@@ -62,7 +62,7 @@ export const AdminRegistrationsPanel: React.FC<AdminRegistrationsPanelProps> = (
   const handleExportCsv = async () => {
     setExporting(true);
     try {
-      const token = getStoredToken();
+      const token = getAccessToken();
       const headers = new Headers({
         'X-Visitor-Id': getOrCreateVisitorId(),
       });
