@@ -15,7 +15,6 @@ import { apiFetch } from '../lib/api';
 
 const AUTH_ROUTE_PATHS = new Set([
   '/login',
-  '/register',
   '/forgot-password',
   '/reset-password',
 ]);
@@ -71,7 +70,7 @@ const AuthBrandHeader: React.FC<{ title: string; subtitle: string }> = ({ title,
 
 export const LoginPage: React.FC = () => {
   const { user, authLoading, login, logout, navigate } = usePlatform();
-  const [email, setEmail] = useState('');
+  const [identifier, setIdentifier] = useState('');
   const [password, setPassword] = useState('');
   const [rememberMe, setRememberMe] = useState(true);
   const [showPassword, setShowPassword] = useState(false);
@@ -101,7 +100,7 @@ export const LoginPage: React.FC = () => {
               onClick={() => navigate(user.role === 'admin' ? '/admin' : '/dashboard')}
               className="w-full rounded-lg bg-[#881337] py-2.5 text-sm font-semibold text-white hover:bg-[#6B0F2B] min-h-[44px]"
             >
-              {user.role === 'admin' ? 'Open Admin Desk' : 'Open Dashboard'}
+              {user.role === 'admin' ? 'Open Admin Desk' : 'Open Member Dashboard'}
             </button>
             <button
               type="button"
@@ -115,7 +114,7 @@ export const LoginPage: React.FC = () => {
               onClick={() => logout()}
               className="text-xs font-medium text-slate-500 hover:text-red-600 py-2 min-h-[36px]"
             >
-              Sign Out & Switch Account
+              Sign Out &amp; Switch Account
             </button>
           </div>
         </div>
@@ -127,20 +126,20 @@ export const LoginPage: React.FC = () => {
     e.preventDefault();
     if (loading) return;
 
-    const cleanEmail = email.trim().toLowerCase();
-    if (!cleanEmail || !password) {
-      setError('Please enter both your email address and password.');
+    const cleanIdentifier = identifier.trim();
+    if (!cleanIdentifier || !password) {
+      setError('Please enter your email or username and password.');
       return;
     }
 
     setLoading(true);
     setError(null);
     try {
-      const loggedUser = await login(cleanEmail, password, rememberMe);
+      const loggedUser = await login(cleanIdentifier, password, rememberMe);
       if (redirectTarget && (redirectTarget !== '/admin' || loggedUser.role === 'admin')) {
         navigate(redirectTarget);
       } else {
-        navigate(loggedUser.role === 'admin' ? '/signals' : '/dashboard');
+        navigate(loggedUser.role === 'admin' ? '/admin' : '/dashboard');
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unable to sign in. Please check your credentials.');
@@ -154,13 +153,13 @@ export const LoginPage: React.FC = () => {
       <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-6 sm:p-8 shadow-xs">
         <AuthBrandHeader
           title="Sign In to MeridianFX"
-          subtitle="Access live trading signals, saved Academy progress, and synced device alerts."
+          subtitle="Secure sign in for MeridianFX administrators and approved premium members."
         />
 
         {resetSuccess && (
           <div className="mb-4 flex items-center gap-2 rounded-lg border border-emerald-200 dark:border-emerald-800/60 bg-emerald-50 dark:bg-emerald-950/25 px-3 py-2.5 text-xs font-medium text-[#15803D] dark:text-emerald-400">
             <CheckCircle2 className="w-4 h-4 shrink-0" />
-            <span>Password updated. Sign in below with your new password.</span>
+            <span>Password updated. Sign in below with your credentials.</span>
           </div>
         )}
 
@@ -173,19 +172,19 @@ export const LoginPage: React.FC = () => {
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>
             <label
-              htmlFor="login-email"
+              htmlFor="login-identifier"
               className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5"
             >
-              Email Address
+              Email or Username
             </label>
             <input
-              id="login-email"
-              type="email"
+              id="login-identifier"
+              type="text"
               required
-              autoComplete="email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              placeholder="you@domain.com"
+              autoComplete="username"
+              value={identifier}
+              onChange={(e) => setIdentifier(e.target.value)}
+              placeholder="username or you@domain.com"
               className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3.5 py-2.5 text-base sm:text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-[#881337]"
             />
           </div>
@@ -258,336 +257,13 @@ export const LoginPage: React.FC = () => {
         </form>
 
         <p className="mt-6 pt-5 border-t border-slate-100 dark:border-slate-800 text-center text-xs text-slate-500 dark:text-slate-400">
-          New to MeridianFX?{' '}
+          Interested in premium access?{' '}
           <button
             type="button"
-            onClick={() =>
-              navigate(
-                redirectTarget
-                  ? `/register?redirect=${encodeURIComponent(redirectTarget)}`
-                  : '/register'
-              )
-            }
+            onClick={() => navigate('/profile')}
             className="font-semibold text-[#881337] dark:text-rose-400 hover:underline"
           >
-            Create Account
-          </button>
-        </p>
-      </div>
-    </div>
-  );
-};
-
-export const RegisterPage: React.FC = () => {
-  const { user, authLoading, register, logout, navigate } = usePlatform();
-  const [name, setName] = useState('');
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
-  const [confirmPassword, setConfirmPassword] = useState('');
-  const [acceptTerms, setAcceptTerms] = useState(false);
-  const [rememberMe, setRememberMe] = useState(true);
-  const [showPassword, setShowPassword] = useState(false);
-  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const redirectTarget = getSafeRedirectTarget();
-  const checks = getPasswordChecks(password);
-  const passwordsMatch = confirmPassword.length > 0 && password === confirmPassword;
-
-  if (!authLoading && user) {
-    return (
-      <div className="mx-auto max-w-md py-10 px-1">
-        <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-6 sm:p-8 space-y-4 text-center">
-          <CheckCircle2 className="w-10 h-10 text-[#15803D] dark:text-emerald-400 mx-auto" />
-          <div>
-            <h1 className="text-xl font-bold text-slate-900 dark:text-white">Account Active</h1>
-            <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
-              You are signed in as{' '}
-              <span className="font-semibold text-slate-800 dark:text-slate-200">{user.name}</span>.
-            </p>
-          </div>
-          <div className="flex flex-col gap-2.5 pt-2">
-            <button
-              type="button"
-              onClick={() => navigate('/dashboard')}
-              className="w-full rounded-lg bg-[#881337] py-2.5 text-sm font-semibold text-white hover:bg-[#6B0F2B] min-h-[44px]"
-            >
-              Open Dashboard
-            </button>
-            <button
-              type="button"
-              onClick={() => navigate('/signals')}
-              className="w-full rounded-lg border border-slate-300 dark:border-slate-700 py-2.5 text-sm font-medium text-slate-800 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 min-h-[44px]"
-            >
-              Open Signals Channel
-            </button>
-            <button
-              type="button"
-              onClick={() => logout()}
-              className="text-xs font-medium text-slate-500 hover:text-red-600 py-2 min-h-[36px]"
-            >
-              Sign Out to Register Another Account
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (loading) return;
-    setError(null);
-
-    if (name.trim().length < 2) {
-      setError('Full name must be at least 2 characters.');
-      return;
-    }
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
-      setError('Please enter a valid email address.');
-      return;
-    }
-    if (!isStrongPassword(password)) {
-      setError('Password must be at least 8 characters and include a letter and a number.');
-      return;
-    }
-    if (password !== confirmPassword) {
-      setError('Passwords do not match.');
-      return;
-    }
-    if (!acceptTerms) {
-      setError('Please accept the Terms and Conditions to create your account.');
-      return;
-    }
-
-    setLoading(true);
-    try {
-      const res = await register({
-        name: name.trim(),
-        email: email.trim().toLowerCase(),
-        password,
-        confirmPassword,
-        acceptTerms,
-        rememberMe,
-      });
-
-      if (redirectTarget && redirectTarget !== '/admin') {
-        navigate(redirectTarget);
-        return;
-      }
-
-      if (res.verification_code) {
-        const nextUrl =
-          `/verify-email?email=${encodeURIComponent(res.user.email)}` +
-          `&code=${encodeURIComponent(res.verification_code)}` +
-          `&welcome=1`;
-        navigate(nextUrl);
-      } else {
-        navigate('/dashboard');
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unable to create account.');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  return (
-    <div className="mx-auto max-w-md py-8 sm:py-10 px-1">
-      <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-6 sm:p-8 shadow-xs">
-        <AuthBrandHeader
-          title="Create MeridianFX Account"
-          subtitle="Track Academy courses, save watchlists, and keep alerts synchronized across devices."
-        />
-
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <div>
-            <label
-              htmlFor="register-name"
-              className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5"
-            >
-              Full Name
-            </label>
-            <input
-              id="register-name"
-              type="text"
-              required
-              minLength={2}
-              autoComplete="name"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="Jordan Vance"
-              className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3.5 py-2.5 text-base sm:text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-[#881337]"
-            />
-          </div>
-
-          <div>
-            <label
-              htmlFor="register-email"
-              className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5"
-            >
-              Email Address
-            </label>
-            <input
-              id="register-email"
-              type="email"
-              required
-              autoComplete="email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              placeholder="jordan@domain.com"
-              className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3.5 py-2.5 text-base sm:text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-[#881337]"
-            />
-          </div>
-
-          <div>
-            <label
-              htmlFor="register-password"
-              className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5"
-            >
-              Password
-            </label>
-            <div className="relative">
-              <input
-                id="register-password"
-                type={showPassword ? 'text' : 'password'}
-                required
-                minLength={8}
-                autoComplete="new-password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="At least 8 chars, letter & number"
-                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 pl-3.5 pr-11 py-2.5 text-base sm:text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-[#881337]"
-              />
-              <button
-                type="button"
-                onClick={() => setShowPassword((v) => !v)}
-                aria-label={showPassword ? 'Hide password' : 'Show password'}
-                className="absolute right-2 top-1/2 -translate-y-1/2 p-2 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
-              >
-                {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-              </button>
-            </div>
-            <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[11px]">
-              <span
-                className={`inline-flex items-center gap-1 ${
-                  checks.minLength ? 'text-[#15803D] dark:text-emerald-400 font-medium' : 'text-slate-400'
-                }`}
-              >
-                <Check className="w-3 h-3" /> 8+ characters
-              </span>
-              <span
-                className={`inline-flex items-center gap-1 ${
-                  checks.hasLetter ? 'text-[#15803D] dark:text-emerald-400 font-medium' : 'text-slate-400'
-                }`}
-              >
-                <Check className="w-3 h-3" /> Letter
-              </span>
-              <span
-                className={`inline-flex items-center gap-1 ${
-                  checks.hasNumber ? 'text-[#15803D] dark:text-emerald-400 font-medium' : 'text-slate-400'
-                }`}
-              >
-                <Check className="w-3 h-3" /> Number
-              </span>
-            </div>
-          </div>
-
-          <div>
-            <label
-              htmlFor="register-confirm-password"
-              className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5"
-            >
-              Confirm Password
-            </label>
-            <div className="relative">
-              <input
-                id="register-confirm-password"
-                type={showConfirmPassword ? 'text' : 'password'}
-                required
-                minLength={8}
-                autoComplete="new-password"
-                value={confirmPassword}
-                onChange={(e) => setConfirmPassword(e.target.value)}
-                placeholder="Re-enter your password"
-                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 pl-3.5 pr-11 py-2.5 text-base sm:text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-[#881337]"
-              />
-              <button
-                type="button"
-                onClick={() => setShowConfirmPassword((v) => !v)}
-                aria-label={showConfirmPassword ? 'Hide confirm password' : 'Show confirm password'}
-                className="absolute right-2 top-1/2 -translate-y-1/2 p-2 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
-              >
-                {showConfirmPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-              </button>
-            </div>
-            {confirmPassword.length > 0 && !passwordsMatch && (
-              <p className="mt-1 text-[11px] font-medium text-rose-600 dark:text-rose-400">
-                Passwords do not match yet.
-              </p>
-            )}
-          </div>
-
-          <div className="space-y-2.5 pt-1">
-            <label className="flex items-start gap-2.5 text-xs text-slate-600 dark:text-slate-300 cursor-pointer select-none">
-              <input
-                type="checkbox"
-                checked={acceptTerms}
-                onChange={(e) => setAcceptTerms(e.target.checked)}
-                className="mt-0.5 h-4 w-4 rounded accent-[#881337] shrink-0"
-              />
-              <span>
-                I accept the MeridianFX{' '}
-                <button
-                  type="button"
-                  onClick={() => navigate('/legal')}
-                  className="font-semibold text-[#881337] dark:text-rose-400 hover:underline"
-                >
-                  Terms &amp; Conditions and Risk Disclosure
-                </button>
-                .
-              </span>
-            </label>
-
-            <label className="flex items-center gap-2.5 text-xs text-slate-600 dark:text-slate-300 cursor-pointer select-none">
-              <input
-                type="checkbox"
-                checked={rememberMe}
-                onChange={(e) => setRememberMe(e.target.checked)}
-                className="h-4 w-4 rounded accent-[#881337] shrink-0"
-              />
-              <span>Keep me signed in on this device (30 days)</span>
-            </label>
-          </div>
-
-          {error && (
-            <div
-              role="alert"
-              className="flex items-center gap-2 rounded-lg bg-rose-50 border border-rose-200 dark:bg-red-500/10 dark:border-red-500/30 px-3 py-2.5 text-xs font-medium text-[#9F1239] dark:text-red-400"
-            >
-              <ShieldAlert className="w-4 h-4 shrink-0" />
-              <span>{error}</span>
-            </div>
-          )}
-
-          <button
-            type="submit"
-            disabled={loading}
-            className="w-full rounded-lg bg-[#881337] py-2.5 text-sm font-semibold text-white hover:bg-[#6B0F2B] disabled:opacity-60 transition-colors min-h-[44px]"
-          >
-            {loading ? 'Creating Account...' : 'Create Account'}
-          </button>
-        </form>
-
-        <p className="mt-6 pt-5 border-t border-slate-100 dark:border-slate-800 text-center text-xs text-slate-500 dark:text-slate-400">
-          Already have an account?{' '}
-          <button
-            type="button"
-            onClick={() => navigate('/login')}
-            className="font-semibold text-[#881337] dark:text-rose-400 hover:underline"
-          >
-            Sign In
+            Apply for Premium Membership
           </button>
         </p>
       </div>
@@ -778,148 +454,51 @@ export const VerifyEmailPage: React.FC = () => {
 };
 
 export const ForgotPasswordPage: React.FC = () => {
-  const { navigate } = usePlatform();
-  const [email, setEmail] = useState('');
-  const [issuedReset, setIssuedReset] = useState<{
-    message: string;
-    resetUrl?: string;
-    resetCode?: string;
-  } | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
-
-  const handleRequest = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (loading) return;
-    setLoading(true);
-    setError(null);
-    setIssuedReset(null);
-    try {
-      const res = await apiFetch<{
-        message: string;
-        reset_code?: string;
-        reset_url?: string;
-      }>('/api/auth/forgot-password', {
-        method: 'POST',
-        body: JSON.stringify({ email: email.trim().toLowerCase() }),
-      });
-      setIssuedReset({
-        message: res.message,
-        resetUrl: res.reset_url,
-        resetCode: res.reset_code,
-      });
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unable to process reset request.');
-    } finally {
-      setLoading(false);
-    }
-  };
+  const { settings, navigate } = usePlatform();
 
   return (
     <div className="mx-auto max-w-md py-8 sm:py-12 px-1">
-      <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-6 sm:p-8 shadow-xs">
-        <div className="flex items-center gap-3 mb-2">
-          <KeyRound className="w-6 h-6 text-[#881337] dark:text-rose-400" />
-          <h1 className="text-xl font-bold text-slate-900 dark:text-white">Forgot Password</h1>
-        </div>
-        <p className="text-sm text-slate-500 dark:text-slate-400">
-          Enter your registered email address to request a password reset link.
-        </p>
-
-        {!issuedReset ? (
-          <form onSubmit={handleRequest} className="mt-6 space-y-4">
-            <div>
-              <label
-                htmlFor="forgot-email"
-                className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5"
-              >
-                Email Address
-              </label>
-              <input
-                id="forgot-email"
-                type="email"
-                required
-                autoComplete="email"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                placeholder="you@domain.com"
-                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3.5 py-2.5 text-base sm:text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-[#881337]"
-              />
-            </div>
-
-            {error && (
-              <div
-                role="alert"
-                className="flex items-center gap-2 rounded-lg bg-rose-50 border border-rose-200 dark:bg-red-500/10 dark:border-red-500/30 px-3 py-2 text-xs font-medium text-[#9F1239] dark:text-red-400"
-              >
-                <ShieldAlert className="w-4 h-4 shrink-0" />
-                <span>{error}</span>
-              </div>
-            )}
-
-            <button
-              type="submit"
-              disabled={loading}
-              className="w-full rounded-lg bg-[#881337] py-2.5 text-sm font-semibold text-white hover:bg-[#6B0F2B] disabled:opacity-60 min-h-[44px]"
-            >
-              {loading ? 'Generating Reset Link...' : 'Send Reset Link'}
-            </button>
-          </form>
-        ) : (
-          <div className="mt-6 space-y-4">
-            <div className="rounded-xl border border-emerald-200 dark:border-emerald-800/60 bg-emerald-50 dark:bg-emerald-950/20 p-4 space-y-2 text-xs text-slate-700 dark:text-slate-200">
-              <p className="font-semibold text-[#15803D] dark:text-emerald-400">
-                {issuedReset.message}
-              </p>
-              {issuedReset.resetCode && (
-                <p>
-                  6-Digit Recovery Code:{' '}
-                  <span className="font-mono font-bold text-slate-900 dark:text-white">
-                    {issuedReset.resetCode}
-                  </span>
-                </p>
-              )}
-            </div>
-
-            {issuedReset.resetUrl ? (
-              <button
-                type="button"
-                onClick={() => navigate(issuedReset.resetUrl!)}
-                className="w-full inline-flex items-center justify-center gap-2 rounded-lg bg-[#881337] py-2.5 text-sm font-semibold text-white hover:bg-[#6B0F2B] min-h-[44px]"
-              >
-                <span>Open Password Reset Page</span>
-                <ArrowRight className="w-4 h-4" />
-              </button>
-            ) : (
-              <button
-                type="button"
-                onClick={() => navigate(`/reset-password?email=${encodeURIComponent(email.trim())}`)}
-                className="w-full rounded-lg bg-[#881337] py-2.5 text-sm font-semibold text-white hover:bg-[#6B0F2B] min-h-[44px]"
-              >
-                Enter Recovery Code
-              </button>
-            )}
-
-            <button
-              type="button"
-              onClick={() => setIssuedReset(null)}
-              className="w-full rounded-lg border border-slate-300 dark:border-slate-700 py-2 text-xs font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 min-h-[40px]"
-            >
-              Try Another Email
-            </button>
+      <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-6 sm:p-8 shadow-xs space-y-5">
+        <div>
+          <div className="flex items-center gap-3 mb-2">
+            <KeyRound className="w-6 h-6 text-[#881337] dark:text-rose-400" />
+            <h1 className="text-xl font-bold text-slate-900 dark:text-white">
+              Password Reset Assistance
+            </h1>
           </div>
-        )}
+          <p className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
+            For account security, MeridianFX member passwords are reset exclusively by the platform administrator. Self-service password resets are disabled.
+          </p>
+        </div>
 
-        <p className="mt-6 pt-5 border-t border-slate-100 dark:border-slate-800 text-center text-xs text-slate-500 dark:text-slate-400">
-          Remembered your password?{' '}
+        <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-900/50 p-4 space-y-2 text-xs text-slate-600 dark:text-slate-300">
+          <p className="font-semibold text-slate-900 dark:text-white">How to recover access</p>
+          <p>
+            Contact the {settings.brand_name} administrator using our official desk email (
+            <span className="font-mono text-slate-800 dark:text-slate-200">
+              {settings.contact_email}
+            </span>
+            ) or via the Profile membership contact desk to receive a new temporary password.
+          </p>
+        </div>
+
+        <div className="flex flex-col gap-2.5">
+          <button
+            type="button"
+            onClick={() => navigate('/profile')}
+            className="w-full inline-flex items-center justify-center gap-2 rounded-lg bg-[#881337] py-2.5 text-sm font-semibold text-white hover:bg-[#6B0F2B] min-h-[44px]"
+          >
+            <span>Open Official Contact Desk</span>
+            <ArrowRight className="w-4 h-4" />
+          </button>
           <button
             type="button"
             onClick={() => navigate('/login')}
-            className="font-semibold text-[#881337] dark:text-rose-400 hover:underline"
+            className="w-full rounded-lg border border-slate-300 dark:border-slate-700 py-2.5 text-sm font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 min-h-[44px]"
           >
             Back to Sign In
           </button>
-        </p>
+        </div>
       </div>
     </div>
   );

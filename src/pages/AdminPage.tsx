@@ -11,7 +11,6 @@ import {
   MessageSquareText,
   Pin,
   Radio,
-  Search,
   Settings as SettingsIcon,
   ShieldAlert,
   Trash2,
@@ -22,6 +21,7 @@ import {
 import { usePlatform } from '../context/PlatformContext';
 import { apiFetch, formatLocalDateTime, uploadMediaFile } from '../lib/api';
 import { AdminAcademyManager } from '../components/admin/AdminAcademyManager';
+import { AdminMembersPanel } from '../components/admin/AdminMembersPanel';
 import { AdminRegistrationsPanel } from '../components/admin/AdminRegistrationsPanel';
 import { CheckCircle2, ExternalLink } from 'lucide-react';
 import { sendTestPushNotification } from '../lib/pushClient';
@@ -37,7 +37,6 @@ import type {
   SignalStatus,
   TradingSignal,
   User,
-  UserRole,
 } from '../types';
 
 type AdminTab =
@@ -138,6 +137,7 @@ export const AdminPage: React.FC = () => {
     analysis: '',
     chart_image_url: '',
     admin_remarks: '',
+    is_premium: false,
     send_push: true,
   });
   const [followUpSignalId, setFollowUpSignalId] = useState<string | null>(null);
@@ -150,6 +150,7 @@ export const AdminPage: React.FC = () => {
     content: '',
     category: 'Forex Update' as MarketUpdateCategory,
     pinned: false,
+    is_premium: false,
     image_url: '',
     video_url: '',
     attachment_url: '',
@@ -184,19 +185,8 @@ export const AdminPage: React.FC = () => {
   } | null>(null);
   const [testingAdminPush, setTestingAdminPush] = useState(false);
 
-  // User search
-  const [userSearch, setUserSearch] = useState('');
-
   // Platform Settings State
   const [settingsForm, setSettingsForm] = useState<PlatformSettings>(settings);
-
-  // Admin Credential Rotation State
-  const [adminCredForm, setAdminCredForm] = useState({
-    current_password: '',
-    new_password: '',
-    confirm_password: '',
-  });
-  const [rotatingPassword, setRotatingPassword] = useState(false);
 
   useEffect(() => {
     setSettingsForm(settings);
@@ -379,6 +369,7 @@ export const AdminPage: React.FC = () => {
         analysis: '',
         chart_image_url: '',
         admin_remarks: '',
+        is_premium: false,
         send_push: true,
       });
       await Promise.all([refreshAll(), loadAdminData()]);
@@ -464,6 +455,7 @@ export const AdminPage: React.FC = () => {
         content: '',
         category: 'Forex Update',
         pinned: false,
+        is_premium: false,
         image_url: '',
         video_url: '',
         attachment_url: '',
@@ -568,23 +560,7 @@ export const AdminPage: React.FC = () => {
     }
   };
 
-  // --- User & Settings Handlers ---
-  const handleUpdateUser = async (
-    targetId: string,
-    patch: { role?: UserRole; status?: 'active' | 'suspended' }
-  ) => {
-    try {
-      await apiFetch(`/api/admin/users/${targetId}`, {
-        method: 'PATCH',
-        body: JSON.stringify(patch),
-      });
-      notifyOk('User permissions updated.');
-      await loadAdminData();
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : 'Update failed.');
-    }
-  };
-
+  // --- Moderation & Settings Handlers ---
   const handleReportAction = async (id: string, action: 'hide_post' | 'dismiss') => {
     await apiFetch(`/api/admin/reports/${id}`, {
       method: 'PATCH',
@@ -617,44 +593,14 @@ export const AdminPage: React.FC = () => {
     await loadAdminData();
   };
 
-  const handleRotateAdminPassword = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (adminCredForm.new_password !== adminCredForm.confirm_password) {
-      setErrorMsg('New password and confirmation do not match.');
-      return;
-    }
-    setRotatingPassword(true);
-    try {
-      await apiFetch('/api/users/password', {
-        method: 'PATCH',
-        body: JSON.stringify({
-          current_password: adminCredForm.current_password,
-          new_password: adminCredForm.new_password,
-        }),
-      });
-      setAdminCredForm({ current_password: '', new_password: '', confirm_password: '' });
-      notifyOk('Administrator password updated securely.');
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : 'Unable to rotate administrator password.');
-    } finally {
-      setRotatingPassword(false);
-    }
-  };
-
-  const filteredUsers = usersList.filter(
-    (u) =>
-      u.name.toLowerCase().includes(userSearch.toLowerCase()) ||
-      u.email.toLowerCase().includes(userSearch.toLowerCase())
-  );
-
   const tabs: Array<{ key: AdminTab; label: string; icon: React.ComponentType<{ className?: string }> }> = [
     { key: 'overview', label: 'Overview', icon: LayoutDashboard },
-    { key: 'registrations', label: 'Registrations', icon: BarChart3 },
+    { key: 'users', label: 'Members', icon: Users },
+    { key: 'registrations', label: 'Member Analytics', icon: BarChart3 },
     { key: 'signals', label: 'Signals', icon: TrendingUp },
     { key: 'updates', label: 'Updates', icon: Radio },
     { key: 'notifications', label: 'Push Alerts', icon: Bell },
     { key: 'academy', label: 'Academy', icon: BookOpen },
-    { key: 'users', label: 'Users & Mod', icon: Users },
     { key: 'settings', label: 'Settings', icon: SettingsIcon },
   ];
 
@@ -759,12 +705,12 @@ export const AdminPage: React.FC = () => {
         <div className="space-y-6">
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
             <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-4">
-              <p className="text-xs text-slate-500">Total Users</p>
+              <p className="text-xs text-slate-500">Members &amp; Admin</p>
               <p className="mt-1 text-2xl font-bold font-mono tabular-nums text-slate-900 dark:text-white">
                 {overview.stats.total_users}
               </p>
               <p className="text-[11px] text-slate-500">
-                +{overview.stats.new_registrations_7d} in last 7d
+                +{overview.stats.new_registrations_7d} added in last 7d
               </p>
             </div>
             <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-4">
@@ -1029,7 +975,7 @@ export const AdminPage: React.FC = () => {
               className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs"
             />
 
-            <div className="flex items-center justify-between gap-2 text-xs">
+            <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
               <label className="inline-flex items-center gap-2 cursor-pointer rounded-lg border border-slate-300 dark:border-slate-700 px-3 py-1.5">
                 <Upload className="w-3.5 h-3.5" />
                 <span>{sigForm.chart_image_url ? 'Chart Attached' : 'Upload Chart Image'}</span>
@@ -1045,15 +991,26 @@ export const AdminPage: React.FC = () => {
                 />
               </label>
 
-              <label className="inline-flex items-center gap-2">
-                <input
-                  type="checkbox"
-                  checked={sigForm.send_push}
-                  onChange={(e) => setSigForm({ ...sigForm, send_push: e.target.checked })}
-                  className="accent-[#881337]"
-                />
-                <span>Send Push Alert</span>
-              </label>
+              <div className="flex flex-wrap items-center gap-4">
+                <label className="inline-flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={sigForm.is_premium}
+                    onChange={(e) => setSigForm({ ...sigForm, is_premium: e.target.checked })}
+                    className="accent-[#881337]"
+                  />
+                  <span>Premium Members Only</span>
+                </label>
+                <label className="inline-flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={sigForm.send_push}
+                    onChange={(e) => setSigForm({ ...sigForm, send_push: e.target.checked })}
+                    className="accent-[#881337]"
+                  />
+                  <span>Send Push Alert</span>
+                </label>
+              </div>
             </div>
 
             <button
@@ -1123,6 +1080,7 @@ export const AdminPage: React.FC = () => {
                       </span>
                       <span className="text-xs text-slate-500">
                         · {sig.status} · {sig.timeframe}
+                        {sig.is_premium ? ' · Premium' : ''}
                       </span>
                     </div>
                     <p className="text-xs font-mono text-slate-500 mt-0.5 tabular-nums">
@@ -1175,6 +1133,7 @@ export const AdminPage: React.FC = () => {
                           analysis: sig.analysis,
                           chart_image_url: sig.chart_image_url || '',
                           admin_remarks: sig.admin_remarks || '',
+                          is_premium: Boolean(sig.is_premium),
                           send_push: true,
                         });
                       }}
@@ -1311,20 +1270,31 @@ export const AdminPage: React.FC = () => {
               </label>
             </div>
 
-            <div className="flex items-center justify-between text-xs">
+            <div className="flex flex-wrap items-center justify-between gap-3 text-xs">
               <label className="inline-flex items-center gap-2">
                 <input
                   type="checkbox"
                   checked={updForm.pinned}
                   onChange={(e) => setUpdForm({ ...updForm, pinned: e.target.checked })}
+                  className="accent-[#881337]"
                 />
                 <span>Pin to top</span>
               </label>
               <label className="inline-flex items-center gap-2">
                 <input
                   type="checkbox"
+                  checked={updForm.is_premium}
+                  onChange={(e) => setUpdForm({ ...updForm, is_premium: e.target.checked })}
+                  className="accent-[#881337]"
+                />
+                <span>Premium Members Only</span>
+              </label>
+              <label className="inline-flex items-center gap-2">
+                <input
+                  type="checkbox"
                   checked={updForm.send_push}
                   onChange={(e) => setUpdForm({ ...updForm, send_push: e.target.checked })}
+                  className="accent-[#881337]"
                 />
                 <span>Send Push Alert</span>
               </label>
@@ -1344,6 +1314,7 @@ export const AdminPage: React.FC = () => {
                 <div className="min-w-0">
                   <p className="text-xs text-slate-500">
                     {u.pinned ? 'Pinned · ' : ''}
+                    {u.is_premium ? 'Premium · ' : ''}
                     {!u.published ? 'Scheduled · ' : ''}
                     {u.category} · {formatLocalDateTime(u.created_at)}
                   </p>
@@ -1686,83 +1657,14 @@ export const AdminPage: React.FC = () => {
         />
       )}
 
-      {/* F. USER MANAGEMENT, REPORTS & CONTACTS */}
+      {/* F. PREMIUM MEMBERS MANAGEMENT, REPORTS & CONTACT INQUIRIES */}
       {tab === 'users' && (
         <div className="space-y-6">
-          <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5 space-y-4">
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <h2 className="text-base font-bold text-slate-900 dark:text-white">
-                Registered Users ({filteredUsers.length})
-              </h2>
-              <div className="relative w-64">
-                <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-                <input
-                  type="search"
-                  value={userSearch}
-                  onChange={(e) => setUserSearch(e.target.value)}
-                  placeholder="Search name or email..."
-                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 pl-9 pr-3 py-1.5 text-xs"
-                />
-              </div>
-            </div>
-
-            <div className="overflow-x-auto">
-              <table className="w-full text-left text-xs">
-                <thead>
-                  <tr className="border-b border-slate-200 dark:border-slate-800 text-slate-500">
-                    <th className="py-2 pr-4">Name</th>
-                    <th className="py-2 pr-4">Email</th>
-                    <th className="py-2 pr-4">Role</th>
-                    <th className="py-2 pr-4">Status</th>
-                    <th className="py-2 text-right">Controls</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                  {filteredUsers.map((u) => (
-                    <tr key={u.id}>
-                      <td className="py-2.5 pr-4 font-semibold">{u.name}</td>
-                      <td className="py-2.5 pr-4 text-slate-500">{u.email}</td>
-                      <td className="py-2.5 pr-4">
-                        <select
-                          value={u.role}
-                          onChange={(e) =>
-                            handleUpdateUser(u.id, { role: e.target.value as UserRole })
-                          }
-                          className="rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2 py-1 text-xs"
-                        >
-                          <option value="user">user</option>
-                          <option value="moderator">moderator</option>
-                          <option value="admin">admin</option>
-                        </select>
-                      </td>
-                      <td className="py-2.5 pr-4">
-                        <span
-                          className={
-                            u.status === 'active' ? 'text-emerald-500 font-semibold' : 'text-red-500 font-semibold'
-                          }
-                        >
-                          {u.status}
-                        </span>
-                      </td>
-                      <td className="py-2.5 text-right">
-                        <button
-                          type="button"
-                          onClick={() =>
-                            handleUpdateUser(u.id, {
-                              status: u.status === 'active' ? 'suspended' : 'active',
-                            })
-                          }
-                          className="rounded border border-slate-300 dark:border-slate-700 px-2.5 py-1 text-xs hover:bg-slate-100 dark:hover:bg-slate-800"
-                        >
-                          {u.status === 'active' ? 'Suspend' : 'Reactivate'}
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
+          <AdminMembersPanel
+            onNotify={notifyOk}
+            onError={setErrorMsg}
+            onGlobalRefresh={loadAdminData}
+          />
 
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
             <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5 space-y-3">
@@ -1802,7 +1704,7 @@ export const AdminPage: React.FC = () => {
 
             <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5 space-y-3">
               <h3 className="text-sm font-bold text-slate-900 dark:text-white">
-                Contact Desk Inquiries ({contacts.length})
+                Contact &amp; Membership Inquiries ({contacts.length})
               </h3>
               {contacts.map((c) => (
                 <div key={c.id} className="rounded-xl border border-slate-200 dark:border-slate-800 p-3 text-xs space-y-1">
@@ -1826,7 +1728,7 @@ export const AdminPage: React.FC = () => {
             className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-6 space-y-4"
           >
             <h2 className="text-base font-bold text-slate-900 dark:text-white">
-              Platform Branding, Content, SEO & Integrations
+              Platform Branding, Official Contact Details &amp; SEO
             </h2>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -1840,11 +1742,52 @@ export const AdminPage: React.FC = () => {
                 />
               </div>
               <div>
-                <label className="block text-xs font-medium mb-1">Contact Email</label>
+                <label className="block text-xs font-medium mb-1">Official Business Email</label>
                 <input
                   type="email"
                   value={settingsForm.contact_email}
                   onChange={(e) => setSettingsForm({ ...settingsForm, contact_email: e.target.value })}
+                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
+                />
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+              <div>
+                <label className="block text-xs font-medium mb-1">
+                  Official WhatsApp Number (optional)
+                </label>
+                <input
+                  type="text"
+                  placeholder="+447911123456 (blank hides WhatsApp button)"
+                  value={settingsForm.contact_whatsapp || ''}
+                  onChange={(e) =>
+                    setSettingsForm({ ...settingsForm, contact_whatsapp: e.target.value })
+                  }
+                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium mb-1">Official Phone Number</label>
+                <input
+                  type="text"
+                  placeholder="Optional support phone"
+                  value={settingsForm.contact_phone || ''}
+                  onChange={(e) =>
+                    setSettingsForm({ ...settingsForm, contact_phone: e.target.value })
+                  }
+                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium mb-1">Official Location / Desk</label>
+                <input
+                  type="text"
+                  placeholder="City / Desk hours"
+                  value={settingsForm.contact_address || ''}
+                  onChange={(e) =>
+                    setSettingsForm({ ...settingsForm, contact_address: e.target.value })
+                  }
                   className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
                 />
               </div>
@@ -1943,68 +1886,35 @@ export const AdminPage: React.FC = () => {
             </div>
           </form>
 
-          {/* Administrator Account & Credential Rotation */}
-          <form
-            onSubmit={handleRotateAdminPassword}
-            className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-6 space-y-4"
-          >
+          {/* Administrator Security Policy */}
+          <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-6 space-y-2">
             <div className="flex items-start gap-3">
               <KeyRound className="w-5 h-5 text-[#881337] dark:text-rose-400 shrink-0 mt-0.5" />
-              <div>
+              <div className="space-y-1">
                 <h2 className="text-base font-bold text-slate-900 dark:text-white">
-                  Administrator Account & Credential Rotation
+                  Administrator Account &amp; Access Policy
                 </h2>
-                <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                  Signed in as <span className="font-mono font-semibold text-slate-700 dark:text-slate-200">{user.email}</span> (Designated Admin: <span className="font-mono">markobare25@gmail.com</span>). Offline recovery can also use <span className="font-mono">ADMIN_RESET_KEY</span> on the Forgot Password page.
+                <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
+                  Signed in as{' '}
+                  <span className="font-mono font-semibold text-slate-900 dark:text-white">
+                    {user.email}
+                  </span>
+                  . Designated administrator credentials remain fixed and protected via server
+                  environment configuration (<span className="font-mono">ADMIN_PASSWORD</span> /{' '}
+                  <span className="font-mono">ADMIN_RESET_KEY</span>). Premium member accounts,
+                  usernames, expiry dates, and temporary password resets are managed from the{' '}
+                  <button
+                    type="button"
+                    onClick={() => setTab('users')}
+                    className="font-semibold text-[#881337] dark:text-rose-400 hover:underline"
+                  >
+                    Members
+                  </button>{' '}
+                  tab.
                 </p>
               </div>
             </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-              <input
-                type="password"
-                required
-                value={adminCredForm.current_password}
-                onChange={(e) =>
-                  setAdminCredForm({ ...adminCredForm, current_password: e.target.value })
-                }
-                placeholder="Current password"
-                className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-base sm:text-sm"
-              />
-              <input
-                type="password"
-                required
-                minLength={8}
-                value={adminCredForm.new_password}
-                onChange={(e) =>
-                  setAdminCredForm({ ...adminCredForm, new_password: e.target.value })
-                }
-                placeholder="New password (min 8 chars)"
-                className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-base sm:text-sm"
-              />
-              <input
-                type="password"
-                required
-                minLength={8}
-                value={adminCredForm.confirm_password}
-                onChange={(e) =>
-                  setAdminCredForm({ ...adminCredForm, confirm_password: e.target.value })
-                }
-                placeholder="Confirm new password"
-                className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-base sm:text-sm"
-              />
-            </div>
-
-            <div>
-              <button
-                type="submit"
-                disabled={rotatingPassword}
-                className="rounded-lg bg-[#881337] px-5 py-2.5 text-sm font-semibold text-white hover:bg-[#6B0F2B] disabled:opacity-60 min-h-[44px]"
-              >
-                {rotatingPassword ? 'Updating...' : 'Rotate Administrator Password'}
-              </button>
-            </div>
-          </form>
+          </div>
         </div>
       )}
     </div>

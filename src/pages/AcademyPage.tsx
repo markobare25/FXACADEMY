@@ -380,6 +380,7 @@ export const AcademyPage: React.FC = () => {
                       <p className="text-xs font-medium text-[#881337] dark:text-rose-400">
                         {course.level_label || course.level} · {total} Lessons ·{' '}
                         {course.estimated_hours || 3} hrs
+                        {course.is_premium ? ' · Premium' : ''}
                       </p>
                       <h2 className="text-lg font-bold text-slate-900 dark:text-white leading-snug">
                         {course.title}

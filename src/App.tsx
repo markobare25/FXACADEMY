@@ -7,7 +7,6 @@ import { HomePage } from './pages/HomePage';
 import {
   ForgotPasswordPage,
   LoginPage,
-  RegisterPage,
   ResetPasswordPage,
   VerifyEmailPage,
 } from './pages/AuthPages';
@@ -77,7 +76,7 @@ const RouteView: React.FC = () => {
       case '/login':
         return <LoginPage />;
       case '/register':
-        return <RegisterPage />;
+        return <ProfilePage />;
       case '/verify-email':
         return <VerifyEmailPage />;
       case '/forgot-password':
@@ -105,11 +104,7 @@ const RouteView: React.FC = () => {
       case '/notifications':
         return authLoading && !user ? <SessionRestoreSpinner /> : <NotificationsPage />;
       case '/profile':
-        return (
-          <ProtectedRoute targetPath="/profile">
-            <ProfilePage />
-          </ProtectedRoute>
-        );
+        return authLoading && !user ? <SessionRestoreSpinner /> : <ProfilePage />;
       case '/legal':
         return <LegalPage />;
       case '/admin':

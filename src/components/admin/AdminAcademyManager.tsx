@@ -72,6 +72,7 @@ export const AdminAcademyManager: React.FC<AdminAcademyManagerProps> = ({
     learning_outcomes_text: '',
     estimated_hours: 3.0,
     status: 'published' as ContentPublishStatus,
+    is_premium: false,
     cover_image_url: '',
   });
 
@@ -101,6 +102,7 @@ export const AdminAcademyManager: React.FC<AdminAcademyManagerProps> = ({
     duration_minutes: 15,
     order_index: 1,
     status: 'published' as ContentPublishStatus,
+    is_premium: false,
     scheduled_at: '',
     send_push: false,
     material_update: false,
@@ -182,6 +184,7 @@ export const AdminAcademyManager: React.FC<AdminAcademyManagerProps> = ({
       learning_outcomes_text: (c.learning_outcomes || []).join('\n'),
       estimated_hours: c.estimated_hours || 3.0,
       status: c.status || 'published',
+      is_premium: Boolean(c.is_premium),
       cover_image_url: c.cover_image_url || '',
     });
     setShowCourseEditor(true);
@@ -203,6 +206,7 @@ export const AdminAcademyManager: React.FC<AdminAcademyManagerProps> = ({
           .filter(Boolean),
         estimated_hours: Number(courseForm.estimated_hours) || 3,
         status: courseForm.status,
+        is_premium: courseForm.is_premium,
         cover_image_url: courseForm.cover_image_url || null,
       };
       if (editingCourseId) {
@@ -253,6 +257,7 @@ export const AdminAcademyManager: React.FC<AdminAcademyManagerProps> = ({
       duration_minutes: l.duration_minutes,
       order_index: l.order_index,
       status: l.status || 'published',
+      is_premium: Boolean(l.is_premium),
       scheduled_at: l.scheduled_at ? l.scheduled_at.slice(0, 16) : '',
       send_push: false,
       material_update: false,
@@ -287,6 +292,7 @@ export const AdminAcademyManager: React.FC<AdminAcademyManagerProps> = ({
       duration_minutes: 15,
       order_index: orderedLessons.length + 1,
       status: 'published',
+      is_premium: false,
       scheduled_at: '',
       send_push: false,
       material_update: false,
@@ -345,6 +351,7 @@ export const AdminAcademyManager: React.FC<AdminAcademyManagerProps> = ({
         duration_minutes: Number(lessonForm.duration_minutes) || 15,
         order_index: Number(lessonForm.order_index) || 1,
         status: lessonForm.status,
+        is_premium: lessonForm.is_premium,
         scheduled_at: lessonForm.scheduled_at
           ? new Date(lessonForm.scheduled_at).toISOString()
           : null,
@@ -505,6 +512,7 @@ export const AdminAcademyManager: React.FC<AdminAcademyManagerProps> = ({
                 learning_outcomes_text: '',
                 estimated_hours: 3,
                 status: 'published',
+                is_premium: false,
                 cover_image_url: '',
               });
               setShowCourseEditor(true);
@@ -615,20 +623,34 @@ export const AdminAcademyManager: React.FC<AdminAcademyManagerProps> = ({
           </div>
 
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <label className="inline-flex items-center gap-2 cursor-pointer rounded-lg border border-slate-300 dark:border-slate-700 px-3 py-1.5 text-xs">
-              <Upload className="w-3.5 h-3.5" />
-              <span>{courseForm.cover_image_url ? 'Cover Ready' : 'Upload Cover Image'}</span>
-              <input
-                type="file"
-                accept="image/*"
-                className="hidden"
-                onChange={(e) =>
-                  handleUpload(e.target.files?.[0], (url) =>
-                    setCourseForm((f) => ({ ...f, cover_image_url: url }))
-                  )
-                }
-              />
-            </label>
+            <div className="flex flex-wrap items-center gap-4">
+              <label className="inline-flex items-center gap-2 cursor-pointer rounded-lg border border-slate-300 dark:border-slate-700 px-3 py-1.5 text-xs">
+                <Upload className="w-3.5 h-3.5" />
+                <span>{courseForm.cover_image_url ? 'Cover Ready' : 'Upload Cover Image'}</span>
+                <input
+                  type="file"
+                  accept="image/*"
+                  className="hidden"
+                  onChange={(e) =>
+                    handleUpload(e.target.files?.[0], (url) =>
+                      setCourseForm((f) => ({ ...f, cover_image_url: url }))
+                    )
+                  }
+                />
+              </label>
+
+              <label className="inline-flex items-center gap-2 text-xs">
+                <input
+                  type="checkbox"
+                  checked={courseForm.is_premium}
+                  onChange={(e) =>
+                    setCourseForm({ ...courseForm, is_premium: e.target.checked })
+                  }
+                  className="accent-[#881337]"
+                />
+                <span>Premium Members Only</span>
+              </label>
+            </div>
             <button
               type="submit"
               className="rounded-lg bg-[#881337] px-4 py-2 text-xs font-semibold text-white"
@@ -696,7 +718,8 @@ export const AdminAcademyManager: React.FC<AdminAcademyManagerProps> = ({
                       {idx + 1}. {lesson.title}
                     </p>
                     <p className="text-[11px] font-mono text-slate-500 mt-0.5">
-                      {lesson.status || 'published'} · v{lesson.material_version || 1} · {lesson.duration_minutes}m
+                      {lesson.status || 'published'}
+                      {lesson.is_premium ? ' · Premium' : ''} · v{lesson.material_version || 1} · {lesson.duration_minutes}m
                     </p>
                   </div>
 
@@ -1136,14 +1159,28 @@ export const AdminAcademyManager: React.FC<AdminAcademyManagerProps> = ({
             )}
 
             <div className="flex flex-wrap items-center justify-between gap-3">
-              <label className="inline-flex items-center gap-2 text-xs">
-                <input
-                  type="checkbox"
-                  checked={lessonForm.send_push}
-                  onChange={(e) => setLessonForm({ ...lessonForm, send_push: e.target.checked })}
-                />
-                <span>Send Push Notification when Published</span>
-              </label>
+              <div className="flex flex-wrap items-center gap-4 text-xs">
+                <label className="inline-flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={lessonForm.is_premium}
+                    onChange={(e) =>
+                      setLessonForm({ ...lessonForm, is_premium: e.target.checked })
+                    }
+                    className="accent-[#881337]"
+                  />
+                  <span>Premium Members Only</span>
+                </label>
+                <label className="inline-flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={lessonForm.send_push}
+                    onChange={(e) => setLessonForm({ ...lessonForm, send_push: e.target.checked })}
+                    className="accent-[#881337]"
+                  />
+                  <span>Send Push Notification when Published</span>
+                </label>
+              </div>
 
               <button
                 type="submit"

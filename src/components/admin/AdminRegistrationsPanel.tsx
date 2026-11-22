@@ -120,10 +120,10 @@ export const AdminRegistrationsPanel: React.FC<AdminRegistrationsPanelProps> = (
       <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
           <h2 className="text-base font-bold text-slate-900 dark:text-white">
-            Community Registration Analytics
+            Member Account Analytics
           </h2>
           <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-            Tracks genuine registered member accounts only. Anonymous Signals Channel visitors are excluded.
+            Tracks administrator-managed member accounts. Self-service public registration is disabled.
           </p>
         </div>
 
@@ -153,20 +153,20 @@ export const AdminRegistrationsPanel: React.FC<AdminRegistrationsPanelProps> = (
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
         <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-4">
           <div className="flex items-center justify-between text-xs text-slate-500">
-            <span>Total Registered Users</span>
+            <span>Total Member Accounts</span>
             <Users className="w-4 h-4 text-[#881337] dark:text-rose-400" />
           </div>
           <p className="mt-1.5 text-2xl font-bold font-mono tabular-nums text-slate-900 dark:text-white">
             {summary.total_users}
           </p>
           <p className="text-[11px] text-slate-500 mt-0.5">
-            Registered member accounts
+            Provisioned member accounts
           </p>
         </div>
 
         <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-4">
           <div className="flex items-center justify-between text-xs text-slate-500">
-            <span>New Registrations</span>
+            <span>New Member Additions</span>
             <CalendarDays className="w-4 h-4 text-[#15803D] dark:text-emerald-400" />
           </div>
           <p className="mt-1.5 text-2xl font-bold font-mono tabular-nums text-slate-900 dark:text-white">

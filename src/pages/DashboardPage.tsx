@@ -8,11 +8,11 @@ import {
   Bookmark,
   CandlestickChart,
   CheckCircle2,
-  MailWarning,
+  ShieldCheck,
   TrendingUp,
 } from 'lucide-react';
 import { usePlatform } from '../context/PlatformContext';
-import { apiFetch, formatRelativeTime } from '../lib/api';
+import { apiFetch, formatLocalDateTime, formatRelativeTime } from '../lib/api';
 import { getCurrentPushSubscription } from '../lib/pushClient';
 import { PWAInstallButton } from '../components/PWAInstallButton';
 import type { MarketInstrument } from '../types';
@@ -40,9 +40,9 @@ export const DashboardPage: React.FC = () => {
   if (!user) {
     return (
       <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-8 text-center">
-        <h1 className="text-xl font-bold text-slate-900 dark:text-white">Sign in to access your Trader Dashboard</h1>
+        <h1 className="text-xl font-bold text-slate-900 dark:text-white">Sign in to access your Member Dashboard</h1>
         <p className="mt-2 text-sm text-slate-500 dark:text-slate-400">
-          Track watchlists, resume Academy lessons, and manage real-time push alerts.
+          Track watchlists, resume Academy lessons, and access approved premium briefings.
         </p>
         <div className="mt-5 flex items-center justify-center gap-3">
           <button
@@ -54,10 +54,10 @@ export const DashboardPage: React.FC = () => {
           </button>
           <button
             type="button"
-            onClick={() => navigate('/register')}
+            onClick={() => navigate('/profile')}
             className="rounded-lg border border-slate-300 dark:border-slate-700 px-5 py-2.5 text-sm font-medium text-slate-800 dark:text-slate-200"
           >
-            Create Account
+            Apply for Membership
           </button>
         </div>
       </div>
@@ -95,21 +95,29 @@ export const DashboardPage: React.FC = () => {
         </div>
       </div>
 
-      {!user.email_verified && (
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 rounded-xl border border-rose-200 dark:border-rose-900/40 bg-rose-50 dark:bg-rose-950/20 p-4 text-sm">
-          <div className="flex items-center gap-3 text-[#881337] dark:text-rose-300">
-            <MailWarning className="w-5 h-5 shrink-0" />
-            <span>Your email address is not yet verified. Verify to secure account recovery.</span>
-          </div>
-          <button
-            type="button"
-            onClick={() => navigate('/verify-email')}
-            className="text-xs font-semibold text-[#881337] dark:text-rose-300 underline shrink-0"
-          >
-            Verify Email
-          </button>
+      <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] px-5 py-3.5 flex flex-wrap items-center justify-between gap-3 text-xs">
+        <div className="flex items-center gap-2.5 text-slate-700 dark:text-slate-200">
+          <ShieldCheck className="w-4 h-4 text-[#15803D] dark:text-emerald-400 shrink-0" />
+          <span>
+            <strong className="font-semibold">
+              {user.role === 'admin' ? 'Administrator Account' : 'Approved Premium Membership'}
+            </strong>
+            {user.username ? ` · @${user.username}` : ''} · Active
+            {user.membership_expires_at
+              ? ` · Expires ${formatLocalDateTime(user.membership_expires_at)}`
+              : user.role === 'admin'
+                ? ''
+                : ' · No Expiry'}
+          </span>
         </div>
-      )}
+        <button
+          type="button"
+          onClick={() => navigate('/profile')}
+          className="font-semibold text-[#881337] dark:text-rose-400 hover:underline shrink-0"
+        >
+          Manage Profile &amp; Security
+        </button>
+      </div>
 
       {/* Watchlist Strip */}
       <section className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5">
@@ -204,7 +212,10 @@ export const DashboardPage: React.FC = () => {
                         {isBuy ? <ArrowUpRight className="w-3.5 h-3.5" /> : <ArrowDownRight className="w-3.5 h-3.5" />}
                         {sig.direction}
                       </span>
-                      <span className="text-xs text-slate-500">{sig.status}</span>
+                      <span className="text-xs text-slate-500">
+                        {sig.status}
+                        {sig.is_premium ? ' · Premium' : ''}
+                      </span>
                     </div>
                     <p className="mt-1 text-xs font-mono text-slate-500 dark:text-slate-400 tabular-nums">
                       Entry {sig.entry_price} · SL {sig.stop_loss} · TP1 {sig.tp1}

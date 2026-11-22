@@ -144,6 +144,14 @@ export const UpdatesPage: React.FC = () => {
                     <span>{upd.author_name}</span>
                     <span aria-hidden="true">·</span>
                     <span className="font-mono">{formatLocalDateTime(upd.created_at)}</span>
+                    {upd.is_premium && (
+                      <>
+                        <span aria-hidden="true">·</span>
+                        <span className="font-semibold text-[#881337] dark:text-rose-400">
+                          Premium
+                        </span>
+                      </>
+                    )}
                   </p>
                   <h2 className="mt-1.5 text-lg font-bold text-slate-900 dark:text-white">
                     {upd.title}

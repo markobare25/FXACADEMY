@@ -25,6 +25,8 @@ import {
   cleanupExpiredAuthRecords,
   createAuthSession,
   extractAuthContext,
+  isActivePremiumUser,
+  isUserMembershipExpired,
   logUserActivity,
   mapDbUser,
   normalizeNotificationPrefs,
@@ -248,6 +250,7 @@ function getPlatformSettings(): PlatformSettings {
     about_text: map.about_text || '',
     contact_email: map.contact_email || 'desk@meridianfx.com',
     contact_phone: map.contact_phone || '',
+    contact_whatsapp: map.contact_whatsapp || '',
     contact_address: map.contact_address || '',
     seo_title: map.seo_title || 'MeridianFX',
     seo_description: map.seo_description || '',
@@ -325,138 +328,61 @@ app.use('/api/auth', (_req, res, next) => {
   next();
 });
 
-const registerSchema = z.object({
-  name: z.string().trim().min(2, 'Full name must be at least 2 characters.').max(80),
-  email: z.string().trim().email('Please enter a valid email address.').max(160),
-  password: z.string().min(8, 'Password must be at least 8 characters.').max(128),
-  confirm_password: z.string().min(1, 'Please confirm your password.').optional(),
-  accept_terms: z.boolean().optional(),
-  remember_me: z.boolean().optional(),
-  timezone: z.string().max(64).optional(),
-});
-
-app.post('/api/auth/register', rateLimit(30, 60_000), (req: Request, res: Response) => {
-  const parsed = registerSchema.safeParse(req.body);
-  if (!parsed.success) {
-    res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid registration data.' });
-    return;
-  }
-
-  const passwordErr = validateStrongPassword(parsed.data.password);
-  if (passwordErr) {
-    res.status(400).json({ error: passwordErr });
-    return;
-  }
-
-  if (parsed.data.confirm_password !== undefined && parsed.data.password !== parsed.data.confirm_password) {
-    res.status(400).json({ error: 'Passwords do not match.' });
-    return;
-  }
-
-  if (parsed.data.accept_terms !== true) {
-    res.status(400).json({ error: 'You must accept the Terms and Conditions to create an account.' });
-    return;
-  }
-
-  const email = parsed.data.email.trim().toLowerCase();
-  if (email === DESIGNATED_ADMIN_EMAIL) {
-    res.status(409).json({ error: 'An account with this email already exists. Please sign in.' });
-    return;
-  }
-
-  const existing = db
-    .prepare('SELECT id FROM users WHERE LOWER(email) = ?')
-    .get(email) as { id: string } | undefined;
-
-  if (existing) {
-    res.status(409).json({ error: 'An account with this email already exists. Please sign in.' });
-    return;
-  }
-
-  const now = new Date().toISOString();
-  const userId = crypto.randomUUID();
-  const rememberMe = parsed.data.remember_me !== false;
-
-  db.prepare(
-    `INSERT INTO users (
-      id, name, email, password_hash, role, status, email_verified,
-      needs_password_setup, terms_accepted_at, timezone, created_at, last_login_at
-    ) VALUES (?, ?, ?, ?, 'user', 'active', 0, 0, ?, ?, ?, ?)`
-  ).run(
-    userId,
-    parsed.data.name,
-    email,
-    hashPassword(parsed.data.password),
-    now,
-    parsed.data.timezone || 'UTC',
-    now,
-    now
-  );
-
-  const verifyToken = crypto.randomBytes(24).toString('hex');
-  const verifyCode = String(crypto.randomInt(100000, 999999));
-  db.prepare(
-    `INSERT INTO email_verifications (id, user_id, token, code, expires_at, used)
-     VALUES (?, ?, ?, ?, ?, 0)`
-  ).run(
-    crypto.randomUUID(),
-    userId,
-    verifyToken,
-    verifyCode,
-    new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
-  );
-
-  logUserActivity(userId, 'Account Registered', 'New MeridianFX trader account created.', req.ip);
-
-  const userRow = db.prepare('SELECT * FROM users WHERE id = ?').get(userId) as Record<string, unknown>;
-  const session = createAuthSession(userId, 'user', {
-    rememberMe,
-    userAgent: String(req.headers['user-agent'] || ''),
-    ip: req.ip,
-  });
-  setRefreshCookie(req, res, session.refreshToken, session.rememberMe);
-
-  res.status(201).json({
-    user: mapDbUser(userRow),
-    access_token: session.accessToken,
-    expires_in: session.expiresIn,
-    remember_me: session.rememberMe,
-    verification_code: verifyCode,
-    verification_token: verifyToken,
-    verification_url: `/verify-email?token=${encodeURIComponent(verifyToken)}&email=${encodeURIComponent(email)}`,
+app.post('/api/auth/register', rateLimit(20, 60_000), (_req: Request, res: Response) => {
+  res.status(403).json({
+    error:
+      'Public account registration is closed. Please apply for Premium Membership via the Profile page or contact the MeridianFX administrator.',
   });
 });
 
-const loginSchema = z.object({
-  email: z.string().trim().email('Please enter a valid email address.'),
-  password: z.string().min(1, 'Password is required.'),
-  remember_me: z.boolean().optional(),
-});
+const loginSchema = z
+  .object({
+    identifier: z.string().trim().min(1, 'Please enter your email or username.').max(160).optional(),
+    email: z.string().trim().min(1).max(160).optional(),
+    password: z.string().min(1, 'Password is required.'),
+    remember_me: z.boolean().optional(),
+  })
+  .refine((data) => Boolean((data.identifier || data.email || '').trim()), {
+    message: 'Please enter your email address or username.',
+  });
 
 app.post('/api/auth/login', rateLimit(40, 60_000), (req: Request, res: Response) => {
   const parsed = loginSchema.safeParse(req.body);
   if (!parsed.success) {
-    res.status(400).json({ error: parsed.error.issues[0]?.message || 'Valid email and password are required.' });
+    res.status(400).json({ error: parsed.error.issues[0]?.message || 'Valid credentials are required.' });
     return;
   }
 
-  const email = parsed.data.email.trim().toLowerCase();
-  const row = db.prepare('SELECT * FROM users WHERE LOWER(email) = ?').get(email) as
-    | Record<string, unknown>
-    | undefined;
+  const identifier = (parsed.data.identifier || parsed.data.email || '').trim().toLowerCase();
+  const row = db
+    .prepare(
+      `SELECT * FROM users
+       WHERE LOWER(email) = ?
+          OR (username IS NOT NULL AND username != '' AND LOWER(username) = ?)
+       LIMIT 1`
+    )
+    .get(identifier, identifier) as Record<string, unknown> | undefined;
 
   if (!row || !verifyPassword(parsed.data.password, String(row.password_hash))) {
-    res.status(401).json({ error: 'Invalid email or password.' });
+    res.status(401).json({ error: 'Invalid email, username, or password.' });
     return;
   }
 
-  if (row.status === 'suspended' && email !== DESIGNATED_ADMIN_EMAIL) {
-    res.status(403).json({ error: 'Your account has been suspended. Contact platform support.' });
+  const resolvedEmail = String(row.email).toLowerCase();
+  const isDesignatedAdmin = resolvedEmail === DESIGNATED_ADMIN_EMAIL;
+
+  if (row.status === 'suspended' && !isDesignatedAdmin) {
+    res.status(403).json({ error: 'Your membership has been suspended. Please contact the MeridianFX administrator.' });
+    return;
+  }
+
+  if (isUserMembershipExpired(row) && !isDesignatedAdmin) {
+    res.status(403).json({ error: 'Your premium membership has expired. Contact the MeridianFX administrator to renew.' });
     return;
   }
 
   const now = new Date().toISOString();
-  if (email === DESIGNATED_ADMIN_EMAIL) {
+  if (isDesignatedAdmin) {
     db.prepare(
       "UPDATE users SET role = 'admin', status = 'active', email_verified = 1, needs_password_setup = 0, last_login_at = ? WHERE id = ?"
     ).run(now, String(row.id));
@@ -617,138 +543,18 @@ app.post('/api/auth/resend-verification', requireAuth, rateLimit(5, 60_000), (re
   });
 });
 
-app.post('/api/auth/forgot-password', rateLimit(10, 60_000), (req: Request, res: Response) => {
-  const email = String(req.body?.email || '').trim().toLowerCase();
-  if (!email) {
-    res.status(400).json({ error: 'Please enter your email address.' });
-    return;
-  }
-  if (email === DESIGNATED_ADMIN_EMAIL) {
-    res.status(403).json({
-      error: 'Administrator login credentials are permanent and cannot be reset.',
-    });
-    return;
-  }
-
-  const user = db.prepare('SELECT id, role FROM users WHERE LOWER(email) = ?').get(email) as
-    | { id: string; role: string }
-    | undefined;
-
-  if (!user) {
-    res.json({
-      ok: true,
-      message: 'If an account exists for that email, a password reset link and recovery code have been generated.',
-    });
-    return;
-  }
-
-  const resetToken = crypto.randomBytes(24).toString('hex');
-  const resetCode = String(crypto.randomInt(100000, 999999));
-  db.prepare(
-    `INSERT INTO password_resets (id, user_id, token, code, expires_at, used)
-     VALUES (?, ?, ?, ?, ?, 0)`
-  ).run(
-    crypto.randomUUID(),
-    user.id,
-    resetToken,
-    resetCode,
-    new Date(Date.now() + 60 * 60 * 1000).toISOString()
-  );
-  logUserActivity(user.id, 'Password Reset Requested', 'Password reset token and code issued.', req.ip);
-
-  res.json({
-    ok: true,
-    message: 'Password reset link and recovery code generated.',
-    reset_code: resetCode,
-    reset_token: resetToken,
-    reset_url: `/reset-password?token=${encodeURIComponent(resetToken)}&email=${encodeURIComponent(email)}`,
+app.post('/api/auth/forgot-password', rateLimit(10, 60_000), (_req: Request, res: Response) => {
+  res.status(403).json({
+    error:
+      'Self-service password resets are disabled. Please contact the MeridianFX administrator via the Profile page to request a temporary password reset.',
   });
 });
 
-app.post('/api/auth/reset-password', rateLimit(10, 60_000), (req: Request, res: Response) => {
-  const schema = z.object({
-    email: z.string().trim().email().optional(),
-    code: z.string().trim().min(4).optional(),
-    token: z.string().trim().min(16).optional(),
-    new_password: z.string().min(8, 'New password must be at least 8 characters.').max(128),
-    confirm_password: z.string().optional(),
+app.post('/api/auth/reset-password', rateLimit(10, 60_000), (_req: Request, res: Response) => {
+  res.status(403).json({
+    error:
+      'Password resets are managed by the MeridianFX administrator. Please contact support via the Profile page.',
   });
-  const parsed = schema.safeParse(req.body);
-  if (!parsed.success) {
-    res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid reset parameters.' });
-    return;
-  }
-
-  const passwordErr = validateStrongPassword(parsed.data.new_password);
-  if (passwordErr) {
-    res.status(400).json({ error: passwordErr });
-    return;
-  }
-
-  if (
-    parsed.data.confirm_password !== undefined &&
-    parsed.data.new_password !== parsed.data.confirm_password
-  ) {
-    res.status(400).json({ error: 'Passwords do not match.' });
-    return;
-  }
-
-  let resetRow: { id: string; user_id: string; expires_at: string } | undefined;
-  let userRow: { id: string; email: string } | undefined;
-
-  if (parsed.data.token) {
-    resetRow = db
-      .prepare('SELECT id, user_id, expires_at FROM password_resets WHERE token = ? AND used = 0 LIMIT 1')
-      .get(parsed.data.token) as typeof resetRow;
-    if (resetRow) {
-      userRow = db
-        .prepare('SELECT id, email FROM users WHERE id = ?')
-        .get(resetRow.user_id) as typeof userRow;
-    }
-  } else if (parsed.data.email && parsed.data.code) {
-    const normalizedEmail = parsed.data.email.trim().toLowerCase();
-    if (normalizedEmail === DESIGNATED_ADMIN_EMAIL) {
-      res.status(403).json({
-        error: 'Administrator login credentials are permanent and cannot be modified.',
-      });
-      return;
-    }
-    userRow = db
-      .prepare('SELECT id, email FROM users WHERE LOWER(email) = ?')
-      .get(normalizedEmail) as typeof userRow;
-    if (userRow) {
-      resetRow = db
-        .prepare(
-          'SELECT id, user_id, expires_at FROM password_resets WHERE user_id = ? AND (code = ? OR token = ?) AND used = 0 ORDER BY expires_at DESC LIMIT 1'
-        )
-        .get(userRow.id, parsed.data.code, parsed.data.code) as typeof resetRow;
-    }
-  } else {
-    res.status(400).json({ error: 'A valid reset link token or email and recovery code is required.' });
-    return;
-  }
-
-  if (!userRow || !resetRow || new Date(resetRow.expires_at).getTime() < Date.now()) {
-    res.status(400).json({ error: 'Invalid or expired reset link or recovery code.' });
-    return;
-  }
-
-  if (userRow.email.toLowerCase() === DESIGNATED_ADMIN_EMAIL) {
-    res.status(403).json({
-      error: 'Administrator login credentials are permanent and cannot be modified.',
-    });
-    return;
-  }
-
-  db.prepare('UPDATE password_resets SET used = 1 WHERE id = ?').run(resetRow.id);
-  db.prepare("UPDATE users SET password_hash = ?, needs_password_setup = 0, status = 'active' WHERE id = ?").run(
-    hashPassword(parsed.data.new_password),
-    userRow.id
-  );
-  revokeAllUserSessions(userRow.id);
-  logUserActivity(userRow.id, 'Password Reset Completed', 'Password updated via verified recovery.', req.ip);
-
-  res.json({ ok: true });
 });
 
 // ---------- User Account Management ----------
@@ -1564,14 +1370,20 @@ function hydrateSignals(rows: Array<Record<string, unknown>>) {
   );
   return rows.map((row) => ({
     ...row,
+    is_premium: Boolean(row.is_premium),
     updates: updateStmt.all(String(row.id)),
   }));
 }
 
-app.get('/api/signals', (_req: Request, res: Response) => {
-  const rows = db.prepare('SELECT * FROM signals ORDER BY created_at DESC').all() as Array<
-    Record<string, unknown>
-  >;
+app.get('/api/signals', optionalAuth, (req: AuthRequest, res: Response) => {
+  const canViewPremium = isActivePremiumUser(req.user);
+  const rows = db
+    .prepare(
+      canViewPremium
+        ? 'SELECT * FROM signals ORDER BY created_at DESC'
+        : 'SELECT * FROM signals WHERE COALESCE(is_premium, 0) = 0 ORDER BY created_at DESC'
+    )
+    .all() as Array<Record<string, unknown>>;
   res.json({ signals: hydrateSignals(rows) });
 });
 
@@ -1591,6 +1403,7 @@ const signalSchema = z.object({
   analysis: z.string().trim().min(5).max(4000),
   chart_image_url: z.string().max(400).optional().nullable(),
   admin_remarks: z.string().max(1000).optional().nullable(),
+  is_premium: z.boolean().optional().default(false),
   send_push: z.boolean().optional(),
 });
 
@@ -1604,13 +1417,14 @@ app.post('/api/signals', requireRole('admin'), async (req: AuthRequest, res: Res
   const d = parsed.data;
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
+  const isPremium = Boolean(d.is_premium);
 
   db.prepare(
     `INSERT INTO signals (
       id, pair, direction, entry_price, stop_loss, tp1, tp2, tp3, tp4,
       risk_reward, timeframe, status, classification, analysis, chart_image_url,
-      admin_remarks, created_by, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      admin_remarks, is_premium, created_by, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     id,
     d.pair.toUpperCase(),
@@ -1628,6 +1442,7 @@ app.post('/api/signals', requireRole('admin'), async (req: AuthRequest, res: Res
     d.analysis,
     d.chart_image_url || null,
     d.admin_remarks || null,
+    isPremium ? 1 : 0,
     req.user!.id,
     now,
     now
@@ -1647,7 +1462,9 @@ app.post('/api/signals', requireRole('admin'), async (req: AuthRequest, res: Res
 
   const row = db.prepare('SELECT * FROM signals WHERE id = ?').get(id) as Record<string, unknown>;
   const hydrated = hydrateSignals([row])[0];
-  broadcastWs('signal:created', hydrated);
+  if (!isPremium) {
+    broadcastWs('signal:created', hydrated);
+  }
 
   const tpList = [d.tp1, d.tp2, d.tp3, d.tp4].filter(Boolean).join(' · ');
   const mirrorText = [
@@ -1659,28 +1476,35 @@ app.post('/api/signals', requireRole('admin'), async (req: AuthRequest, res: Res
     .filter(Boolean)
     .join('\n\n');
 
-  const mirrored = publishMirrorToSignalChannel({
-    sourceType: 'signal',
-    sourceId: id,
-    authorId: req.user!.id,
-    authorName: req.user!.name,
-    messageType: 'signal',
-    content: mirrorText,
-    imageUrl: d.chart_image_url || null,
-    imageName: d.chart_image_url ? `${d.pair.toUpperCase()} chart` : null,
-    createdAt: now,
-  });
+  const mirrored = !isPremium
+    ? publishMirrorToSignalChannel({
+        sourceType: 'signal',
+        sourceId: id,
+        authorId: req.user!.id,
+        authorName: req.user!.name,
+        messageType: 'signal',
+        content: mirrorText,
+        imageUrl: d.chart_image_url || null,
+        imageName: d.chart_image_url ? `${d.pair.toUpperCase()} chart` : null,
+        createdAt: now,
+      })
+    : null;
 
-  const targetUrl = mirrored ? `/signals?message=${mirrored.message.id}` : '/signals';
+  const targetUrl = isPremium
+    ? '/dashboard'
+    : mirrored
+      ? `/signals?message=${mirrored.message.id}`
+      : '/signals';
   let pushJob = null;
   if (d.send_push !== false) {
     const dispatchRes = await dispatchNotification({
-      title: `${d.direction} ${d.pair.toUpperCase()} · ${d.entry_price}`,
+      title: `${isPremium ? '[Premium] ' : ''}${d.direction} ${d.pair.toUpperCase()} · ${d.entry_price}`,
       body: `Entry ${d.entry_price} · SL ${d.stop_loss} · TP1 ${d.tp1} (${d.timeframe} · ${d.classification})`,
       category: 'signals',
       linkUrl: targetUrl,
       signalMessageId: mirrored?.message.id || null,
       imageUrl: d.chart_image_url || null,
+      targetGroup: isPremium ? 'registered' : 'all',
       publishedAt: now,
       dedupKey: `signal:${id}`,
       broadcastWs,
@@ -1714,13 +1538,14 @@ app.patch('/api/signals/:id', requireRole('admin'), async (req: AuthRequest, res
   const now = new Date().toISOString();
   const nextStatus = d.status ?? String(existing.status);
   const nextPair = (d.pair ?? String(existing.pair)).toUpperCase();
+  const nextIsPremium = d.is_premium !== undefined ? Boolean(d.is_premium) : Boolean(existing.is_premium);
 
   db.prepare(
     `UPDATE signals SET
       pair = ?, direction = ?, entry_price = ?, stop_loss = ?,
       tp1 = ?, tp2 = ?, tp3 = ?, tp4 = ?, risk_reward = ?, timeframe = ?,
       status = ?, classification = ?, analysis = ?, chart_image_url = ?,
-      admin_remarks = ?, updated_at = ?
+      admin_remarks = ?, is_premium = ?, updated_at = ?
      WHERE id = ?`
   ).run(
     nextPair,
@@ -1738,6 +1563,7 @@ app.patch('/api/signals/:id', requireRole('admin'), async (req: AuthRequest, res
     d.analysis ?? existing.analysis,
     d.chart_image_url !== undefined ? d.chart_image_url : existing.chart_image_url,
     d.admin_remarks !== undefined ? d.admin_remarks : existing.admin_remarks,
+    nextIsPremium ? 1 : 0,
     now,
     req.params.id
   );
@@ -1763,28 +1589,35 @@ app.patch('/api/signals/:id', requireRole('admin'), async (req: AuthRequest, res
        VALUES (?, ?, ?, ?, ?, ?)`
     ).run(signalUpdateId, req.params.id, noteText, nextStatus, req.user!.name, now);
 
-    const mirrored = publishMirrorToSignalChannel({
-      sourceType: 'signal_update',
-      sourceId: signalUpdateId,
-      authorId: req.user!.id,
-      authorName: req.user!.name,
-      messageType: 'update',
-      content: `${nextPair} Signal Update (${nextStatus}): ${noteText}`,
-      createdAt: now,
-    });
+    const mirrored = !nextIsPremium
+      ? publishMirrorToSignalChannel({
+          sourceType: 'signal_update',
+          sourceId: signalUpdateId,
+          authorId: req.user!.id,
+          authorName: req.user!.name,
+          messageType: 'update',
+          content: `${nextPair} Signal Update (${nextStatus}): ${noteText}`,
+          createdAt: now,
+        })
+      : null;
     mirroredMsg = mirrored?.message || null;
 
     if (d.send_push !== false) {
       const dispatchRes = await dispatchNotification({
-        title: `${nextPair} Signal · ${nextStatus}`,
+        title: `${nextIsPremium ? '[Premium] ' : ''}${nextPair} Signal · ${nextStatus}`,
         body:
           d.admin_remarks ||
           (statusChanged
             ? `${nextPair} status changed from ${String(existing.status)} to ${nextStatus}.`
             : noteText),
         category: 'signal_updates',
-        linkUrl: mirrored ? `/signals?message=${mirrored.message.id}` : '/signals',
+        linkUrl: nextIsPremium
+          ? '/dashboard'
+          : mirrored
+            ? `/signals?message=${mirrored.message.id}`
+            : '/signals',
         signalMessageId: mirrored?.message.id || null,
+        targetGroup: nextIsPremium ? 'registered' : 'all',
         publishedAt: now,
         dedupKey: `signal_update:${signalUpdateId}`,
         broadcastWs,
@@ -1798,7 +1631,9 @@ app.patch('/api/signals/:id', requireRole('admin'), async (req: AuthRequest, res
     unknown
   >;
   const hydrated = hydrateSignals([updatedRow])[0];
-  broadcastWs('signal:updated', hydrated);
+  if (!nextIsPremium) {
+    broadcastWs('signal:updated', hydrated);
+  }
 
   res.json({ signal: hydrated, signal_message: mirroredMsg, push_job: pushJob });
 });
@@ -1825,6 +1660,7 @@ app.post('/api/signals/:id/updates', requireRole('admin'), async (req: AuthReque
 
   const now = new Date().toISOString();
   const nextStatus = parsed.data.status || String(existing.status);
+  const isPremium = Boolean(existing.is_premium);
   const signalUpdateId = crypto.randomUUID();
 
   db.prepare('UPDATE signals SET status = ?, admin_remarks = ?, updated_at = ? WHERE id = ?').run(
@@ -1843,26 +1679,35 @@ app.post('/api/signals/:id/updates', requireRole('admin'), async (req: AuthReque
     unknown
   >;
   const hydrated = hydrateSignals([updatedRow])[0];
-  broadcastWs('signal:updated', hydrated);
+  if (!isPremium) {
+    broadcastWs('signal:updated', hydrated);
+  }
 
-  const mirrored = publishMirrorToSignalChannel({
-    sourceType: 'signal_update',
-    sourceId: signalUpdateId,
-    authorId: req.user!.id,
-    authorName: req.user!.name,
-    messageType: 'update',
-    content: `${String(existing.pair)} Update (${nextStatus}): ${parsed.data.note}`,
-    createdAt: now,
-  });
+  const mirrored = !isPremium
+    ? publishMirrorToSignalChannel({
+        sourceType: 'signal_update',
+        sourceId: signalUpdateId,
+        authorId: req.user!.id,
+        authorName: req.user!.name,
+        messageType: 'update',
+        content: `${String(existing.pair)} Update (${nextStatus}): ${parsed.data.note}`,
+        createdAt: now,
+      })
+    : null;
 
   let pushJob = null;
   if (parsed.data.send_push !== false) {
     const dispatchRes = await dispatchNotification({
-      title: `${String(existing.pair)} Signal · ${nextStatus}`,
+      title: `${isPremium ? '[Premium] ' : ''}${String(existing.pair)} Signal · ${nextStatus}`,
       body: parsed.data.note,
       category: 'signal_updates',
-      linkUrl: mirrored ? `/signals?message=${mirrored.message.id}` : '/signals',
+      linkUrl: isPremium
+        ? '/dashboard'
+        : mirrored
+          ? `/signals?message=${mirrored.message.id}`
+          : '/signals',
       signalMessageId: mirrored?.message.id || null,
+      targetGroup: isPremium ? 'registered' : 'all',
       publishedAt: now,
       dedupKey: `signal_update:${signalUpdateId}`,
       broadcastWs,
@@ -1921,6 +1766,7 @@ function hydrateUpdates(rows: Array<Record<string, unknown>>, userId?: string) {
     ...row,
     pinned: Boolean(row.pinned),
     published: Boolean(row.published),
+    is_premium: Boolean(row.is_premium),
     reactions: reactMap.get(String(row.id)) || {},
     user_reacted: userReactSet.get(String(row.id)) || [],
     bookmarked: userBookmarkSet.has(String(row.id)),
@@ -1929,13 +1775,12 @@ function hydrateUpdates(rows: Array<Record<string, unknown>>, userId?: string) {
 
 app.get('/api/updates', optionalAuth, (req: AuthRequest, res: Response) => {
   const includeUnpublished = req.user?.role === 'admin' && req.query.includeAll === 'true';
-  const rows = db
-    .prepare(
-      includeUnpublished
-        ? 'SELECT * FROM market_updates ORDER BY pinned DESC, created_at DESC'
-        : 'SELECT * FROM market_updates WHERE published = 1 ORDER BY pinned DESC, created_at DESC'
-    )
-    .all() as Array<Record<string, unknown>>;
+  const canViewPremium = isActivePremiumUser(req.user);
+  let sql = 'SELECT * FROM market_updates WHERE 1=1';
+  if (!includeUnpublished) sql += ' AND published = 1';
+  if (!canViewPremium) sql += ' AND COALESCE(is_premium, 0) = 0';
+  sql += ' ORDER BY pinned DESC, created_at DESC';
+  const rows = db.prepare(sql).all() as Array<Record<string, unknown>>;
   res.json({ updates: hydrateUpdates(rows, req.user?.id) });
 });
 
@@ -1954,6 +1799,7 @@ const updateSchema = z.object({
     'Platform Announcement',
   ]),
   pinned: z.boolean().default(false),
+  is_premium: z.boolean().optional().default(false),
   image_url: z.string().max(500).optional().nullable(),
   video_url: z.string().max(500).optional().nullable(),
   attachment_url: z.string().max(500).optional().nullable(),
@@ -1975,18 +1821,20 @@ app.post('/api/updates', requireRole('admin'), async (req: AuthRequest, res: Res
   const now = new Date().toISOString();
   const isScheduledFuture = Boolean(d.scheduled_at && new Date(d.scheduled_at).getTime() > Date.now());
   const published = isScheduledFuture ? 0 : 1;
+  const isPremium = Boolean(d.is_premium);
 
   db.prepare(
     `INSERT INTO market_updates (
-      id, title, content, category, pinned, image_url, video_url, attachment_url,
+      id, title, content, category, pinned, is_premium, image_url, video_url, attachment_url,
       attachment_name, external_link, scheduled_at, published, author_name, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     id,
     d.title,
     d.content,
     d.category,
     d.pinned ? 1 : 0,
+    isPremium ? 1 : 0,
     d.image_url || null,
     d.video_url || null,
     d.attachment_url || null,
@@ -2009,7 +1857,9 @@ app.post('/api/updates', requireRole('admin'), async (req: AuthRequest, res: Res
   let mirroredMsg = null;
 
   if (published === 1) {
-    broadcastWs('update:created', hydrated);
+    if (!isPremium) {
+      broadcastWs('update:created', hydrated);
+    }
     const isAnnouncement =
       d.category === 'Platform Announcement' || d.category === 'Risk Warning';
     const mirrorContent = [
@@ -2020,28 +1870,35 @@ app.post('/api/updates', requireRole('admin'), async (req: AuthRequest, res: Res
       .filter(Boolean)
       .join('\n\n');
 
-    const mirrored = publishMirrorToSignalChannel({
-      sourceType: 'market_update',
-      sourceId: id,
-      authorId: req.user!.id,
-      authorName: req.user!.name,
-      messageType: isAnnouncement ? 'announcement' : 'update',
-      content: mirrorContent,
-      imageUrl: d.image_url || null,
-      imageName: d.title,
-      pinned: Boolean(d.pinned),
-      createdAt: now,
-    });
+    const mirrored = !isPremium
+      ? publishMirrorToSignalChannel({
+          sourceType: 'market_update',
+          sourceId: id,
+          authorId: req.user!.id,
+          authorName: req.user!.name,
+          messageType: isAnnouncement ? 'announcement' : 'update',
+          content: mirrorContent,
+          imageUrl: d.image_url || null,
+          imageName: d.title,
+          pinned: Boolean(d.pinned),
+          createdAt: now,
+        })
+      : null;
     mirroredMsg = mirrored?.message || null;
 
     if (d.send_push !== false) {
       const dispatchRes = await dispatchNotification({
-        title: `${d.category}: ${d.title}`,
+        title: `${isPremium ? '[Premium] ' : ''}${d.category}: ${d.title}`,
         body: d.content.slice(0, 140),
         category: isAnnouncement ? 'announcements' : 'market_updates',
-        linkUrl: mirrored ? `/signals?message=${mirrored.message.id}` : '/signals',
+        linkUrl: isPremium
+          ? '/updates'
+          : mirrored
+            ? `/signals?message=${mirrored.message.id}`
+            : '/signals',
         signalMessageId: mirrored?.message.id || null,
         imageUrl: d.image_url || null,
+        targetGroup: isPremium ? 'registered' : 'all',
         publishedAt: now,
         dedupKey: `market_update:${id}`,
         broadcastWs,
@@ -2073,10 +1930,11 @@ app.patch('/api/updates/:id', requireRole('admin'), (req: AuthRequest, res: Resp
   }
   const d = parsed.data;
   const now = new Date().toISOString();
+  const nextIsPremium = d.is_premium !== undefined ? Boolean(d.is_premium) : Boolean(existing.is_premium);
 
   db.prepare(
     `UPDATE market_updates SET
-      title = ?, content = ?, category = ?, pinned = ?, image_url = ?,
+      title = ?, content = ?, category = ?, pinned = ?, is_premium = ?, image_url = ?,
       video_url = ?, attachment_url = ?, attachment_name = ?, external_link = ?, updated_at = ?
      WHERE id = ?`
   ).run(
@@ -2084,6 +1942,7 @@ app.patch('/api/updates/:id', requireRole('admin'), (req: AuthRequest, res: Resp
     d.content ?? existing.content,
     d.category ?? existing.category,
     d.pinned !== undefined ? (d.pinned ? 1 : 0) : existing.pinned,
+    nextIsPremium ? 1 : 0,
     d.image_url !== undefined ? d.image_url : existing.image_url,
     d.video_url !== undefined ? d.video_url : existing.video_url,
     d.attachment_url !== undefined ? d.attachment_url : existing.attachment_url,
@@ -2098,7 +1957,9 @@ app.patch('/api/updates/:id', requireRole('admin'), (req: AuthRequest, res: Resp
     unknown
   >;
   const hydrated = hydrateUpdates([row], req.user!.id)[0];
-  broadcastWs('update:updated', hydrated);
+  if (!nextIsPremium) {
+    broadcastWs('update:updated', hydrated);
+  }
   res.json({ update: hydrated });
 });
 
@@ -2190,22 +2051,20 @@ function logAcademyAudit(
 
 app.get('/api/academy/courses', optionalAuth, (req: AuthRequest, res: Response) => {
   const includeAll = req.user?.role === 'admin' && req.query.includeAll === 'true';
+  const canViewPremium = isActivePremiumUser(req.user);
 
-  const courseRows = db
-    .prepare(
-      includeAll
-        ? 'SELECT * FROM courses ORDER BY COALESCE(course_number, 999) ASC, created_at ASC'
-        : "SELECT * FROM courses WHERE status = 'published' ORDER BY COALESCE(course_number, 999) ASC, created_at ASC"
-    )
-    .all() as Array<Record<string, unknown>>;
+  let courseSql = 'SELECT * FROM courses WHERE 1=1';
+  if (!includeAll) courseSql += " AND status = 'published'";
+  if (!canViewPremium) courseSql += ' AND COALESCE(is_premium, 0) = 0';
+  courseSql += ' ORDER BY COALESCE(course_number, 999) ASC, created_at ASC';
 
-  const lessonRows = db
-    .prepare(
-      includeAll
-        ? 'SELECT * FROM lessons ORDER BY order_index ASC, created_at ASC'
-        : "SELECT * FROM lessons WHERE status = 'published' ORDER BY order_index ASC, created_at ASC"
-    )
-    .all() as Array<Record<string, unknown>>;
+  let lessonSql = 'SELECT * FROM lessons WHERE 1=1';
+  if (!includeAll) lessonSql += " AND status = 'published'";
+  if (!canViewPremium) lessonSql += ' AND COALESCE(is_premium, 0) = 0';
+  lessonSql += ' ORDER BY order_index ASC, created_at ASC';
+
+  const courseRows = db.prepare(courseSql).all() as Array<Record<string, unknown>>;
+  const lessonRows = db.prepare(lessonSql).all() as Array<Record<string, unknown>>;
 
   const enrollMap = new Map<string, string | null>();
   const progressMap = new Map<
@@ -2317,6 +2176,7 @@ app.get('/api/academy/courses', optionalAuth, (req: AuthRequest, res: Response) 
         return {
           ...l,
           status: (l.status as string) || 'published',
+          is_premium: Boolean(l.is_premium),
           common_mistakes: safeJsonParse<string[]>(l.common_mistakes_json, []),
           practical_exercise: safeJsonParse(l.practical_exercise_json, null),
           sources: safeJsonParse(l.sources_json, []),
@@ -2334,6 +2194,7 @@ app.get('/api/academy/courses', optionalAuth, (req: AuthRequest, res: Response) 
     return {
       ...c,
       status: (c.status as string) || 'published',
+      is_premium: Boolean(c.is_premium),
       learning_outcomes: safeJsonParse<string[]>(c.learning_outcomes_json, []),
       assessment: safeJsonParse(c.assessment_json, []),
       assessment_record: assessmentMap.get(String(c.id)) || null,
@@ -2688,6 +2549,7 @@ app.post('/api/academy/courses', requireRole('admin'), (req: AuthRequest, res: R
     learning_outcomes: z.array(z.string()).optional(),
     estimated_hours: z.number().min(0.5).max(100).optional(),
     status: z.enum(['draft', 'published', 'unpublished', 'archived', 'scheduled']).default('published'),
+    is_premium: z.boolean().optional().default(false),
     cover_image_url: z.string().max(400).optional().nullable(),
     assessment: z
       .array(
@@ -2717,9 +2579,9 @@ app.post('/api/academy/courses', requireRole('admin'), (req: AuthRequest, res: R
   db.prepare(
     `INSERT INTO courses (
       id, slug, course_number, title, description, category, level, level_label,
-      prerequisites, learning_outcomes_json, estimated_hours, status, assessment_json,
+      prerequisites, learning_outcomes_json, estimated_hours, status, is_premium, assessment_json,
       cover_image_url, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     id,
     slug,
@@ -2733,6 +2595,7 @@ app.post('/api/academy/courses', requireRole('admin'), (req: AuthRequest, res: R
     JSON.stringify(parsed.data.learning_outcomes || []),
     parsed.data.estimated_hours ?? 3.0,
     parsed.data.status,
+    parsed.data.is_premium ? 1 : 0,
     JSON.stringify(parsed.data.assessment || []),
     parsed.data.cover_image_url || '/src/assets/images/academy_forex_cover_1795085836938.jpg',
     now,
@@ -2764,6 +2627,7 @@ app.patch('/api/academy/courses/:id', requireRole('admin'), (req: AuthRequest, r
     learning_outcomes: z.array(z.string()).optional(),
     estimated_hours: z.number().min(0.5).max(100).optional(),
     status: z.enum(['draft', 'published', 'unpublished', 'archived', 'scheduled']).optional(),
+    is_premium: z.boolean().optional(),
     cover_image_url: z.string().max(400).optional().nullable(),
     assessment: z
       .array(
@@ -2788,7 +2652,7 @@ app.patch('/api/academy/courses/:id', requireRole('admin'), (req: AuthRequest, r
   db.prepare(
     `UPDATE courses SET
       title = ?, description = ?, category = ?, level = ?, level_label = ?,
-      prerequisites = ?, learning_outcomes_json = ?, estimated_hours = ?, status = ?,
+      prerequisites = ?, learning_outcomes_json = ?, estimated_hours = ?, status = ?, is_premium = ?,
       assessment_json = ?, cover_image_url = ?, updated_at = ?
      WHERE id = ?`
   ).run(
@@ -2801,6 +2665,7 @@ app.patch('/api/academy/courses/:id', requireRole('admin'), (req: AuthRequest, r
     d.learning_outcomes ? JSON.stringify(d.learning_outcomes) : existing.learning_outcomes_json,
     d.estimated_hours ?? existing.estimated_hours,
     d.status ?? existing.status,
+    d.is_premium !== undefined ? (d.is_premium ? 1 : 0) : existing.is_premium,
     d.assessment ? JSON.stringify(d.assessment) : existing.assessment_json,
     d.cover_image_url !== undefined ? d.cover_image_url : existing.cover_image_url,
     now,
@@ -2850,6 +2715,7 @@ const lessonInputSchema = z.object({
   duration_minutes: z.number().int().min(1).max(240).default(15),
   order_index: z.number().int().min(1).default(1),
   status: z.enum(['draft', 'published', 'unpublished', 'archived', 'scheduled']).default('published'),
+  is_premium: z.boolean().optional().default(false),
   scheduled_at: z.string().optional().nullable(),
   quiz: z
     .array(
@@ -2882,9 +2748,9 @@ app.post('/api/academy/lessons', requireRole('admin'), async (req: AuthRequest, 
       id, course_id, title, category, summary, learning_objective, introduction, content,
       demonstration, common_mistakes_json, summary_recap, practical_exercise_json,
       visual_key, video_url, audio_url, transcript, pdf_url, image_url, sources_json, tags_json,
-      duration_minutes, order_index, status, scheduled_at, published_at, updated_at, material_version,
+      duration_minutes, order_index, status, is_premium, scheduled_at, published_at, updated_at, material_version,
       quiz_json, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
   ).run(
     id,
     d.course_id,
@@ -2909,6 +2775,7 @@ app.post('/api/academy/lessons', requireRole('admin'), async (req: AuthRequest, 
     d.duration_minutes,
     d.order_index,
     d.status,
+    d.is_premium ? 1 : 0,
     d.scheduled_at || null,
     publishedAt,
     now,
@@ -2924,12 +2791,18 @@ app.post('/api/academy/lessons', requireRole('admin'), async (req: AuthRequest, 
   logAcademyAudit(req.user!.id, req.user!.name, 'Lesson Created', 'lesson', id, `${d.title} (${d.status})`);
   broadcastWs('academy:updated', { type: 'lesson', id });
 
+  const parentCourse = db
+    .prepare('SELECT is_premium FROM courses WHERE id = ?')
+    .get(d.course_id) as { is_premium?: number } | undefined;
+  const lessonIsPremium = Boolean(d.is_premium) || Boolean(parentCourse?.is_premium);
+
   if (d.status === 'published' && d.send_push !== false) {
     await dispatchNotification({
-      title: `New Academy Lesson: ${d.title}`,
+      title: `${lessonIsPremium ? '[Premium] ' : ''}New Academy Lesson: ${d.title}`,
       body: `${d.category} · ${d.duration_minutes} min study module published.`,
       category: 'academy',
       linkUrl: '/academy',
+      targetGroup: lessonIsPremium ? 'registered' : 'all',
       broadcastWs,
     });
   }
@@ -2963,6 +2836,7 @@ app.patch('/api/academy/lessons/:id', requireRole('admin'), async (req: AuthRequ
   const nextStatus = d.status ?? String(existing.status || 'published');
   const nextPublishedAt =
     nextStatus === 'published' && !existing.published_at ? now : existing.published_at;
+  const nextIsPremium = d.is_premium !== undefined ? Boolean(d.is_premium) : Boolean(existing.is_premium);
 
   db.prepare(
     `UPDATE lessons SET
@@ -2970,7 +2844,7 @@ app.patch('/api/academy/lessons/:id', requireRole('admin'), async (req: AuthRequ
       introduction = ?, content = ?, demonstration = ?, common_mistakes_json = ?,
       summary_recap = ?, practical_exercise_json = ?, visual_key = ?, video_url = ?,
       audio_url = ?, transcript = ?, pdf_url = ?, image_url = ?, sources_json = ?,
-      tags_json = ?, duration_minutes = ?, order_index = ?, status = ?, scheduled_at = ?,
+      tags_json = ?, duration_minutes = ?, order_index = ?, status = ?, is_premium = ?, scheduled_at = ?,
       published_at = ?, updated_at = ?, material_version = ?, quiz_json = ?
      WHERE id = ?`
   ).run(
@@ -3000,6 +2874,7 @@ app.patch('/api/academy/lessons/:id', requireRole('admin'), async (req: AuthRequ
     d.duration_minutes ?? existing.duration_minutes,
     d.order_index ?? existing.order_index,
     nextStatus,
+    nextIsPremium ? 1 : 0,
     d.scheduled_at !== undefined ? d.scheduled_at : existing.scheduled_at,
     nextPublishedAt,
     now,
@@ -3933,9 +3808,384 @@ app.get('/api/admin/registrations/export', requireRole('admin'), (_req: Request,
   res.send(lines.join('\r\n'));
 });
 
+function generateTemporaryPassword(): string {
+  const letters = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+  const digits = '23456789';
+  const symbols = '!@#$%';
+  const all = letters + digits + symbols;
+  const pick = (pool: string) => pool[crypto.randomInt(0, pool.length)];
+  const chars = [
+    pick('ABCDEFGHJKLMNPQRSTUVWXYZ'),
+    pick('abcdefghijkmnopqrstuvwxyz'),
+    pick(digits),
+    pick(symbols),
+  ];
+  for (let i = 0; i < 8; i += 1) {
+    chars.push(pick(all));
+  }
+  for (let i = chars.length - 1; i > 0; i -= 1) {
+    const j = crypto.randomInt(0, i + 1);
+    [chars[i], chars[j]] = [chars[j], chars[i]];
+  }
+  return chars.join('');
+}
+
+function normalizeOptionalExpiry(raw?: string | null): string | null | 'invalid' {
+  if (raw === undefined || raw === null) return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  // Support YYYY-MM-DD date input by setting end of that UTC day
+  const normalized = /^\d{4}-\d{2}-\d{2}$/.test(trimmed) ? `${trimmed}T23:59:59.999Z` : trimmed;
+  const ms = Date.parse(normalized);
+  if (!Number.isFinite(ms)) return 'invalid';
+  return new Date(ms).toISOString();
+}
+
+function buildAdminMembersPayload() {
+  const rows = db
+    .prepare('SELECT * FROM users WHERE LOWER(email) != ? ORDER BY created_at DESC')
+    .all(DESIGNATED_ADMIN_EMAIL) as Array<Record<string, unknown>>;
+  const members = rows.map(mapDbUser);
+
+  let activeMembers = 0;
+  let suspendedMembers = 0;
+  let expiredMembers = 0;
+
+  for (const m of members) {
+    const expired = isUserMembershipExpired(m);
+    if (m.status === 'suspended') {
+      suspendedMembers += 1;
+    } else if (expired) {
+      expiredMembers += 1;
+    } else {
+      activeMembers += 1;
+    }
+  }
+
+  return {
+    summary: {
+      total_members: members.length,
+      active_members: activeMembers,
+      suspended_members: suspendedMembers,
+      expired_members: expiredMembers,
+      inactive_members: suspendedMembers + expiredMembers,
+    },
+    members,
+  };
+}
+
+app.get('/api/admin/members', requireRole('admin'), (_req: Request, res: Response) => {
+  res.json(buildAdminMembersPayload());
+});
+
+app.post('/api/admin/members', requireRole('admin'), (req: AuthRequest, res: Response) => {
+  const schema = z.object({
+    name: z.string().trim().min(2, 'Member name must be at least 2 characters.').max(80),
+    username: z
+      .string()
+      .trim()
+      .min(3, 'Username must be at least 3 characters.')
+      .max(40)
+      .regex(/^[a-zA-Z0-9._-]+$/, 'Username may contain letters, numbers, dots, underscores, or hyphens.'),
+    email: z.string().trim().email('Please enter a valid email address.').max(160),
+    password: z.string().max(128).optional(),
+    status: z.enum(['active', 'suspended']).default('active'),
+    membership_expires_at: z.string().nullable().optional(),
+    membership_notes: z.string().max(500).nullable().optional(),
+  });
+
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid member details.' });
+    return;
+  }
+
+  const email = parsed.data.email.trim().toLowerCase();
+  const username = parsed.data.username.trim().toLowerCase();
+  if (email === DESIGNATED_ADMIN_EMAIL) {
+    res.status(400).json({ error: 'Cannot create a member with the designated administrator email.' });
+    return;
+  }
+
+  const dupEmail = db.prepare('SELECT id FROM users WHERE LOWER(email) = ?').get(email) as
+    | { id: string }
+    | undefined;
+  if (dupEmail) {
+    res.status(409).json({ error: 'A member account with this email address already exists.' });
+    return;
+  }
+
+  const dupUsername = db
+    .prepare('SELECT id FROM users WHERE username IS NOT NULL AND LOWER(username) = ?')
+    .get(username) as { id: string } | undefined;
+  if (dupUsername) {
+    res.status(409).json({ error: 'This username is already assigned to another member.' });
+    return;
+  }
+
+  const expiry = normalizeOptionalExpiry(parsed.data.membership_expires_at);
+  if (expiry === 'invalid') {
+    res.status(400).json({ error: 'Invalid membership expiry date.' });
+    return;
+  }
+
+  const rawPassword = (parsed.data.password || '').trim() || generateTemporaryPassword();
+  const pwError = validateStrongPassword(rawPassword);
+  if (pwError) {
+    res.status(400).json({ error: pwError });
+    return;
+  }
+
+  const now = new Date().toISOString();
+  const id = crypto.randomUUID();
+  db.prepare(
+    `INSERT INTO users (
+      id, name, username, email, password_hash, role, status, email_verified,
+      membership_expires_at, membership_notes, needs_password_setup,
+      terms_accepted_at, timezone, created_at
+    ) VALUES (?, ?, ?, ?, ?, 'user', ?, 1, ?, ?, 1, ?, 'UTC', ?)`
+  ).run(
+    id,
+    parsed.data.name,
+    username,
+    email,
+    hashPassword(rawPassword),
+    parsed.data.status,
+    expiry,
+    parsed.data.membership_notes?.trim() || null,
+    now,
+    now
+  );
+
+  logUserActivity(id, 'Membership Created', `Premium member account provisioned by ${req.user!.name}.`, req.ip);
+  const createdRow = db.prepare('SELECT * FROM users WHERE id = ?').get(id) as Record<string, unknown>;
+  res.status(201).json({
+    member: mapDbUser(createdRow),
+    temporary_password: rawPassword,
+  });
+});
+
+app.patch('/api/admin/members/:id', requireRole('admin'), (req: AuthRequest, res: Response) => {
+  const target = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id) as
+    | Record<string, unknown>
+    | undefined;
+  if (!target) {
+    res.status(404).json({ error: 'Member account not found.' });
+    return;
+  }
+  if (String(target.email).toLowerCase() === DESIGNATED_ADMIN_EMAIL) {
+    res.status(400).json({ error: 'Designated administrator account cannot be modified here.' });
+    return;
+  }
+
+  const schema = z.object({
+    name: z.string().trim().min(2).max(80).optional(),
+    username: z
+      .string()
+      .trim()
+      .min(3)
+      .max(40)
+      .regex(/^[a-zA-Z0-9._-]+$/, 'Username may contain letters, numbers, dots, underscores, or hyphens.')
+      .optional(),
+    email: z.string().trim().email().max(160).optional(),
+    status: z.enum(['active', 'suspended']).optional(),
+    membership_expires_at: z.string().nullable().optional(),
+    membership_notes: z.string().max(500).nullable().optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid member update fields.' });
+    return;
+  }
+
+  const d = parsed.data;
+  const nextEmail = d.email ? d.email.trim().toLowerCase() : String(target.email).toLowerCase();
+  if (nextEmail === DESIGNATED_ADMIN_EMAIL) {
+    res.status(400).json({ error: 'Cannot assign designated administrator email to a member.' });
+    return;
+  }
+
+  if (d.email && nextEmail !== String(target.email).toLowerCase()) {
+    const dupEmail = db
+      .prepare('SELECT id FROM users WHERE LOWER(email) = ? AND id != ?')
+      .get(nextEmail, req.params.id);
+    if (dupEmail) {
+      res.status(409).json({ error: 'Another member already uses that email address.' });
+      return;
+    }
+  }
+
+  const nextUsername =
+    d.username !== undefined
+      ? d.username.trim().toLowerCase()
+      : target.username
+        ? String(target.username).toLowerCase()
+        : null;
+  if (d.username !== undefined && nextUsername) {
+    const dupUser = db
+      .prepare('SELECT id FROM users WHERE username IS NOT NULL AND LOWER(username) = ? AND id != ?')
+      .get(nextUsername, req.params.id);
+    if (dupUser) {
+      res.status(409).json({ error: 'Another member already uses that username.' });
+      return;
+    }
+  }
+
+  let nextExpiry: string | null = target.membership_expires_at ? String(target.membership_expires_at) : null;
+  if (d.membership_expires_at !== undefined) {
+    const resolvedExpiry = normalizeOptionalExpiry(d.membership_expires_at);
+    if (resolvedExpiry === 'invalid') {
+      res.status(400).json({ error: 'Invalid membership expiry date.' });
+      return;
+    }
+    nextExpiry = resolvedExpiry;
+  }
+
+  const nextStatus = d.status ?? (String(target.status) as 'active' | 'suspended');
+  db.prepare(
+    `UPDATE users SET
+      name = ?,
+      username = ?,
+      email = ?,
+      role = 'user',
+      status = ?,
+      email_verified = 1,
+      membership_expires_at = ?,
+      membership_notes = ?
+     WHERE id = ?`
+  ).run(
+    d.name ?? target.name,
+    nextUsername,
+    nextEmail,
+    nextStatus,
+    nextExpiry,
+    d.membership_notes !== undefined ? d.membership_notes?.trim() || null : target.membership_notes ?? null,
+    req.params.id
+  );
+
+  const nowExpired = isUserMembershipExpired({ role: 'user', membership_expires_at: nextExpiry });
+  if (nextStatus === 'suspended' || nowExpired) {
+    revokeAllUserSessions(String(req.params.id));
+  }
+
+  logUserActivity(
+    String(req.params.id),
+    'Membership Updated',
+    `Updated by administrator (${nextStatus}${nextExpiry ? `, expires ${nextExpiry.slice(0, 10)}` : ''}).`,
+    req.ip
+  );
+
+  const updated = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id) as Record<
+    string,
+    unknown
+  >;
+  res.json({ member: mapDbUser(updated) });
+});
+
+app.post('/api/admin/members/:id/reset-password', requireRole('admin'), (req: AuthRequest, res: Response) => {
+  const target = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id) as
+    | Record<string, unknown>
+    | undefined;
+  if (!target) {
+    res.status(404).json({ error: 'Member account not found.' });
+    return;
+  }
+  if (String(target.email).toLowerCase() === DESIGNATED_ADMIN_EMAIL) {
+    res.status(403).json({ error: 'Designated administrator credentials cannot be reset via member tools.' });
+    return;
+  }
+
+  const rawProvided = typeof req.body?.new_password === 'string' ? req.body.new_password.trim() : '';
+  const temporaryPassword = rawProvided || generateTemporaryPassword();
+  const pwError = validateStrongPassword(temporaryPassword);
+  if (pwError) {
+    res.status(400).json({ error: pwError });
+    return;
+  }
+
+  db.prepare('UPDATE users SET password_hash = ?, needs_password_setup = 1 WHERE id = ?').run(
+    hashPassword(temporaryPassword),
+    req.params.id
+  );
+  revokeAllUserSessions(String(req.params.id));
+  logUserActivity(
+    String(req.params.id),
+    'Password Reset by Admin',
+    `Temporary password assigned by ${req.user!.name}.`,
+    req.ip
+  );
+
+  const updated = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id) as Record<
+    string,
+    unknown
+  >;
+  res.json({
+    ok: true,
+    temporary_password: temporaryPassword,
+    member: mapDbUser(updated),
+  });
+});
+
+app.delete('/api/admin/members/:id', requireRole('admin'), (req: AuthRequest, res: Response) => {
+  const target = db.prepare('SELECT id, email FROM users WHERE id = ?').get(req.params.id) as
+    | { id: string; email: string }
+    | undefined;
+  if (!target) {
+    res.status(404).json({ error: 'Member account not found.' });
+    return;
+  }
+  if (target.id === req.user!.id || target.email.toLowerCase() === DESIGNATED_ADMIN_EMAIL) {
+    res.status(403).json({ error: 'The administrator account cannot be deleted.' });
+    return;
+  }
+
+  revokeAllUserSessions(target.id);
+  db.prepare('DELETE FROM users WHERE id = ?').run(target.id);
+  res.json({ ok: true });
+});
+
+app.get('/api/admin/members/export', requireRole('admin'), (_req: Request, res: Response) => {
+  const payload = buildAdminMembersPayload();
+  const headers = [
+    'Member ID',
+    'Name',
+    'Username',
+    'Email',
+    'Account Status',
+    'Membership Access',
+    'Expiry Date (UTC)',
+    'Notes',
+    'Registered At (UTC)',
+    'Last Sign In (UTC)',
+  ];
+  const lines = [headers.map(escapeCsvCell).join(',')];
+  for (const m of payload.members) {
+    lines.push(
+      [
+        m.id,
+        m.name,
+        m.username || '',
+        m.email,
+        m.status,
+        m.membership_active ? 'Active' : m.status === 'suspended' ? 'Suspended' : 'Expired',
+        m.membership_expires_at || 'No expiry',
+        m.membership_notes || '',
+        m.created_at,
+        m.last_login_at || '',
+      ]
+        .map((v) => escapeCsvCell(String(v)))
+        .join(',')
+    );
+  }
+  const stamp = new Date().toISOString().slice(0, 10);
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="meridianfx-members-${stamp}.csv"`);
+  res.send(lines.join('\r\n'));
+});
+
 app.patch('/api/admin/users/:id', requireRole('admin'), (req: AuthRequest, res: Response) => {
   const schema = z.object({
-    role: z.enum(['user', 'moderator', 'admin']).optional(),
+    role: z.enum(['user', 'admin']).optional(),
     status: z.enum(['active', 'suspended']).optional(),
     email_verified: z.boolean().optional(),
   });
@@ -4104,6 +4354,7 @@ app.patch('/api/admin/settings', requireRole('admin'), (req: Request, res: Respo
     'about_text',
     'contact_email',
     'contact_phone',
+    'contact_whatsapp',
     'contact_address',
     'seo_title',
     'seo_description',
@@ -4164,9 +4415,20 @@ if (!process.env.VERCEL) {
 
       for (const u of dueUpdates) {
         const uid = String(u.id);
+        const isPremium = Boolean(u.is_premium);
         db.prepare('UPDATE market_updates SET published = 1, updated_at = ? WHERE id = ?').run(nowIso, uid);
-        const hydrated = { ...u, pinned: Boolean(u.pinned), published: true, reactions: {}, user_reacted: [], bookmarked: false };
-        broadcastWs('update:created', hydrated);
+        const hydrated = {
+          ...u,
+          pinned: Boolean(u.pinned),
+          published: true,
+          is_premium: isPremium,
+          reactions: {},
+          user_reacted: [],
+          bookmarked: false,
+        };
+        if (!isPremium) {
+          broadcastWs('update:created', hydrated);
+        }
 
         const category = String(u.category || 'Market Update');
         const isAnnouncement =
@@ -4179,25 +4441,32 @@ if (!process.env.VERCEL) {
           .filter(Boolean)
           .join('\n\n');
 
-        const mirrored = publishMirrorToSignalChannel({
-          sourceType: 'market_update',
-          sourceId: uid,
-          authorName: String(u.author_name || 'MeridianFX'),
-          messageType: isAnnouncement ? 'announcement' : 'update',
-          content: mirrorContent,
-          imageUrl: u.image_url ? String(u.image_url) : null,
-          imageName: String(u.title),
-          pinned: Boolean(u.pinned),
-          createdAt: nowIso,
-        });
+        const mirrored = !isPremium
+          ? publishMirrorToSignalChannel({
+              sourceType: 'market_update',
+              sourceId: uid,
+              authorName: String(u.author_name || 'MeridianFX'),
+              messageType: isAnnouncement ? 'announcement' : 'update',
+              content: mirrorContent,
+              imageUrl: u.image_url ? String(u.image_url) : null,
+              imageName: String(u.title),
+              pinned: Boolean(u.pinned),
+              createdAt: nowIso,
+            })
+          : null;
 
         await dispatchNotification({
-          title: `${category}: ${String(u.title)}`,
+          title: `${isPremium ? '[Premium] ' : ''}${category}: ${String(u.title)}`,
           body: String(u.content).slice(0, 140),
           category: isAnnouncement ? 'announcements' : 'market_updates',
-          linkUrl: mirrored ? `/signals?message=${mirrored.message.id}` : '/signals',
+          linkUrl: isPremium
+            ? '/updates'
+            : mirrored
+              ? `/signals?message=${mirrored.message.id}`
+              : '/signals',
           signalMessageId: mirrored?.message.id || null,
           imageUrl: u.image_url ? String(u.image_url) : null,
+          targetGroup: isPremium ? 'registered' : 'all',
           publishedAt: nowIso,
           dedupKey: `market_update:${uid}`,
           broadcastWs,

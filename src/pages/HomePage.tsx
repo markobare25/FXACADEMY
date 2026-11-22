@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   ArrowDownRight,
   ArrowRight,
@@ -8,6 +8,7 @@ import {
   CheckCircle2,
   Mail,
   MapPin,
+  MessageCircle,
   Phone,
   Radio,
   ShieldAlert,
@@ -15,6 +16,7 @@ import {
 import { usePlatform } from '../context/PlatformContext';
 import { PWAInstallButton } from '../components/PWAInstallButton';
 import { apiFetch, formatLocalDateTime, formatRelativeTime } from '../lib/api';
+import { getCurrentPushSubscription } from '../lib/pushClient';
 
 export const HomePage: React.FC = () => {
   const {
@@ -25,8 +27,17 @@ export const HomePage: React.FC = () => {
     updates,
     courses,
     navigate,
+    showNotifModal,
     setShowNotifModal,
   } = usePlatform();
+
+  const [pushSubscribed, setPushSubscribed] = useState(false);
+
+  useEffect(() => {
+    getCurrentPushSubscription()
+      .then((sub) => setPushSubscribed(Boolean(sub)))
+      .catch(() => setPushSubscribed(false));
+  }, [showNotifModal]);
 
   const [contactForm, setContactForm] = useState({
     name: '',
@@ -79,30 +90,21 @@ export const HomePage: React.FC = () => {
               {user ? (
                 <button
                   type="button"
-                  onClick={() => navigate('/dashboard')}
+                  onClick={() => navigate(user.role === 'admin' ? '/admin' : '/dashboard')}
                   className="inline-flex items-center gap-2 rounded-lg bg-[#881337] px-5 py-3 text-sm font-semibold text-white hover:bg-[#6B0F2B] transition-colors min-h-[44px]"
                 >
-                  <span>Open Trader Dashboard</span>
+                  <span>{user.role === 'admin' ? 'Open Admin Desk' : 'Open Member Dashboard'}</span>
                   <ArrowRight className="w-4 h-4" />
                 </button>
               ) : (
-                <>
-                  <button
-                    type="button"
-                    onClick={() => navigate('/register')}
-                    className="inline-flex items-center gap-2 rounded-lg bg-[#881337] px-5 py-3 text-sm font-semibold text-white hover:bg-[#6B0F2B] transition-colors min-h-[44px]"
-                  >
-                    <span>Create Free Account</span>
-                    <ArrowRight className="w-4 h-4" />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => navigate('/login')}
-                    className="inline-flex items-center gap-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-5 py-3 text-sm font-medium text-slate-800 dark:text-slate-100 hover:border-[#881337]/40 hover:bg-rose-50/40 dark:hover:bg-slate-800 transition-colors min-h-[44px]"
-                  >
-                    Sign In
-                  </button>
-                </>
+                <button
+                  type="button"
+                  onClick={() => navigate('/signals')}
+                  className="inline-flex items-center gap-2 rounded-lg bg-[#881337] px-5 py-3 text-sm font-semibold text-white hover:bg-[#6B0F2B] transition-colors min-h-[44px]"
+                >
+                  <span>Free Signal Channel</span>
+                  <ArrowRight className="w-4 h-4" />
+                </button>
               )}
 
               <PWAInstallButton variant="primary" label="INSTALL APP" />
@@ -110,10 +112,18 @@ export const HomePage: React.FC = () => {
               <button
                 type="button"
                 onClick={() => setShowNotifModal(true)}
-                className="inline-flex items-center gap-2 rounded-lg border border-emerald-700/30 bg-emerald-50/70 dark:bg-emerald-950/30 px-4 py-2.5 text-sm font-medium text-emerald-800 dark:text-emerald-300 hover:bg-emerald-100/80 transition-colors min-h-[44px]"
+                className={`inline-flex items-center gap-2 rounded-lg border px-4 py-2.5 text-sm font-medium transition-colors min-h-[44px] ${
+                  pushSubscribed
+                    ? 'border-emerald-700/40 bg-emerald-50 dark:bg-emerald-950/40 text-emerald-800 dark:text-emerald-300'
+                    : 'border-emerald-700/30 bg-emerald-50/70 dark:bg-emerald-950/30 text-emerald-800 dark:text-emerald-300 hover:bg-emerald-100/80'
+                }`}
               >
-                <BellRing className="w-4 h-4 text-emerald-700 dark:text-emerald-400" />
-                <span>Enable Alerts</span>
+                {pushSubscribed ? (
+                  <CheckCircle2 className="w-4 h-4 text-emerald-700 dark:text-emerald-400" />
+                ) : (
+                  <BellRing className="w-4 h-4 text-emerald-700 dark:text-emerald-400" />
+                )}
+                <span>{pushSubscribed ? 'Alerts Enabled' : 'Enable Notifications'}</span>
               </button>
             </div>
 
@@ -385,6 +395,19 @@ export const HomePage: React.FC = () => {
                 <Mail className="w-4 h-4 text-[#881337] dark:text-rose-400 shrink-0" />
                 <span>{settings.contact_email}</span>
               </div>
+              {settings.contact_whatsapp && settings.contact_whatsapp.trim() && (
+                <div className="flex items-center gap-3">
+                  <MessageCircle className="w-4 h-4 text-[#15803D] dark:text-emerald-400 shrink-0" />
+                  <a
+                    href={`https://wa.me/${settings.contact_whatsapp.replace(/\D/g, '')}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="font-medium text-[#15803D] dark:text-emerald-400 hover:underline"
+                  >
+                    WhatsApp Official Desk ({settings.contact_whatsapp})
+                  </a>
+                </div>
+              )}
               {settings.contact_phone && (
                 <div className="flex items-center gap-3">
                   <Phone className="w-4 h-4 text-[#881337] dark:text-rose-400 shrink-0" />

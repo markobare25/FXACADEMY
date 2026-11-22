@@ -242,7 +242,7 @@ export function rotateRefreshSession(
     .prepare('SELECT * FROM users WHERE id = ?')
     .get(session.user_id) as Record<string, unknown> | undefined;
 
-  if (!userRow || userRow.status === 'suspended') {
+  if (!userRow || userRow.status === 'suspended' || isUserMembershipExpired(userRow)) {
     return null;
   }
 
@@ -473,14 +473,39 @@ export function normalizeNotificationPrefs(raw: unknown) {
   };
 }
 
+export function isUserMembershipExpired(row: {
+  role?: unknown;
+  membership_expires_at?: unknown;
+}): boolean {
+  if (String(row.role || '') === 'admin') return false;
+  const raw = row.membership_expires_at ? String(row.membership_expires_at).trim() : '';
+  if (!raw) return false;
+  const ms = Date.parse(raw);
+  return Number.isFinite(ms) && ms <= Date.now();
+}
+
+export function isActivePremiumUser(user?: User | null): boolean {
+  if (!user) return false;
+  if (user.role === 'admin') return true;
+  if (user.status !== 'active') return false;
+  return !isUserMembershipExpired(user);
+}
+
 export function mapDbUser(row: Record<string, unknown>): User {
+  const expired = isUserMembershipExpired(row);
+  const status = (row.status as 'active' | 'suspended') || 'active';
   return {
     id: String(row.id),
     name: String(row.name),
+    username: row.username ? String(row.username) : null,
     email: String(row.email),
     role: row.role as UserRole,
-    status: row.status as 'active' | 'suspended',
+    status,
     email_verified: Boolean(row.email_verified),
+    membership_expires_at: row.membership_expires_at ? String(row.membership_expires_at) : null,
+    membership_notes: row.membership_notes ? String(row.membership_notes) : null,
+    needs_password_setup: Boolean(row.needs_password_setup),
+    membership_active: String(row.role) === 'admin' || (status === 'active' && !expired),
     avatar_url: row.avatar_url ? String(row.avatar_url) : null,
     bio: row.bio ? String(row.bio) : null,
     timezone: row.timezone ? String(row.timezone) : 'UTC',
@@ -559,11 +584,11 @@ export function extractAuthContext(req: Request): AuthContext {
     db.prepare('UPDATE user_sessions SET last_seen_at = ? WHERE id = ?').run(nowIso, session.id);
   }
 
-  // 3. Load user and verify active status & password-reset token epoch
+  // 3. Load user and verify active status, membership expiry & password-reset token epoch
   const row = db
     .prepare('SELECT * FROM users WHERE id = ?')
     .get(claims.sub) as Record<string, unknown> | undefined;
-  if (!row || row.status === 'suspended') return {};
+  if (!row || row.status === 'suspended' || isUserMembershipExpired(row)) return {};
 
   if (row.tokens_valid_after && typeof claims.iat === 'number') {
     const validAfterSec = Math.floor(Date.parse(String(row.tokens_valid_after)) / 1000);

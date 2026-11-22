@@ -1035,14 +1035,14 @@ export const SignalsPage: React.FC = () => {
                 onClick={() => setShowNotifModal(true)}
                 aria-label={pushSubscribed ? 'Push notifications active' : 'Enable push notifications'}
                 title={pushSubscribed ? 'Push alerts enabled on this device' : 'Enable real-time push alerts'}
-                className={`relative min-h-[38px] px-2.5 flex items-center justify-center gap-1.5 rounded-lg text-xs font-semibold transition-colors ${
+                className={`relative min-h-[38px] px-2.5 flex items-center justify-center gap-1.5 rounded-lg text-xs font-semibold whitespace-nowrap shrink-0 transition-colors ${
                   pushSubscribed
                     ? 'text-[#15803D] dark:text-emerald-400 bg-emerald-50/80 dark:bg-emerald-950/30 hover:bg-emerald-100/80'
                     : 'text-[#881337] dark:text-rose-300 bg-rose-50/70 dark:bg-rose-950/30 hover:bg-rose-100/70'
                 }`}
               >
                 {pushSubscribed ? <BellRing className="w-4 h-4" /> : <Bell className="w-4 h-4" />}
-                <span className="hidden sm:inline">
+                <span>
                   {pushSubscribed ? 'Alerts On' : 'Get Alerts'}
                 </span>
               </button>

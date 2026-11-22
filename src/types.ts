@@ -29,10 +29,15 @@ export interface PushSubscriptionSummary {
 export interface User {
   id: string;
   name: string;
+  username?: string | null;
   email: string;
   role: UserRole;
   status: 'active' | 'suspended';
   email_verified: boolean;
+  membership_expires_at?: string | null;
+  membership_notes?: string | null;
+  needs_password_setup?: boolean;
+  membership_active?: boolean;
   avatar_url?: string | null;
   bio?: string | null;
   timezone?: string;
@@ -40,6 +45,19 @@ export interface User {
   watchlist: string[];
   created_at: string;
   last_login_at?: string | null;
+}
+
+export interface AdminMembersSummary {
+  total_members: number;
+  active_members: number;
+  suspended_members: number;
+  expired_members: number;
+  inactive_members: number;
+}
+
+export interface AdminMembersPayload {
+  summary: AdminMembersSummary;
+  members: User[];
 }
 
 export type SignalDirection = 'BUY' | 'SELL';
@@ -72,6 +90,7 @@ export interface TradingSignal {
   analysis: string;
   chart_image_url?: string | null;
   admin_remarks?: string | null;
+  is_premium?: boolean;
   created_by: string;
   created_at: string;
   updated_at: string;
@@ -176,6 +195,7 @@ export interface MarketUpdate {
   external_link?: string | null;
   scheduled_at?: string | null;
   published: boolean;
+  is_premium?: boolean;
   author_name: string;
   reactions: Record<string, number>;
   user_reacted?: string[];
@@ -231,6 +251,7 @@ export interface Lesson {
   duration_minutes: number;
   order_index: number;
   status?: ContentPublishStatus;
+  is_premium?: boolean;
   scheduled_at?: string | null;
   published_at?: string | null;
   updated_at?: string | null;
@@ -266,6 +287,7 @@ export interface Course {
   learning_outcomes?: string[];
   estimated_hours?: number;
   status?: ContentPublishStatus;
+  is_premium?: boolean;
   cover_image_url?: string | null;
   assessment?: QuizQuestion[];
   assessment_record?: CourseAssessmentRecord | null;
@@ -400,6 +422,7 @@ export interface PlatformSettings {
   about_text: string;
   contact_email: string;
   contact_phone: string;
+  contact_whatsapp: string;
   contact_address: string;
   seo_title: string;
   seo_description: string;

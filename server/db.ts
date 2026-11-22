@@ -593,8 +593,15 @@ export function initDatabase(): void {
   ensureColumn('push_subscriptions', 'last_error', 'TEXT');
   ensureColumn('push_subscriptions', 'last_success_at', 'TEXT');
   ensureColumn('push_subscriptions', 'updated_at', 'TEXT');
+  ensureColumn('users', 'username', 'TEXT');
+  ensureColumn('users', 'membership_expires_at', 'TEXT');
+  ensureColumn('users', 'membership_notes', 'TEXT');
   ensureColumn('users', 'tokens_valid_after', 'TEXT');
   ensureColumn('users', 'terms_accepted_at', 'TEXT');
+  ensureColumn('signals', 'is_premium', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('market_updates', 'is_premium', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('courses', 'is_premium', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('lessons', 'is_premium', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('user_sessions', 'refresh_token_hash', 'TEXT');
   ensureColumn('user_sessions', 'prev_refresh_token_hash', 'TEXT');
   ensureColumn('user_sessions', 'prev_grace_until', 'TEXT');
@@ -604,6 +611,9 @@ export function initDatabase(): void {
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_user_sessions_refresh
       ON user_sessions(refresh_token_hash);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_unique
+      ON users(LOWER(username))
+      WHERE username IS NOT NULL AND username != '';
     CREATE UNIQUE INDEX IF NOT EXISTS idx_signal_messages_source
       ON signal_messages(source_type, source_id)
       WHERE source_type IS NOT NULL AND source_id IS NOT NULL;
@@ -671,6 +681,7 @@ function seedInitialData(): void {
       'MeridianFX bridges institutional market analysis and retail trader discipline. Every published signal documents clear entry levels, invalidation stops, multi-tier profit targets, and underlying technical & macroeconomic rationale. All setups are published strictly for educational and informational purposes.',
     contact_email: 'desk@meridianfx.com',
     contact_phone: '+44 20 7946 0821',
+    contact_whatsapp: '',
     contact_address: '22 Bishopsgate, Level 18, London EC2N 4BQ, United Kingdom',
     seo_title: 'MeridianFX — Forex Signals, Market Intelligence & Trading Academy',
     seo_description:
@@ -1074,7 +1085,11 @@ export function createDatabaseBackup(): { filename: string; path: string; create
 
   const snapshot = {
     exported_at: new Date().toISOString(),
-    users: db.prepare('SELECT id, name, email, role, status, email_verified, timezone, notification_prefs, watchlist, created_at, last_login_at FROM users').all(),
+    users: db
+      .prepare(
+        'SELECT id, name, username, email, role, status, email_verified, membership_expires_at, membership_notes, timezone, notification_prefs, watchlist, created_at, last_login_at FROM users'
+      )
+      .all(),
     signals: db.prepare('SELECT * FROM signals').all(),
     signal_updates: db.prepare('SELECT * FROM signal_updates').all(),
     signal_messages: db.prepare('SELECT * FROM signal_messages').all(),

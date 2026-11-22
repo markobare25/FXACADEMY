@@ -297,12 +297,22 @@ function resolveGroupTargetUserIds(targetGroup?: PushTargetGroup): string[] | nu
     return null;
   }
   if (targetGroup === 'registered') {
-    const rows = db.prepare("SELECT id FROM users WHERE status = 'active'").all() as Array<{ id: string }>;
+    const rows = db
+      .prepare(
+        `SELECT id FROM users
+         WHERE status = 'active'
+           AND (role = 'admin' OR membership_expires_at IS NULL OR membership_expires_at = '' OR datetime(membership_expires_at) > datetime('now'))`
+      )
+      .all() as Array<{ id: string }>;
     return rows.map((r) => r.id);
   }
   if (targetGroup === 'verified') {
     const rows = db
-      .prepare("SELECT id FROM users WHERE status = 'active' AND email_verified = 1")
+      .prepare(
+        `SELECT id FROM users
+         WHERE status = 'active' AND email_verified = 1
+           AND (role = 'admin' OR membership_expires_at IS NULL OR membership_expires_at = '' OR datetime(membership_expires_at) > datetime('now'))`
+      )
       .all() as Array<{ id: string }>;
     return rows.map((r) => r.id);
   }

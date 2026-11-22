@@ -55,7 +55,7 @@ export const Layout: React.FC<LayoutProps> = ({ children }) => {
     { path: '/signals', label: 'Signals', icon: TrendingUp },
     { path: '/updates', label: 'Updates', icon: Radio },
     { path: '/academy', label: 'Academy', icon: BookOpen },
-    { path: user ? '/profile' : '/login', label: 'Profile', icon: UserIcon },
+    { path: '/profile', label: 'Profile', icon: UserIcon },
   ];
 
   if (isLanding) {
@@ -121,10 +121,10 @@ export const Layout: React.FC<LayoutProps> = ({ children }) => {
               <PWAInstallButton variant="header" label="INSTALL APP" />
               <button
                 type="button"
-                onClick={() => navigate('/register')}
+                onClick={() => navigate('/academy')}
                 className="rounded-lg bg-[#881337] px-3 sm:px-4 py-2 text-xs sm:text-sm font-semibold text-white hover:bg-[#6B0F2B] transition-colors whitespace-nowrap shrink-0 min-h-[38px] sm:min-h-[40px]"
               >
-                Get Started
+                Explore Academy
               </button>
             </div>
           </div>
@@ -347,10 +347,10 @@ export const Layout: React.FC<LayoutProps> = ({ children }) => {
               </button>
               <button
                 type="button"
-                onClick={() => navigate('/register')}
+                onClick={() => navigate('/profile')}
                 className="rounded-lg bg-[#881337] py-2 text-xs font-semibold text-white hover:bg-[#6B0F2B]"
               >
-                Sign Up
+                Membership
               </button>
             </div>
           )}
@@ -386,10 +386,10 @@ export const Layout: React.FC<LayoutProps> = ({ children }) => {
                 </button>
                 <button
                   type="button"
-                  onClick={() => navigate('/register')}
+                  onClick={() => navigate('/profile')}
                   className="rounded-lg bg-[#881337] px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-[#6B0F2B] transition-colors"
                 >
-                  Get Started
+                  Membership
                 </button>
               </>
             )}

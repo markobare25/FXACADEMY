@@ -39,21 +39,6 @@ export type SignalChatWsEvent =
     }
   | { type: 'reconnected' };
 
-export interface RegisterPayload {
-  name: string;
-  email: string;
-  password: string;
-  confirmPassword: string;
-  acceptTerms: boolean;
-  rememberMe?: boolean;
-}
-
-export interface RegisterResult {
-  user: User;
-  verification_code?: string;
-  verification_url?: string;
-}
-
 interface PlatformContextValue {
   user: User | null;
   authLoading: boolean;
@@ -71,8 +56,7 @@ interface PlatformContextValue {
   unreadCount: number;
   showNotifModal: boolean;
   setShowNotifModal: (v: boolean) => void;
-  login: (email: string, password: string, rememberMe?: boolean) => Promise<User>;
-  register: (payload: RegisterPayload) => Promise<RegisterResult>;
+  login: (identifier: string, password: string, rememberMe?: boolean) => Promise<User>;
   logout: () => Promise<void>;
   logoutAllSessions: () => Promise<void>;
   setUser: React.Dispatch<React.SetStateAction<User | null>>;
@@ -98,6 +82,7 @@ const DEFAULT_SETTINGS: PlatformSettings = {
   about_text: '',
   contact_email: 'desk@meridianfx.com',
   contact_phone: '',
+  contact_whatsapp: '',
   contact_address: '',
   seo_title: 'MeridianFX — Forex Signals, Market Intelligence & Trading Academy',
   seo_description: '',
@@ -159,8 +144,13 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   const refreshInFlightRef = useRef<{ epoch: number; promise: Promise<string | null> } | null>(null);
   const isLoggingOutRef = useRef<boolean>(false);
   const authChannelRef = useRef<BroadcastChannel | null>(null);
+  const userRef = useRef<User | null>(user);
   const signalChatListenersRef = useRef<Set<(event: SignalChatWsEvent) => void>>(new Set());
   const pushJobListenersRef = useRef<Set<(job: PushJobSummary) => void>>(new Set());
+
+  useEffect(() => {
+    userRef.current = user;
+  }, [user]);
 
   const subscribeSignalChatEvents = useCallback((listener: (event: SignalChatWsEvent) => void) => {
     signalChatListenersRef.current.add(listener);
@@ -430,9 +420,10 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     }
   }, [user?.id, authLoading]);
 
-  // Listen for Service Worker notification clicks & PWA install prompt triggers
+  // Listen for Service Worker notification clicks, first-visit push prompt, & PWA install prompt triggers
   useEffect(() => {
     const promptKey = 'mfx_post_install_notif_prompted_v1';
+    const firstVisitPromptKey = 'mfx_first_visit_notif_prompt_v1';
 
     const maybeEncourageAfterInstall = () => {
       try {
@@ -446,13 +437,30 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       }
     };
 
+    const maybeEncourageFirstVisit = () => {
+      try {
+        if (!isPushSupported()) return;
+        if (Notification.permission !== 'default') return;
+        if (localStorage.getItem(firstVisitPromptKey) === '1') return;
+        const currentPath = window.location.pathname || '/';
+        if (currentPath === '/login' || currentPath === '/admin') return;
+        localStorage.setItem(firstVisitPromptKey, '1');
+        setShowNotifModal(true);
+      } catch {
+        // ignore storage errors
+      }
+    };
+
     const isStandaloneNow =
       window.matchMedia('(display-mode: standalone)').matches ||
       (window.navigator as unknown as { standalone?: boolean }).standalone === true;
 
     let standaloneTimer: number | undefined;
+    let firstVisitTimer: number | undefined;
     if (isStandaloneNow) {
       standaloneTimer = window.setTimeout(maybeEncourageAfterInstall, 1200);
+    } else {
+      firstVisitTimer = window.setTimeout(maybeEncourageFirstVisit, 2200);
     }
 
     const onSwMessage = (evt: MessageEvent) => {
@@ -474,6 +482,7 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
     return () => {
       if (standaloneTimer) clearTimeout(standaloneTimer);
+      if (firstVisitTimer) clearTimeout(firstVisitTimer);
       window.removeEventListener('mfx:pwa-installed', maybeEncourageAfterInstall);
       if ('serviceWorker' in navigator) {
         navigator.serviceWorker.removeEventListener('message', onSwMessage);
@@ -507,13 +516,13 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
     const onVisibleOrFocus = () => {
       if (document.visibilityState === 'hidden') return;
-      if (user && getAccessTokenRemainingMs() < 3 * 60_000) {
+      if (userRef.current && getAccessTokenRemainingMs() < 3 * 60_000) {
         performSessionRefresh().catch(() => undefined);
       }
     };
 
     const onExpired = () => {
-      if (user) {
+      if (userRef.current) {
         clearLocalSessionState();
       }
     };
@@ -528,7 +537,7 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       authChannelRef.current?.close();
       authChannelRef.current = null;
     };
-  }, [user, clearLocalSessionState, performSessionRefresh]);
+  }, [clearLocalSessionState, performSessionRefresh]);
 
   // Real-Time WebSocket Sync with auto-reconnect (never resets auth state)
   useEffect(() => {
@@ -686,7 +695,7 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     };
   }, [refreshPublicData, refreshNotifications, emitSignalChatEvent, emitPushJobEvent]);
 
-  const login = async (email: string, password: string, rememberMe = true): Promise<User> => {
+  const login = async (identifier: string, password: string, rememberMe = true): Promise<User> => {
     authEpochRef.current += 1;
     refreshInFlightRef.current = null;
     const res = await apiFetch<{ user: User; access_token: string; expires_in?: number }>(
@@ -694,7 +703,7 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       {
         method: 'POST',
         body: JSON.stringify({
-          email: email.trim().toLowerCase(),
+          identifier: identifier.trim(),
           password,
           remember_me: rememberMe,
         }),
@@ -712,46 +721,6 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     }
     await Promise.all([refreshPublicData(), refreshNotifications()]);
     return res.user;
-  };
-
-  const register = async (payload: RegisterPayload): Promise<RegisterResult> => {
-    authEpochRef.current += 1;
-    refreshInFlightRef.current = null;
-    const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
-    const res = await apiFetch<{
-      user: User;
-      access_token: string;
-      expires_in?: number;
-      verification_code?: string;
-      verification_url?: string;
-    }>('/api/auth/register', {
-      method: 'POST',
-      body: JSON.stringify({
-        name: payload.name.trim(),
-        email: payload.email.trim().toLowerCase(),
-        password: payload.password,
-        confirm_password: payload.confirmPassword,
-        accept_terms: payload.acceptTerms,
-        remember_me: payload.rememberMe !== false,
-        timezone,
-      }),
-    });
-    const expiresIn = typeof res.expires_in === 'number' ? res.expires_in : 900;
-    setAccessToken(res.access_token, expiresIn);
-    setUser(res.user);
-    setAuthLoading(false);
-    scheduleProactiveRefreshRef.current(expiresIn);
-    try {
-      authChannelRef.current?.postMessage({ type: 'login' });
-    } catch {
-      // ignore
-    }
-    await Promise.all([refreshPublicData(), refreshNotifications()]);
-    return {
-      user: res.user,
-      verification_code: res.verification_code,
-      verification_url: res.verification_url,
-    };
   };
 
   const logout = async () => {
@@ -783,7 +752,8 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         body: '{}',
       }).catch(() => undefined);
 
-      navigate('/login');
+      await refreshPublicData();
+      navigate('/profile');
     } finally {
       isLoggingOutRef.current = false;
     }
@@ -800,7 +770,8 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     } catch {
       // ignore
     }
-    navigate('/login');
+    await refreshPublicData();
+    navigate('/profile');
   };
 
   return (
@@ -823,7 +794,6 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         showNotifModal,
         setShowNotifModal,
         login,
-        register,
         logout,
         logoutAllSessions,
         setUser,
