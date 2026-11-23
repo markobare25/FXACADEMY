@@ -3,7 +3,10 @@ import http2 from 'node:http2';
 import * as webpush from 'web-push';
 import { db, logSystemEvent } from './db.ts';
 import { normalizeNotificationPrefs } from './auth.ts';
-import { deleteRemotePushSubscription } from './persistentStore.ts';
+import {
+  deleteRemotePushSubscription,
+  refreshPushSubscriptionsFromRemote,
+} from './persistentStore.ts';
 import {
   VAPID_KEY_SOURCE,
   VAPID_PRIVATE_KEY,
@@ -1026,6 +1029,7 @@ export async function sendPushToAllSubscribers(params: {
   failed: number;
 }> {
   ensureVapidKeys();
+  await refreshPushSubscriptionsFromRemote();
 
   const subs = db
     .prepare(

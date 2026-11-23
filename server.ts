@@ -80,6 +80,7 @@ import {
   deleteRemoteSignalMessage,
   ensureRemoteHydrated,
   fetchRemoteSignalMessageById,
+  incrementTotalPublishedSignalsRemote,
   refreshSignalsAndStatsFromRemote,
   syncMarketUpdateToRemote,
   syncPushSubscriptionToRemote,
@@ -87,7 +88,7 @@ import {
   syncSignalReactionToRemote,
   syncSignalToRemote,
   syncSignalUpdateToRemote,
-  syncTotalPublishedSignalsToRemote,
+  WELCOME_ID,
 } from './server/persistentStore.ts';
 import {
   getEconomicCalendar,
@@ -1846,12 +1847,10 @@ app.post('/api/signals/messages', requireRole('admin'), async (req: AuthRequest,
     );
 
     if (initialStatus === 'active') {
-      totalPublishedSignals = incrementTotalPublishedSignals();
+      const localNext = incrementTotalPublishedSignals();
       counterIncremented = true;
-      await Promise.all([
-        syncSignalMessageToRemote(id, { strict: true }),
-        syncTotalPublishedSignalsToRemote(totalPublishedSignals, { strict: true }),
-      ]);
+      await syncSignalMessageToRemote(id, { strict: true });
+      totalPublishedSignals = await incrementTotalPublishedSignalsRemote(localNext, { strict: true });
       broadcastWs('stats:updated', { total_published_signals: totalPublishedSignals });
     } else {
       await syncSignalMessageToRemote(id, { strict: true });
@@ -2114,12 +2113,10 @@ app.patch('/api/signals/messages/:id', requireRole('admin'), async (req: AuthReq
     );
 
     if (publishingFromDraft) {
-      totalPublishedSignals = incrementTotalPublishedSignals();
+      const localNext = incrementTotalPublishedSignals();
       counterIncremented = true;
-      await Promise.all([
-        syncSignalMessageToRemote(String(req.params.id), { strict: true }),
-        syncTotalPublishedSignalsToRemote(totalPublishedSignals, { strict: true }),
-      ]);
+      await syncSignalMessageToRemote(String(req.params.id), { strict: true });
+      totalPublishedSignals = await incrementTotalPublishedSignalsRemote(localNext, { strict: true });
       broadcastWs('stats:updated', { total_published_signals: totalPublishedSignals });
     } else {
       await syncSignalMessageToRemote(String(req.params.id), { strict: true });
@@ -2274,17 +2271,39 @@ async function handleSignalMessageReaction(req: AuthRequest, res: Response): Pro
     | undefined;
 
   if (!msg && targetId) {
-    const recovered = await fetchRemoteSignalMessageById(targetId);
-    if (recovered) {
-      msg = db
-        .prepare(
-          `SELECT id, seed_love, seed_like, seed_fire, seed_hundred
-           FROM signal_messages
-           WHERE id = ? OR source_id = ?
-           LIMIT 1`
-        )
-        .get(targetId, targetId) as typeof msg;
-    }
+    await fetchRemoteSignalMessageById(targetId);
+    msg = db
+      .prepare(
+        `SELECT id, seed_love, seed_like, seed_fire, seed_hundred
+         FROM signal_messages
+         WHERE id = ? OR source_id = ?
+         LIMIT 1`
+      )
+      .get(targetId, targetId) as typeof msg;
+  }
+
+  if (!msg && targetId) {
+    await refreshSignalsAndStatsFromRemote();
+    msg = db
+      .prepare(
+        `SELECT id, seed_love, seed_like, seed_fire, seed_hundred
+         FROM signal_messages
+         WHERE id = ? OR source_id = ?
+         LIMIT 1`
+      )
+      .get(targetId, targetId) as typeof msg;
+  }
+
+  if (!msg && targetId === WELCOME_ID) {
+    initDatabase();
+    msg = db
+      .prepare(
+        `SELECT id, seed_love, seed_like, seed_fire, seed_hundred
+         FROM signal_messages
+         WHERE id = ? OR is_welcome = 1
+         LIMIT 1`
+      )
+      .get(targetId) as typeof msg;
   }
 
   if (!msg) {
@@ -2302,6 +2321,33 @@ async function handleSignalMessageReaction(req: AuthRequest, res: Response): Pro
     res.status(429).json({ error: 'Too many reaction updates. Please wait a few seconds.' });
     return;
   }
+
+  try {
+    assertPersistentDatabaseReady();
+  } catch (err) {
+    res.status(500).json({
+      error: err instanceof Error ? err.message : 'Database persistence is not configured.',
+    });
+    return;
+  }
+
+  const prevActorRow = db
+    .prepare('SELECT message_id, actor_key, user_id, visitor_id, reaction, created_at FROM signal_message_reactions WHERE message_id = ? AND actor_key = ?')
+    .get(msg.id, actor.actorKey) as
+    | {
+        message_id: string;
+        actor_key: string;
+        user_id: string | null;
+        visitor_id: string | null;
+        reaction: SignalReactionType;
+        created_at: string;
+      }
+    | undefined;
+  const prevMsgCounts = db
+    .prepare('SELECT love_count, like_count, fire_count, hundred_count FROM signal_messages WHERE id = ?')
+    .get(msg.id) as
+    | { love_count: number; like_count: number; fire_count: number; hundred_count: number }
+    | undefined;
 
   const reactTx = db.transaction(() => {
     const existing = db
@@ -2371,10 +2417,51 @@ async function handleSignalMessageReaction(req: AuthRequest, res: Response): Pro
 
   const { reactions, nextUserReaction, action } = reactTx();
 
-  await Promise.all([
-    syncSignalReactionToRemote(msg.id, actor.actorKey, action),
-    syncSignalMessageToRemote(msg.id),
-  ]);
+  try {
+    await Promise.all([
+      syncSignalReactionToRemote(msg.id, actor.actorKey, action, { strict: true }),
+      syncSignalMessageToRemote(msg.id, { strict: true }),
+    ]);
+  } catch (err) {
+    if (prevActorRow) {
+      db.prepare(
+        `INSERT INTO signal_message_reactions (message_id, actor_key, user_id, visitor_id, reaction, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(message_id, actor_key) DO UPDATE SET
+           user_id = excluded.user_id,
+           visitor_id = excluded.visitor_id,
+           reaction = excluded.reaction,
+           created_at = excluded.created_at`
+      ).run(
+        prevActorRow.message_id,
+        prevActorRow.actor_key,
+        prevActorRow.user_id,
+        prevActorRow.visitor_id,
+        prevActorRow.reaction,
+        prevActorRow.created_at
+      );
+    } else {
+      db.prepare('DELETE FROM signal_message_reactions WHERE message_id = ? AND actor_key = ?').run(
+        msg.id,
+        actor.actorKey
+      );
+    }
+    if (prevMsgCounts) {
+      db.prepare(
+        'UPDATE signal_messages SET love_count = ?, like_count = ?, fire_count = ?, hundred_count = ? WHERE id = ?'
+      ).run(
+        prevMsgCounts.love_count,
+        prevMsgCounts.like_count,
+        prevMsgCounts.fire_count,
+        prevMsgCounts.hundred_count,
+        msg.id
+      );
+    }
+    res.status(500).json({
+      error: err instanceof Error ? err.message : 'Failed to save reaction to database.',
+    });
+    return;
+  }
 
   const viewerKey = hashActorKey(actor.actorKey);
   broadcastSignalChatEvent('signals_chat:reacted', {
@@ -2524,7 +2611,7 @@ app.post('/api/signals', requireRole('admin'), async (req: AuthRequest, res: Res
       now
     );
 
-    totalPublishedSignals = incrementTotalPublishedSignals();
+    const localNext = incrementTotalPublishedSignals();
     counterIncremented = true;
 
     const tpList = [d.tp1, d.tp2, d.tp3, d.tp4].filter(Boolean).join(' · ');
@@ -2555,9 +2642,9 @@ app.post('/api/signals', requireRole('admin'), async (req: AuthRequest, res: Res
     await Promise.all([
       syncSignalToRemote(id, { strict: true }),
       syncSignalUpdateToRemote(signalUpdateId, { strict: true }),
-      syncTotalPublishedSignalsToRemote(totalPublishedSignals, { strict: true }),
       ...(mirrored?.message?.id ? [syncSignalMessageToRemote(mirrored.message.id, { strict: true })] : []),
     ]);
+    totalPublishedSignals = await incrementTotalPublishedSignalsRemote(localNext, { strict: true });
   } catch (err) {
     db.prepare('DELETE FROM signal_updates WHERE id = ?').run(signalUpdateId);
     db.prepare('DELETE FROM signals WHERE id = ?').run(id);
