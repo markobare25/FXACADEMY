@@ -1,0 +1,39 @@
+{
+  "id": "/",
+  "name": "MeridianFX — Forex Signals & Academy",
+  "short_name": "MeridianFX",
+  "description": "Institutional-grade Forex trading signals, real-time market updates, economic calendar, and trading academy.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "theme_color": "#881337",
+  "background_color": "#FFFFFF",
+  "gcm_sender_id": "103953800507",
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-maskable-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}

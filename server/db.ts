@@ -556,6 +556,7 @@ export function initDatabase(): void {
       device_label TEXT,
       prefs_json TEXT NOT NULL DEFAULT '{"signals":true,"signal_updates":true,"signal_chat":true,"market_updates":true,"academy":true,"economic_calendar":true,"announcements":true,"sound_enabled":true}',
       sound_enabled INTEGER NOT NULL DEFAULT 1,
+      is_muted INTEGER NOT NULL DEFAULT 0,
       failure_count INTEGER NOT NULL DEFAULT 0,
       active INTEGER NOT NULL DEFAULT 1,
       last_error TEXT,
@@ -781,6 +782,7 @@ export function initDatabase(): void {
   ensureColumn('push_subscriptions', 'device_label', 'TEXT');
   ensureColumn('push_subscriptions', 'prefs_json', 'TEXT');
   ensureColumn('push_subscriptions', 'sound_enabled', 'INTEGER NOT NULL DEFAULT 1');
+  ensureColumn('push_subscriptions', 'is_muted', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('push_subscriptions', 'failure_count', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('push_subscriptions', 'last_error', 'TEXT');
   ensureColumn('push_subscriptions', 'last_success_at', 'TEXT');

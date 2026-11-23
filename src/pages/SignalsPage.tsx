@@ -297,10 +297,14 @@ export const SignalsPage: React.FC = () => {
       .then((res) => {
         if (cancelled) return;
         const mutedOnServer =
-          res.prefs &&
-          res.prefs.signal_chat === false &&
-          res.prefs.signals === false &&
-          res.prefs.market_updates === false;
+          typeof res.isMuted === 'boolean'
+            ? res.isMuted
+            : Boolean(
+                res.prefs &&
+                  res.prefs.signal_chat === false &&
+                  res.prefs.signals === false &&
+                  res.prefs.market_updates === false
+              );
         setSignalsMutedLocal(mutedOnServer);
         setIsMuted(mutedOnServer);
       })

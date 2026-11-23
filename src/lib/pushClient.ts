@@ -1,4 +1,5 @@
 import { apiFetch } from './api';
+import { VAPID_PUBLIC_KEY } from '../../lib/vapidPublic';
 import type { NotificationPreferences } from '../types';
 
 export const DEFAULT_DEVICE_PREFS: NotificationPreferences = {
@@ -31,9 +32,17 @@ function uint8ArraysEqual(a: Uint8Array, b: Uint8Array): boolean {
   return true;
 }
 
-async function getReadyServiceWorkerRegistration(timeoutMs = 6000): Promise<ServiceWorkerRegistration> {
-  const existing = await navigator.serviceWorker.getRegistration();
+async function getReadyServiceWorkerRegistration(timeoutMs = 8000): Promise<ServiceWorkerRegistration> {
+  const existing = await navigator.serviceWorker.getRegistration('/sw.js').catch(() => undefined)
+    || await navigator.serviceWorker.getRegistration().catch(() => undefined);
   if (existing && existing.active) return existing;
+
+  try {
+    const reg = await navigator.serviceWorker.register('/sw.js', { scope: '/' });
+    if (reg.active) return reg;
+  } catch {
+    // ignore and await navigator.serviceWorker.ready
+  }
 
   return await Promise.race([
     navigator.serviceWorker.ready,
@@ -47,6 +56,16 @@ async function getReadyServiceWorkerRegistration(timeoutMs = 6000): Promise<Serv
       )
     ),
   ]);
+}
+
+async function resolveVapidPublicKey(): Promise<string> {
+  try {
+    const res = await apiFetch<{ publicKey?: string }>('/api/push/vapid-public-key');
+    if (res?.publicKey) return res.publicKey;
+  } catch {
+    // Fallback to shared VAPID public key
+  }
+  return VAPID_PUBLIC_KEY;
 }
 
 const SIGNALS_MUTED_KEY = 'mfx_signals_muted_v1';
@@ -124,7 +143,7 @@ export async function syncExistingPushSubscriptionIfGranted(): Promise<boolean> 
   try {
     const registration = await getReadyServiceWorkerRegistration(4000);
     let sub = await registration.pushManager.getSubscription();
-    const { publicKey } = await apiFetch<{ publicKey: string }>('/api/push/vapid-public-key');
+    const publicKey = await resolveVapidPublicKey();
     const expectedKey = urlBase64ToUint8Array(publicKey);
 
     let oldEndpoint: string | undefined;
@@ -249,7 +268,7 @@ export async function subscribeToPushNotifications(
   }
 
   try {
-    const { publicKey } = await apiFetch<{ publicKey: string }>('/api/push/vapid-public-key');
+    const publicKey = await resolveVapidPublicKey();
     const expectedKey = urlBase64ToUint8Array(publicKey);
     const registration = await getReadyServiceWorkerRegistration();
 
@@ -322,10 +341,11 @@ export async function unsubscribeFromPushNotifications(): Promise<void> {
 export async function getDevicePushPreferences(): Promise<{
   prefs: NotificationPreferences;
   subscribed: boolean;
+  isMuted?: boolean;
 }> {
   const sub = await getCurrentPushSubscription();
   const query = sub ? `?endpoint=${encodeURIComponent(sub.endpoint)}` : '';
-  return apiFetch<{ prefs: NotificationPreferences; subscribed: boolean }>(
+  return apiFetch<{ prefs: NotificationPreferences; subscribed: boolean; isMuted?: boolean }>(
     `/api/push/preferences${query}`,
     { cache: 'no-store' }
   );
@@ -355,15 +375,16 @@ export async function sendTestPushNotification(): Promise<{ ok: boolean; statusC
 export async function muteSignalChannelPush(): Promise<{ muted: boolean }> {
   setSignalsMutedLocal(true);
   try {
-    await saveDevicePushPreferences({
-      signals: false,
-      signal_updates: false,
-      signal_chat: false,
-      market_updates: false,
-      announcements: false,
+    const sub = await getCurrentPushSubscription();
+    await apiFetch('/api/push/mute', {
+      method: 'POST',
+      body: JSON.stringify({
+        ...(sub ? { endpoint: sub.endpoint } : {}),
+        muted: true,
+      }),
     });
   } catch {
-    // localStorage state still protects client if offline
+    // localStorage state still tracks client preference if offline
   }
   return { muted: true };
 }
@@ -394,7 +415,14 @@ export async function unmuteSignalChannelPush(): Promise<{
   }
 
   try {
-    await saveDevicePushPreferences(unmutedPrefs);
+    const sub = await getCurrentPushSubscription();
+    await apiFetch('/api/push/mute', {
+      method: 'POST',
+      body: JSON.stringify({
+        ...(sub ? { endpoint: sub.endpoint } : {}),
+        muted: false,
+      }),
+    });
   } catch {
     // ignore transient network failure
   }

@@ -65,6 +65,7 @@ import {
   processPendingPushDeliveries,
   recordPushReceipt,
   sendDirectTestPush,
+  sendPushToAllSubscribers,
   setPushWsBroadcaster,
   type PushCategory,
   type PushTargetGroup,
@@ -1809,9 +1810,17 @@ app.post('/api/signals/messages', requireRole('admin'), async (req: AuthRequest,
         priority: d.priority,
         publishedAt: now,
         dedupKey: `signal_message:${id}`,
+        skipWebPush: true,
         broadcastWs,
       });
       pushJob = dispatchRes.push_job;
+
+      await sendPushToAllSubscribers({
+        title: 'MeridianFX Signal Alert',
+        body: preview,
+        url: '/signals',
+        tag: `mfx-signal-${id}`,
+      });
     }
   }
 
@@ -2350,9 +2359,10 @@ app.post('/api/signals', requireRole('admin'), async (req: AuthRequest, res: Res
       : '/signals';
   let pushJob = null;
   if (d.send_push !== false) {
+    const signalBody = `Entry ${d.entry_price} · SL ${d.stop_loss} · TP1 ${d.tp1} (${d.timeframe} · ${d.classification})`;
     const dispatchRes = await dispatchNotification({
       title: `${isPremium ? '[Premium] ' : ''}${d.direction} ${d.pair.toUpperCase()} · ${d.entry_price}`,
-      body: `Entry ${d.entry_price} · SL ${d.stop_loss} · TP1 ${d.tp1} (${d.timeframe} · ${d.classification})`,
+      body: signalBody,
       category: 'signals',
       linkUrl: targetUrl,
       signalMessageId: mirrored?.message.id || null,
@@ -2360,9 +2370,17 @@ app.post('/api/signals', requireRole('admin'), async (req: AuthRequest, res: Res
       targetGroup: isPremium ? 'registered' : 'all',
       publishedAt: now,
       dedupKey: `signal:${id}`,
+      skipWebPush: true,
       broadcastWs,
     });
     pushJob = dispatchRes.push_job;
+
+    await sendPushToAllSubscribers({
+      title: 'MeridianFX Signal Alert',
+      body: `${d.direction} ${d.pair.toUpperCase()} · ${signalBody}`,
+      url: '/signals',
+      tag: `mfx-signal-${id}`,
+    });
   }
 
   res.status(201).json({
@@ -2456,13 +2474,14 @@ app.patch('/api/signals/:id', requireRole('admin'), async (req: AuthRequest, res
     mirroredMsg = mirrored?.message || null;
 
     if (d.send_push !== false) {
+      const updateBody =
+        d.admin_remarks ||
+        (statusChanged
+          ? `${nextPair} status changed from ${String(existing.status)} to ${nextStatus}.`
+          : noteText);
       const dispatchRes = await dispatchNotification({
         title: `${nextIsPremium ? '[Premium] ' : ''}${nextPair} Signal · ${nextStatus}`,
-        body:
-          d.admin_remarks ||
-          (statusChanged
-            ? `${nextPair} status changed from ${String(existing.status)} to ${nextStatus}.`
-            : noteText),
+        body: updateBody,
         category: 'signal_updates',
         linkUrl: nextIsPremium
           ? '/dashboard'
@@ -2473,9 +2492,17 @@ app.patch('/api/signals/:id', requireRole('admin'), async (req: AuthRequest, res
         targetGroup: nextIsPremium ? 'registered' : 'all',
         publishedAt: now,
         dedupKey: `signal_update:${signalUpdateId}`,
+        skipWebPush: true,
         broadcastWs,
       });
       pushJob = dispatchRes.push_job;
+
+      await sendPushToAllSubscribers({
+        title: 'MeridianFX Signal Alert',
+        body: `${nextPair} · ${nextStatus}: ${updateBody}`,
+        url: '/signals',
+        tag: `mfx-signal-update-${signalUpdateId}`,
+      });
     }
   }
 
@@ -2563,9 +2590,17 @@ app.post('/api/signals/:id/updates', requireRole('admin'), async (req: AuthReque
       targetGroup: isPremium ? 'registered' : 'all',
       publishedAt: now,
       dedupKey: `signal_update:${signalUpdateId}`,
+      skipWebPush: true,
       broadcastWs,
     });
     pushJob = dispatchRes.push_job;
+
+    await sendPushToAllSubscribers({
+      title: 'MeridianFX Signal Alert',
+      body: `${String(existing.pair)} · ${nextStatus}: ${parsed.data.note}`,
+      url: '/signals',
+      tag: `mfx-signal-update-${signalUpdateId}`,
+    });
   }
 
   res.status(201).json({
@@ -2752,9 +2787,17 @@ app.post('/api/updates', requireRole('admin'), async (req: AuthRequest, res: Res
         targetGroup: isPremium ? 'registered' : 'all',
         publishedAt: now,
         dedupKey: `market_update:${id}`,
+        skipWebPush: true,
         broadcastWs,
       });
       pushJob = dispatchRes.push_job;
+
+      await sendPushToAllSubscribers({
+        title: 'MeridianFX Market Update',
+        body: `${d.title} — ${d.content.slice(0, 140)}`,
+        url: '/updates',
+        tag: `mfx-update-${id}`,
+      });
     }
   }
 
@@ -2865,7 +2908,15 @@ app.patch('/api/updates/:id', requireRole('admin'), async (req: AuthRequest, res
         targetGroup: nextIsPremium ? 'registered' : 'all',
         publishedAt: now,
         dedupKey: `market_update:${String(req.params.id)}`,
+        skipWebPush: true,
         broadcastWs,
+      });
+
+      await sendPushToAllSubscribers({
+        title: 'MeridianFX Market Update',
+        body: `${nextTitle} — ${nextContent.slice(0, 140)}`,
+        url: '/updates',
+        tag: `mfx-update-${String(req.params.id)}`,
       });
     }
   } else if (!nextIsPremium) {
@@ -4288,6 +4339,26 @@ function parseDeviceMetadata(ua: string, explicitPlatform?: string): {
 }
 
 app.post('/api/push/subscribe', optionalAuth, rateLimit(30, 60_000), async (req: AuthRequest, res: Response) => {
+  const rawBody = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, unknown>;
+  const subPayload =
+    rawBody.subscription && typeof rawBody.subscription === 'object'
+      ? (rawBody.subscription as Record<string, unknown>)
+      : rawBody;
+  const rawKeys =
+    subPayload.keys && typeof subPayload.keys === 'object'
+      ? (subPayload.keys as Record<string, unknown>)
+      : { p256dh: subPayload.p256dh, auth: subPayload.auth };
+
+  const normalizedInput = {
+    endpoint: subPayload.endpoint ?? rawBody.endpoint,
+    keys: rawKeys,
+    platform: rawBody.platform,
+    browser_name: rawBody.browser_name,
+    old_endpoint: rawBody.old_endpoint,
+    prefs: rawBody.prefs,
+    isMuted: rawBody.isMuted ?? rawBody.is_muted,
+  };
+
   const schema = z.object({
     endpoint: z.string().url().refine(isAllowedPushEndpointUrl, 'Invalid push endpoint protocol.'),
     keys: z.object({
@@ -4298,8 +4369,9 @@ app.post('/api/push/subscribe', optionalAuth, rateLimit(30, 60_000), async (req:
     browser_name: z.string().max(60).optional(),
     old_endpoint: z.string().url().optional(),
     prefs: pushPrefsSchema.optional(),
+    isMuted: z.boolean().optional(),
   });
-  const parsed = schema.safeParse(req.body);
+  const parsed = schema.safeParse(normalizedInput);
   if (!parsed.success) {
     res.status(400).json({ error: 'Invalid push subscription object.' });
     return;
@@ -4321,8 +4393,10 @@ app.post('/api/push/subscribe', optionalAuth, rateLimit(30, 60_000), async (req:
   }
 
   const existingSub = db
-    .prepare('SELECT prefs_json, sound_enabled FROM push_subscriptions WHERE endpoint = ?')
-    .get(parsed.data.endpoint) as { prefs_json?: string; sound_enabled?: number } | undefined;
+    .prepare('SELECT prefs_json, sound_enabled, is_muted FROM push_subscriptions WHERE endpoint = ?')
+    .get(parsed.data.endpoint) as
+    | { prefs_json?: string; sound_enabled?: number; is_muted?: number }
+    | undefined;
 
   const visitorPrefRow = visitorId
     ? (db
@@ -4338,12 +4412,21 @@ app.post('/api/push/subscribe', optionalAuth, rateLimit(30, 60_000), async (req:
   });
   const prefsJson = JSON.stringify(effectivePrefs);
 
+  const isMutedVal =
+    typeof parsed.data.isMuted === 'boolean'
+      ? parsed.data.isMuted
+        ? 1
+        : 0
+      : existingSub?.is_muted !== undefined
+        ? Number(existingSub.is_muted ? 1 : 0)
+        : 0;
+
   db.prepare(
     `INSERT INTO push_subscriptions (
       id, user_id, visitor_id, endpoint, p256dh, auth, user_agent, platform,
       transport, token, browser_name, device_label,
-      prefs_json, sound_enabled, failure_count, active, last_error, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'web_push', NULL, ?, ?, ?, ?, 0, 1, NULL, ?, ?)
+      prefs_json, sound_enabled, is_muted, failure_count, active, last_error, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'web_push', NULL, ?, ?, ?, ?, ?, 0, 1, NULL, ?, ?)
     ON CONFLICT(endpoint) DO UPDATE SET
       user_id = COALESCE(excluded.user_id, push_subscriptions.user_id),
       visitor_id = COALESCE(excluded.visitor_id, push_subscriptions.visitor_id),
@@ -4356,6 +4439,7 @@ app.post('/api/push/subscribe', optionalAuth, rateLimit(30, 60_000), async (req:
       device_label = excluded.device_label,
       prefs_json = excluded.prefs_json,
       sound_enabled = excluded.sound_enabled,
+      is_muted = excluded.is_muted,
       failure_count = 0,
       active = 1,
       last_error = NULL,
@@ -4373,6 +4457,7 @@ app.post('/api/push/subscribe', optionalAuth, rateLimit(30, 60_000), async (req:
     deviceLabel,
     prefsJson,
     effectivePrefs.sound_enabled ? 1 : 0,
+    isMutedVal,
     now,
     now
   );
@@ -4380,17 +4465,90 @@ app.post('/api/push/subscribe', optionalAuth, rateLimit(30, 60_000), async (req:
   await syncPushSubscriptionToRemote(parsed.data.endpoint);
 
   const subRow = db
-    .prepare('SELECT id FROM push_subscriptions WHERE endpoint = ?')
-    .get(parsed.data.endpoint) as { id: string } | undefined;
+    .prepare('SELECT id, is_muted FROM push_subscriptions WHERE endpoint = ?')
+    .get(parsed.data.endpoint) as { id: string; is_muted: number } | undefined;
 
   res.status(201).json({
     ok: true,
     subscription_id: subRow?.id || null,
     active: true,
+    isMuted: Boolean(subRow?.is_muted),
     platform: meta.platform,
     device_label: deviceLabel,
     prefs: effectivePrefs,
   });
+});
+
+app.post('/api/push/mute', optionalAuth, rateLimit(60, 60_000), async (req: AuthRequest, res: Response) => {
+  const schema = z.object({
+    endpoint: z.string().url().optional(),
+    muted: z.boolean().optional(),
+    isMuted: z.boolean().optional(),
+  });
+  const parsed = schema.safeParse(req.body || {});
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid mute payload.' });
+    return;
+  }
+
+  const actor = resolveReactionActor(req, res, true);
+  const now = new Date().toISOString();
+  let targetEndpoint = parsed.data.endpoint || '';
+
+  let subRow: { endpoint: string; is_muted?: number; prefs_json?: string } | undefined;
+  if (targetEndpoint) {
+    subRow = db
+      .prepare('SELECT endpoint, is_muted, prefs_json FROM push_subscriptions WHERE endpoint = ?')
+      .get(targetEndpoint) as typeof subRow;
+  } else if (actor?.userId) {
+    subRow = db
+      .prepare(
+        'SELECT endpoint, is_muted, prefs_json FROM push_subscriptions WHERE user_id = ? AND COALESCE(active, 1) = 1 ORDER BY updated_at DESC LIMIT 1'
+      )
+      .get(actor.userId) as typeof subRow;
+    targetEndpoint = subRow?.endpoint || '';
+  } else if (actor?.visitorId) {
+    subRow = db
+      .prepare(
+        'SELECT endpoint, is_muted, prefs_json FROM push_subscriptions WHERE visitor_id = ? AND COALESCE(active, 1) = 1 ORDER BY updated_at DESC LIMIT 1'
+      )
+      .get(actor.visitorId) as typeof subRow;
+    targetEndpoint = subRow?.endpoint || '';
+  }
+
+  const explicitMuted =
+    parsed.data.muted !== undefined ? parsed.data.muted : parsed.data.isMuted;
+  const nextMuted =
+    explicitMuted !== undefined ? explicitMuted : !Boolean(subRow?.is_muted);
+
+  const existingPrefs = normalizeNotificationPrefs(subRow?.prefs_json || '{}');
+  const nextPrefs = normalizeNotificationPrefs({
+    ...existingPrefs,
+    signals: !nextMuted,
+    signal_updates: !nextMuted,
+    signal_chat: !nextMuted,
+    market_updates: !nextMuted,
+    announcements: !nextMuted,
+  });
+  const prefsJson = JSON.stringify(nextPrefs);
+
+  if (targetEndpoint) {
+    db.prepare(
+      'UPDATE push_subscriptions SET is_muted = ?, prefs_json = ?, updated_at = ? WHERE endpoint = ?'
+    ).run(nextMuted ? 1 : 0, prefsJson, now, targetEndpoint);
+    await syncPushSubscriptionToRemote(targetEndpoint);
+  }
+  if (actor?.visitorId) {
+    db.prepare(
+      `INSERT INTO visitor_preferences (visitor_id, prefs_json, sound_enabled, updated_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(visitor_id) DO UPDATE SET
+         prefs_json = excluded.prefs_json,
+         updated_at = excluded.updated_at`
+    ).run(actor.visitorId, prefsJson, nextPrefs.sound_enabled ? 1 : 0, now);
+  }
+
+  res.json({ ok: true, isMuted: nextMuted, muted: nextMuted, prefs: nextPrefs });
 });
 
 app.post('/api/push/register-native', optionalAuth, rateLimit(30, 60_000), (req: AuthRequest, res: Response) => {
@@ -4488,21 +4646,21 @@ app.get('/api/push/preferences', optionalAuth, (req: AuthRequest, res: Response)
   const endpoint = typeof req.query.endpoint === 'string' ? req.query.endpoint.trim() : '';
   const actor = resolveReactionActor(req, res, false);
 
-  let row: { prefs_json?: string; sound_enabled?: number; active?: number } | undefined;
+  let row: { prefs_json?: string; sound_enabled?: number; active?: number; is_muted?: number } | undefined;
   if (endpoint) {
     row = db
-      .prepare('SELECT prefs_json, sound_enabled, active FROM push_subscriptions WHERE endpoint = ?')
+      .prepare('SELECT prefs_json, sound_enabled, active, is_muted FROM push_subscriptions WHERE endpoint = ?')
       .get(endpoint) as typeof row;
   } else if (actor?.userId) {
     row = db
       .prepare(
-        'SELECT prefs_json, sound_enabled, active FROM push_subscriptions WHERE user_id = ? AND COALESCE(active, 1) = 1 ORDER BY updated_at DESC LIMIT 1'
+        'SELECT prefs_json, sound_enabled, active, is_muted FROM push_subscriptions WHERE user_id = ? AND COALESCE(active, 1) = 1 ORDER BY updated_at DESC LIMIT 1'
       )
       .get(actor.userId) as typeof row;
   } else if (actor?.visitorId) {
     row = db
       .prepare(
-        'SELECT prefs_json, sound_enabled, active FROM push_subscriptions WHERE visitor_id = ? AND COALESCE(active, 1) = 1 ORDER BY updated_at DESC LIMIT 1'
+        'SELECT prefs_json, sound_enabled, active, is_muted FROM push_subscriptions WHERE visitor_id = ? AND COALESCE(active, 1) = 1 ORDER BY updated_at DESC LIMIT 1'
       )
       .get(actor.visitorId) as typeof row;
   }
@@ -4527,7 +4685,11 @@ app.get('/api/push/preferences', optionalAuth, (req: AuthRequest, res: Response)
     ...base,
     ...(soundFlag !== undefined ? { sound_enabled: soundFlag } : {}),
   });
-  res.json({ prefs, subscribed: Boolean(row && row.active !== 0) });
+  const isMuted =
+    row?.is_muted !== undefined
+      ? Boolean(row.is_muted)
+      : prefs.signals === false && prefs.signal_chat === false && prefs.market_updates === false;
+  res.json({ prefs, subscribed: Boolean(row && row.active !== 0), isMuted });
 });
 
 app.patch('/api/push/preferences', optionalAuth, async (req: AuthRequest, res: Response) => {
@@ -4570,23 +4732,29 @@ app.patch('/api/push/preferences', optionalAuth, async (req: AuthRequest, res: R
   });
   const prefsJson = JSON.stringify(nextPrefs);
   const soundVal = nextPrefs.sound_enabled ? 1 : 0;
+  const mutedVal =
+    nextPrefs.signals === false &&
+    nextPrefs.signal_chat === false &&
+    nextPrefs.market_updates === false
+      ? 1
+      : 0;
 
   if (parsed.data.endpoint) {
     db.prepare(
-      'UPDATE push_subscriptions SET prefs_json = ?, sound_enabled = ?, updated_at = ? WHERE endpoint = ?'
-    ).run(prefsJson, soundVal, now, parsed.data.endpoint);
+      'UPDATE push_subscriptions SET prefs_json = ?, sound_enabled = ?, is_muted = ?, updated_at = ? WHERE endpoint = ?'
+    ).run(prefsJson, soundVal, mutedVal, now, parsed.data.endpoint);
     await syncPushSubscriptionToRemote(parsed.data.endpoint);
   }
   if (req.user) {
     db.prepare('UPDATE users SET notification_prefs = ? WHERE id = ?').run(prefsJson, req.user.id);
     db.prepare(
-      'UPDATE push_subscriptions SET prefs_json = ?, sound_enabled = ?, updated_at = ? WHERE user_id = ?'
-    ).run(prefsJson, soundVal, now, req.user.id);
+      'UPDATE push_subscriptions SET prefs_json = ?, sound_enabled = ?, is_muted = ?, updated_at = ? WHERE user_id = ?'
+    ).run(prefsJson, soundVal, mutedVal, now, req.user.id);
   }
   if (actor?.visitorId) {
     db.prepare(
-      'UPDATE push_subscriptions SET prefs_json = ?, sound_enabled = ?, updated_at = ? WHERE visitor_id = ?'
-    ).run(prefsJson, soundVal, now, actor.visitorId);
+      'UPDATE push_subscriptions SET prefs_json = ?, sound_enabled = ?, is_muted = ?, updated_at = ? WHERE visitor_id = ?'
+    ).run(prefsJson, soundVal, mutedVal, now, actor.visitorId);
     db.prepare(
       `INSERT INTO visitor_preferences (visitor_id, prefs_json, sound_enabled, updated_at)
        VALUES (?, ?, ?, ?)
@@ -4597,7 +4765,7 @@ app.patch('/api/push/preferences', optionalAuth, async (req: AuthRequest, res: R
     ).run(actor.visitorId, prefsJson, soundVal, now);
   }
 
-  res.json({ ok: true, prefs: nextPrefs });
+  res.json({ ok: true, prefs: nextPrefs, isMuted: Boolean(mutedVal) });
 });
 
 app.post('/api/push/test', optionalAuth, rateLimit(8, 60_000), async (req: AuthRequest, res: Response) => {

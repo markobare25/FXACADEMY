@@ -3,6 +3,13 @@ import http2 from 'node:http2';
 import * as webpush from 'web-push';
 import { db, logSystemEvent } from './db.ts';
 import { normalizeNotificationPrefs } from './auth.ts';
+import { deleteRemotePushSubscription } from './persistentStore.ts';
+import {
+  VAPID_KEY_SOURCE,
+  VAPID_PRIVATE_KEY,
+  VAPID_PUBLIC_KEY,
+  VAPID_SUBJECT,
+} from '../lib/vapid.ts';
 import type {
   NotificationPreferences,
   PushDeliveryRecord,
@@ -14,7 +21,7 @@ import type {
 
 let vapidReady = false;
 let lastVapidFingerprint = '';
-let vapidSource: 'env' | 'database' = 'database';
+let vapidSource: 'env' | 'database' = VAPID_KEY_SOURCE === 'env' ? 'env' : 'database';
 let cachedVapidPublic = '';
 let wsBroadcaster: ((event: string, data: unknown) => void) | null = null;
 let queueProcessingPromise: Promise<void> | null = null;
@@ -33,52 +40,14 @@ export function setPushWsBroadcaster(fn: (event: string, data: unknown) => void)
 }
 
 export function ensureVapidKeys(): { publicKey: string; privateKey: string; source: 'env' | 'database' } {
-  const envPublic = (process.env.VAPID_PUBLIC_KEY || '').trim();
-  const envPrivate = (process.env.VAPID_PRIVATE_KEY || '').trim();
-
-  let publicKey = '';
-  let privateKey = '';
-
-  if (envPublic && envPrivate) {
-    publicKey = envPublic;
-    privateKey = envPrivate;
-    vapidSource = 'env';
-  } else {
-    vapidSource = 'database';
-    const pubRow = db
-      .prepare('SELECT value FROM platform_settings WHERE key = ?')
-      .get('vapid_public_key') as { value: string } | undefined;
-    const privRow = db
-      .prepare('SELECT value FROM platform_settings WHERE key = ?')
-      .get('vapid_private_key') as { value: string } | undefined;
-
-    publicKey = pubRow?.value || '';
-    privateKey = privRow?.value || '';
-
-    if (!publicKey || !privateKey) {
-      const keys = webpush.generateVAPIDKeys();
-      publicKey = keys.publicKey;
-      privateKey = keys.privateKey;
-      db.prepare('INSERT OR REPLACE INTO platform_settings (key, value) VALUES (?, ?)').run(
-        'vapid_public_key',
-        publicKey
-      );
-      db.prepare('INSERT OR REPLACE INTO platform_settings (key, value) VALUES (?, ?)').run(
-        'vapid_private_key',
-        privateKey
-      );
-    }
-  }
-
+  const publicKey = VAPID_PUBLIC_KEY;
+  const privateKey = VAPID_PRIVATE_KEY;
+  vapidSource = VAPID_KEY_SOURCE === 'env' ? 'env' : 'database';
   cachedVapidPublic = publicKey;
-  const fingerprint = `${publicKey}:${privateKey.slice(0, 8)}`;
+
+  const fingerprint = `${VAPID_SUBJECT}:${publicKey}:${privateKey.slice(0, 8)}`;
   if (!vapidReady || lastVapidFingerprint !== fingerprint) {
-    const contactEmailRow = db
-      .prepare('SELECT value FROM platform_settings WHERE key = ?')
-      .get('contact_email') as { value: string } | undefined;
-    const rawEmail = (contactEmailRow?.value || 'desk@meridianfx.com').trim();
-    const safeEmail = rawEmail.includes('@') ? rawEmail : 'desk@meridianfx.com';
-    webpush.setVapidDetails(`mailto:${safeEmail}`, publicKey, privateKey);
+    webpush.setVapidDetails(VAPID_SUBJECT, publicKey, privateKey);
     vapidReady = true;
     lastVapidFingerprint = fingerprint;
   }
@@ -420,6 +389,7 @@ export interface DispatchPayload {
   targetGroup?: PushTargetGroup;
   respectPrefs?: boolean;
   sound?: boolean;
+  skipWebPush?: boolean;
   broadcastWs?: (event: string, data: unknown) => void;
 }
 
@@ -869,14 +839,15 @@ export async function dispatchNotification(payload: DispatchPayload): Promise<Di
       email_verified: number | null;
     }> = [];
 
-    if (isPushEnabled) {
+    if (isPushEnabled && !payload.skipWebPush) {
       const subs = db
         .prepare(
           `SELECT ps.id, ps.user_id, ps.visitor_id, ps.endpoint, ps.transport, ps.prefs_json,
                   u.notification_prefs, u.status, u.role, u.email_verified
            FROM push_subscriptions ps
            LEFT JOIN users u ON ps.user_id = u.id
-           WHERE COALESCE(ps.active, 1) = 1`
+           WHERE COALESCE(ps.active, 1) = 1
+             AND COALESCE(ps.is_muted, 0) = 0`
         )
         .all() as typeof eligibleSubs;
 
@@ -1043,6 +1014,106 @@ function isPermanentInvalidSubscriptionError(statusCode: number | null, errMsg: 
   return false;
 }
 
+export async function sendPushToAllSubscribers(params: {
+  title: string;
+  body: string;
+  url: string;
+  tag?: string;
+}): Promise<{
+  targeted: number;
+  sent: number;
+  removed: number;
+  failed: number;
+}> {
+  ensureVapidKeys();
+
+  const subs = db
+    .prepare(
+      `SELECT id, endpoint, p256dh, auth, prefs_json
+       FROM push_subscriptions
+       WHERE COALESCE(is_muted, 0) = 0
+         AND COALESCE(active, 1) = 1
+         AND COALESCE(transport, 'web_push') = 'web_push'`
+    )
+    .all() as Array<{
+    id: string;
+    endpoint: string;
+    p256dh: string;
+    auth: string;
+    prefs_json: string | null;
+  }>;
+
+  if (subs.length === 0) {
+    return { targeted: 0, sent: 0, removed: 0, failed: 0 };
+  }
+
+  const payloadJson = JSON.stringify({
+    title: params.title,
+    body: buildNotificationPreviewBody(params.body),
+    url: params.url || '/signals',
+    tag: params.tag || `mfx-alert-${Date.now()}`,
+  });
+
+  const now = new Date().toISOString();
+  let sent = 0;
+  let removed = 0;
+  let failed = 0;
+
+  await Promise.allSettled(
+    subs.map(async (sub) => {
+      try {
+        await webpush.sendNotification(
+          {
+            endpoint: sub.endpoint,
+            keys: { p256dh: sub.p256dh, auth: sub.auth },
+          },
+          payloadJson,
+          { TTL: 86400, urgency: 'high' }
+        );
+        sent += 1;
+        db.prepare(
+          `UPDATE push_subscriptions
+           SET last_success_at = ?, last_error = NULL, failure_count = 0, updated_at = ?
+           WHERE id = ?`
+        ).run(now, now, sub.id);
+      } catch (err: unknown) {
+        const statusCode =
+          typeof (err as { statusCode?: unknown })?.statusCode === 'number'
+            ? Number((err as { statusCode: number }).statusCode)
+            : null;
+        const errMsg = err instanceof Error ? err.message : String(err || 'Web Push error');
+
+        if (statusCode === 410 || statusCode === 404) {
+          removed += 1;
+          db.prepare('DELETE FROM push_subscriptions WHERE endpoint = ?').run(sub.endpoint);
+          await deleteRemotePushSubscription(sub.endpoint);
+          logSystemEvent(
+            'info',
+            'push-cleanup',
+            `Removed expired push subscription (${statusCode}): ${sub.id}`
+          );
+        } else {
+          failed += 1;
+          db.prepare(
+            `UPDATE push_subscriptions
+             SET failure_count = COALESCE(failure_count, 0) + 1,
+                 last_error = ?,
+                 updated_at = ?
+             WHERE id = ?`
+          ).run(errMsg.slice(0, 240), now, sub.id);
+        }
+      }
+    })
+  );
+
+  return {
+    targeted: subs.length,
+    sent,
+    removed,
+    failed,
+  };
+}
+
 export async function sendDirectTestPush(subscriptionId: string): Promise<{
   ok: boolean;
   statusCode?: number;
@@ -1196,6 +1267,7 @@ export async function processPendingPushDeliveries(options?: {
          JOIN push_subscriptions ps ON ps.id = d.subscription_id
          LEFT JOIN users u ON ps.user_id = u.id
          WHERE d.status IN ('queued', 'retrying')
+           AND COALESCE(ps.is_muted, 0) = 0
            AND d.next_attempt_at <= ?
            ${options?.jobId ? 'AND d.job_id = ?' : ''}
          ORDER BY d.next_attempt_at ASC

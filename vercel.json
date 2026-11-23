@@ -13,7 +13,7 @@
     { "source": "/api/(.*)", "destination": "/api" },
     { "source": "/uploads/(.*)", "destination": "/api" },
     {
-      "source": "/((?!api/|uploads/|assets/|sw\\.js|manifest\\.webmanifest).*)",
+      "source": "/((?!api/|uploads/|assets/|sw\\.js|manifest\\.webmanifest|manifest\\.json|icon-192\\.png|pwa-192x192\\.png|pwa-512x512\\.png|pwa-maskable-512x512\\.png|apple-touch-icon\\.png|icon\\.svg).*)",
       "destination": "/index.html"
     }
   ]

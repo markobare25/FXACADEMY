@@ -239,8 +239,8 @@ function upsertLocalPushSubscription(row: Record<string, unknown>): void {
     `INSERT INTO push_subscriptions (
       id, user_id, visitor_id, endpoint, p256dh, auth, user_agent, platform,
       transport, token, browser_name, device_label, prefs_json, sound_enabled,
-      failure_count, active, last_error, last_success_at, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      is_muted, failure_count, active, last_error, last_success_at, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(endpoint) DO UPDATE SET
       user_id = COALESCE(excluded.user_id, push_subscriptions.user_id),
       visitor_id = COALESCE(excluded.visitor_id, push_subscriptions.visitor_id),
@@ -253,6 +253,7 @@ function upsertLocalPushSubscription(row: Record<string, unknown>): void {
       device_label = excluded.device_label,
       prefs_json = excluded.prefs_json,
       sound_enabled = excluded.sound_enabled,
+      is_muted = excluded.is_muted,
       active = excluded.active,
       updated_at = excluded.updated_at`
   ).run(
@@ -273,6 +274,7 @@ function upsertLocalPushSubscription(row: Record<string, unknown>): void {
         '{"signals":true,"signal_updates":true,"signal_chat":true,"market_updates":true,"academy":true,"economic_calendar":true,"announcements":true,"sound_enabled":true}'
     ),
     Number(row.sound_enabled ?? 1) ? 1 : 0,
+    Number(row.is_muted ?? row.isMuted ?? 0) ? 1 : 0,
     Number(row.failure_count || 0),
     Number(row.active ?? 1) ? 1 : 0,
     row.last_error ? String(row.last_error) : null,
@@ -426,9 +428,38 @@ export async function syncPushSubscriptionToRemote(endpoint: string): Promise<vo
     | undefined;
   if (!row) return;
 
-  await restRequest('push_subscriptions?on_conflict=endpoint', {
-    method: 'POST',
-    headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
-    body: JSON.stringify([row]),
+  const cfg = getSupabaseConfig();
+  if (!cfg) return;
+
+  try {
+    const res = await fetch(`${cfg.url}/rest/v1/push_subscriptions?on_conflict=endpoint`, {
+      method: 'POST',
+      headers: {
+        apikey: cfg.key,
+        Authorization: `Bearer ${cfg.key}`,
+        'Content-Type': 'application/json',
+        Prefer: 'resolution=merge-duplicates,return=minimal',
+      },
+      body: JSON.stringify([row]),
+    });
+    if (!res.ok && 'is_muted' in row) {
+      const legacyRow = { ...row };
+      delete legacyRow.is_muted;
+      await restRequest('push_subscriptions?on_conflict=endpoint', {
+        method: 'POST',
+        headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
+        body: JSON.stringify([legacyRow]),
+      });
+    }
+  } catch {
+    // ignore transient remote sync failures
+  }
+}
+
+export async function deleteRemotePushSubscription(endpoint: string): Promise<void> {
+  if (!isRemotePersistentStoreEnabled() || !endpoint) return;
+  await restRequest(`push_subscriptions?endpoint=eq.${encodeURIComponent(endpoint)}`, {
+    method: 'DELETE',
+    headers: { Prefer: 'return=minimal' },
   });
 }
