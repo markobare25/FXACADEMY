@@ -34,11 +34,13 @@ clientsClaim();
 cleanupOutdatedCaches();
 precacheAndRoute(self.__WB_MANIFEST || []);
 
-// Never cache auth, push registration/ack, or real-time delta sync calls
+// Never cache auth, admin APIs, push registration/ack, or real-time delta sync calls
 registerRoute(
   ({ url }) =>
     url.pathname.startsWith('/api/push/') ||
     url.pathname.startsWith('/api/auth/') ||
+    url.pathname.startsWith('/api/admin/') ||
+    url.searchParams.get('includeAll') === 'true' ||
     (url.pathname === '/api/signals/messages' && url.searchParams.has('after')),
   new NetworkOnly()
 );

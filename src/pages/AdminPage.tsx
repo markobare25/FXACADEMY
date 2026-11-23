@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   BarChart3,
   Bell,
@@ -33,11 +33,15 @@ import { formatLocalDateTime } from '../lib/api';
 import {
   adminApiFetch,
   adminUploadMediaFile,
-  bootstrapAdminSession,
+  bootstrapAdminSessionDetailed,
   getAdminAccessToken,
+  getAdminAccessTokenRemainingMs,
+  getAdminAuthEpoch,
   loginAdmin,
   logoutAdmin,
   refreshAdminSession,
+  refreshAdminSessionDetailed,
+  subscribeAdminAuthSync,
 } from '../lib/adminApi';
 import { sendTestPushNotification } from '../lib/pushClient';
 import { AdminAcademyManager } from '../components/admin/AdminAcademyManager';
@@ -111,12 +115,19 @@ export const AdminPage: React.FC = () => {
   // Isolated Admin Session State
   const [adminUser, setAdminUser] = useState<User | null>(null);
   const [adminAuthLoading, setAdminAuthLoading] = useState(true);
+  const [bootNetworkIssue, setBootNetworkIssue] = useState(false);
+  const adminUserRef = useRef<User | null>(null);
+  const explicitSigningOutRef = useRef(false);
   const [loginIdentifier, setLoginIdentifier] = useState('');
   const [loginPassword, setLoginPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [rememberMe, setRememberMe] = useState(true);
   const [loginSubmitting, setLoginSubmitting] = useState(false);
   const [loginError, setLoginError] = useState<string | null>(null);
+
+  useEffect(() => {
+    adminUserRef.current = adminUser;
+  }, [adminUser]);
 
   // Dashboard State
   const [tab, setTab] = useState<AdminTab>('overview');
@@ -239,27 +250,89 @@ export const AdminPage: React.FC = () => {
     setSettingsForm(settings);
   }, [settings]);
 
-  // Bootstrap isolated /admin session on mount
+  const restoreAdminSession = useCallback(async (isInitialBoot = false) => {
+    const startEpoch = getAdminAuthEpoch();
+    if (isInitialBoot) {
+      setAdminAuthLoading(true);
+    }
+    try {
+      const outcome = await bootstrapAdminSessionDetailed();
+      if (getAdminAuthEpoch() !== startEpoch) {
+        return;
+      }
+      if (outcome.status === 'authenticated') {
+        setBootNetworkIssue(false);
+        setLoginError(null);
+        if (outcome.user.role === 'admin') {
+          setAdminUser((prev) =>
+            prev && prev.id === outcome.user.id && prev.role === outcome.user.role
+              ? prev
+              : outcome.user
+          );
+        } else {
+          setAdminUser(null);
+        }
+      } else if (outcome.status === 'network_error') {
+        if (!adminUserRef.current) {
+          setBootNetworkIssue(true);
+        }
+      } else {
+        setBootNetworkIssue(false);
+        setAdminUser(null);
+      }
+    } finally {
+      if (isInitialBoot && getAdminAuthEpoch() === startEpoch) {
+        setAdminAuthLoading(false);
+      }
+    }
+  }, []);
+
+  // Bootstrap isolated /admin session on mount & sync across tabs
   useEffect(() => {
     let active = true;
-    bootstrapAdminSession()
-      .then((u) => {
-        if (active) setAdminUser(u && u.role === 'admin' ? u : null);
-      })
-      .finally(() => {
-        if (active) setAdminAuthLoading(false);
-      });
+    void restoreAdminSession(true);
 
     const handleExpired = () => {
+      if (!active || explicitSigningOutRef.current) return;
       setAdminUser(null);
+      setOverview(null);
+      setRegistrations(null);
+      setBootNetworkIssue(false);
       setLoginError('Administrator session expired. Please sign in again.');
     };
+
+    const unsubscribeSync = subscribeAdminAuthSync((eventType) => {
+      if (!active) return;
+      if (eventType === 'logout') {
+        setAdminUser(null);
+        setOverview(null);
+        setRegistrations(null);
+        setBootNetworkIssue(false);
+        setLoginError(null);
+      } else if (eventType === 'login') {
+        void restoreAdminSession(false);
+      }
+    });
+
     window.addEventListener('mfx:admin-auth-expired', handleExpired);
     return () => {
       active = false;
+      unsubscribeSync();
       window.removeEventListener('mfx:admin-auth-expired', handleExpired);
     };
-  }, []);
+  }, [restoreAdminSession]);
+
+  // Retry initial boot session restoration automatically when connection returns
+  useEffect(() => {
+    if (!bootNetworkIssue || adminUser) return;
+    const handleOnline = () => {
+      void restoreAdminSession(true);
+    };
+    window.addEventListener('online', handleOnline);
+    return () => {
+      window.removeEventListener('online', handleOnline);
+    };
+  }, [bootNetworkIssue, adminUser, restoreAdminSession]);
 
   const notifyOk = useCallback((msg: string) => {
     setErrorMsg(null);
@@ -267,8 +340,11 @@ export const AdminPage: React.FC = () => {
     window.setTimeout(() => setToast(null), 4000);
   }, []);
 
+  const adminUserId = adminUser?.id || null;
+  const adminUserRole = adminUser?.role || null;
+
   const loadAdminData = useCallback(async () => {
-    if (!adminUser || adminUser.role !== 'admin') return;
+    if (!adminUserId || adminUserRole !== 'admin') return;
     try {
       const [ov, reg, upd, usr, rep, diag] = await Promise.all([
         adminApiFetch<OverviewPayload>('/api/admin/overview'),
@@ -287,15 +363,99 @@ export const AdminPage: React.FC = () => {
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Failed to load admin console data.');
     }
-  }, [adminUser]);
+  }, [adminUserId, adminUserRole]);
 
   useEffect(() => {
     loadAdminData();
   }, [loadAdminData]);
 
+  // Proactive silent token renewal & background/offline recovery (never drops session on network outage)
+  useEffect(() => {
+    if (!adminUserId || adminUserRole !== 'admin') return;
+    let cancelled = false;
+    let timerId: number | null = null;
+
+    const scheduleRenewal = (delayMs?: number) => {
+      if (cancelled) return;
+      if (timerId !== null) {
+        window.clearTimeout(timerId);
+        timerId = null;
+      }
+      const remainingMs = getAdminAccessTokenRemainingMs();
+      const targetDelay =
+        typeof delayMs === 'number'
+          ? Math.max(10_000, delayMs)
+          : Math.max(20_000, remainingMs - 120_000);
+
+      timerId = window.setTimeout(async () => {
+        if (cancelled) return;
+        const epochBefore = getAdminAuthEpoch();
+        const res = await refreshAdminSessionDetailed();
+        if (cancelled || getAdminAuthEpoch() !== epochBefore) return;
+
+        if (res.status === 'ok') {
+          setAdminUser((prev) =>
+            prev && prev.id === res.user.id && prev.role === res.user.role ? prev : res.user
+          );
+          scheduleRenewal();
+        } else if (res.status === 'network_error') {
+          // Keep current session alive and retry shortly when network settles
+          scheduleRenewal(30_000);
+        } else {
+          setAdminUser(null);
+          setOverview(null);
+          setRegistrations(null);
+          setLoginError('Administrator session expired. Please sign in again.');
+        }
+      }, targetDelay);
+    };
+
+    const refreshIfNeededOnResume = async () => {
+      if (cancelled) return;
+      if (document.visibilityState === 'hidden') return;
+      if (!getAdminAccessToken() || getAdminAccessTokenRemainingMs() < 180_000) {
+        const epochBefore = getAdminAuthEpoch();
+        const res = await refreshAdminSessionDetailed();
+        if (cancelled || getAdminAuthEpoch() !== epochBefore) return;
+        if (res.status === 'ok') {
+          setAdminUser((prev) =>
+            prev && prev.id === res.user.id && prev.role === res.user.role ? prev : res.user
+          );
+          scheduleRenewal();
+        } else if (res.status === 'unauthorized') {
+          setAdminUser(null);
+          setOverview(null);
+          setRegistrations(null);
+          setLoginError('Administrator session expired. Please sign in again.');
+        }
+      }
+    };
+
+    const handleOnline = () => {
+      void refreshIfNeededOnResume().then(() => {
+        if (!cancelled) {
+          void loadAdminData();
+        }
+      });
+    };
+
+    scheduleRenewal();
+    document.addEventListener('visibilitychange', refreshIfNeededOnResume);
+    window.addEventListener('focus', refreshIfNeededOnResume);
+    window.addEventListener('online', handleOnline);
+
+    return () => {
+      cancelled = true;
+      if (timerId !== null) window.clearTimeout(timerId);
+      document.removeEventListener('visibilitychange', refreshIfNeededOnResume);
+      window.removeEventListener('focus', refreshIfNeededOnResume);
+      window.removeEventListener('online', handleOnline);
+    };
+  }, [adminUserId, adminUserRole, loadAdminData]);
+
   // Dedicated Real-Time Admin WebSocket Connection
   useEffect(() => {
-    if (!adminUser || adminUser.role !== 'admin') return;
+    if (!adminUserId || adminUserRole !== 'admin') return;
 
     let ws: WebSocket | null = null;
     let closedByCleanup = false;
@@ -382,7 +542,7 @@ export const AdminPage: React.FC = () => {
       if (reconnectTimer) window.clearTimeout(reconnectTimer);
       if (ws && ws.readyState < 2) ws.close();
     };
-  }, [adminUser, loadAdminData]);
+  }, [adminUserId, adminUserRole, loadAdminData]);
 
   // Poll queued push job until finished
   useEffect(() => {
@@ -405,12 +565,15 @@ export const AdminPage: React.FC = () => {
   const handleAdminSignIn = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoginError(null);
+    setBootNetworkIssue(false);
     setLoginSubmitting(true);
+    explicitSigningOutRef.current = false;
     try {
       const res = await loginAdmin(loginIdentifier.trim(), loginPassword, rememberMe);
       setAdminUser(res.user);
       setLoginPassword('');
       setLoginError(null);
+      setAdminAuthLoading(false);
     } catch (err) {
       setLoginError(
         err instanceof Error ? err.message : 'Unable to sign in to administrator console.'
@@ -421,10 +584,17 @@ export const AdminPage: React.FC = () => {
   };
 
   const handleAdminSignOut = async () => {
-    await logoutAdmin();
-    setAdminUser(null);
-    setOverview(null);
-    setRegistrations(null);
+    explicitSigningOutRef.current = true;
+    try {
+      await logoutAdmin();
+    } finally {
+      setAdminUser(null);
+      setOverview(null);
+      setRegistrations(null);
+      setBootNetworkIssue(false);
+      setLoginError(null);
+      explicitSigningOutRef.current = false;
+    }
   };
 
   // --- Admin Login Screen (Standalone) ---
@@ -436,6 +606,43 @@ export const AdminPage: React.FC = () => {
           <p className="text-sm font-medium text-slate-600 dark:text-slate-300">
             Verifying administrator session...
           </p>
+        </div>
+      </div>
+    );
+  }
+
+  if (bootNetworkIssue && !adminUser) {
+    return (
+      <div className="min-h-screen bg-[#F8FAFC] dark:bg-[#0B0F17] flex items-center justify-center p-4">
+        <div className="w-full max-w-md rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-6 sm:p-8 text-center space-y-4 shadow-sm">
+          <div className="w-12 h-12 rounded-2xl bg-[#881337]/10 dark:bg-rose-500/15 text-[#881337] dark:text-rose-400 flex items-center justify-center mx-auto">
+            <RefreshCw className="w-6 h-6" />
+          </div>
+          <div className="space-y-1.5">
+            <h2 className="text-lg font-bold text-slate-900 dark:text-white">
+              Restoring Administrator Connection
+            </h2>
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              Unable to reach the server while checking your saved session. Your login is not cleared—retry once connected.
+            </p>
+          </div>
+          <div className="flex flex-col sm:flex-row gap-2.5 pt-1">
+            <button
+              type="button"
+              onClick={() => void restoreAdminSession(true)}
+              className="flex-1 inline-flex items-center justify-center gap-2 rounded-xl bg-[#881337] py-2.5 px-4 text-xs font-bold text-white hover:bg-[#6B0F2B]"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+              <span>Retry Session Check</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setBootNetworkIssue(false)}
+              className="flex-1 rounded-xl border border-slate-300 dark:border-slate-700 py-2.5 px-4 text-xs font-semibold text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800"
+            >
+              Show Sign In Form
+            </button>
+          </div>
         </div>
       </div>
     );
@@ -598,13 +805,27 @@ export const AdminPage: React.FC = () => {
       }
       if (!token) throw new Error('Administrator session required to download backups.');
 
-      const res = await fetch(`/api/admin/backups/${encodeURIComponent(filename)}`, {
+      let res = await fetch(`/api/admin/backups/${encodeURIComponent(filename)}`, {
         credentials: 'include',
+        cache: 'no-store',
         headers: {
           Authorization: `Bearer ${token}`,
           'X-Requested-With': 'MeridianFX-Admin',
         },
       });
+      if (res.status === 401) {
+        const refreshed = await refreshAdminSessionDetailed();
+        if (refreshed.status === 'ok') {
+          res = await fetch(`/api/admin/backups/${encodeURIComponent(filename)}`, {
+            credentials: 'include',
+            cache: 'no-store',
+            headers: {
+              Authorization: `Bearer ${refreshed.token}`,
+              'X-Requested-With': 'MeridianFX-Admin',
+            },
+          });
+        }
+      }
       if (!res.ok) throw new Error(`Backup download failed (${res.status})`);
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);

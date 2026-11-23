@@ -73,7 +73,7 @@ initDatabase();
 ensureVapidKeys();
 
 const app = express();
-app.set('trust proxy', 1);
+app.set('trust proxy', true);
 const httpServer = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
@@ -290,7 +290,54 @@ const supportImageUpload = multer({
 
 function isHttpsRequest(req: Request): boolean {
   const proto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
-  return Boolean(req.secure || proto === 'https');
+  const forwarded = String(req.headers['forwarded'] || '').toLowerCase();
+  return Boolean(
+    req.secure ||
+      proto === 'https' ||
+      forwarded.includes('proto=https') ||
+      req.headers['x-forwarded-ssl'] === 'on'
+  );
+}
+
+function buildRefreshCookieOptions(
+  req: Request,
+  cookiePath: string,
+  rememberMe?: boolean
+) {
+  const isHttps = isHttpsRequest(req);
+  return {
+    httpOnly: true,
+    sameSite: isHttps ? ('none' as const) : ('lax' as const),
+    secure: isHttps,
+    ...(isHttps ? { partitioned: true } : {}),
+    ...(rememberMe ? { maxAge: REFRESH_REMEMBER_TTL_SEC * 1000 } : {}),
+    path: cookiePath,
+  };
+}
+
+function clearCookieVariants(req: Request, res: Response, cookieName: string, cookiePath: string): void {
+  const isHttps = isHttpsRequest(req);
+  res.clearCookie(cookieName, {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: isHttps,
+    path: cookiePath,
+  });
+  if (isHttps) {
+    res.clearCookie(cookieName, {
+      httpOnly: true,
+      sameSite: 'none',
+      secure: true,
+      partitioned: true,
+      path: cookiePath,
+    });
+    res.clearCookie(cookieName, {
+      httpOnly: true,
+      sameSite: 'none',
+      secure: true,
+      path: cookiePath,
+    });
+  }
 }
 
 function setRefreshCookie(
@@ -299,35 +346,12 @@ function setRefreshCookie(
   refreshToken: string,
   rememberMe: boolean
 ): void {
-  const isHttps = isHttpsRequest(req);
-  res.cookie('mfx_refresh', refreshToken, {
-    httpOnly: true,
-    sameSite: isHttps ? 'none' : 'lax',
-    secure: isHttps,
-    ...(isHttps ? { partitioned: true } : {}),
-    ...(rememberMe ? { maxAge: REFRESH_REMEMBER_TTL_SEC * 1000 } : {}),
-    path: '/',
-  });
+  res.cookie('mfx_refresh', refreshToken, buildRefreshCookieOptions(req, '/', rememberMe));
 }
 
 function clearRefreshCookie(req: Request, res: Response): void {
-  const isHttps = isHttpsRequest(req);
   for (const cookieName of ['mfx_refresh', 'mfx_session']) {
-    res.clearCookie(cookieName, {
-      httpOnly: true,
-      sameSite: isHttps ? 'none' : 'lax',
-      secure: isHttps,
-      ...(isHttps ? { partitioned: true } : {}),
-      path: '/',
-    });
-    if (isHttps) {
-      res.clearCookie(cookieName, {
-        httpOnly: true,
-        sameSite: 'none',
-        secure: true,
-        path: '/',
-      });
-    }
+    clearCookieVariants(req, res, cookieName, '/');
   }
 }
 
@@ -337,34 +361,15 @@ function setAdminRefreshCookie(
   refreshToken: string,
   rememberMe: boolean
 ): void {
-  const isHttps = isHttpsRequest(req);
-  res.cookie('mfx_admin_refresh', refreshToken, {
-    httpOnly: true,
-    sameSite: isHttps ? 'none' : 'lax',
-    secure: isHttps,
-    ...(isHttps ? { partitioned: true } : {}),
-    ...(rememberMe ? { maxAge: REFRESH_REMEMBER_TTL_SEC * 1000 } : {}),
-    path: '/api/admin',
-  });
+  res.cookie(
+    'mfx_admin_refresh',
+    refreshToken,
+    buildRefreshCookieOptions(req, '/api/admin', rememberMe)
+  );
 }
 
 function clearAdminRefreshCookie(req: Request, res: Response): void {
-  const isHttps = isHttpsRequest(req);
-  res.clearCookie('mfx_admin_refresh', {
-    httpOnly: true,
-    sameSite: isHttps ? 'none' : 'lax',
-    secure: isHttps,
-    ...(isHttps ? { partitioned: true } : {}),
-    path: '/api/admin',
-  });
-  if (isHttps) {
-    res.clearCookie('mfx_admin_refresh', {
-      httpOnly: true,
-      sameSite: 'none',
-      secure: true,
-      path: '/api/admin',
-    });
-  }
+  clearCookieVariants(req, res, 'mfx_admin_refresh', '/api/admin');
 }
 
 // Verify Origin/Host or X-Requested-With on cookie-authenticated state-changing API requests

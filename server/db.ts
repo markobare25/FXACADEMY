@@ -32,7 +32,9 @@ export const BACKUP_DIR = BACKUPS_DIR;
 
 export const DESIGNATED_ADMIN_EMAIL = (
   process.env.DESIGNATED_ADMIN_EMAIL || 'markobare25@gmail.com'
-).toLowerCase();
+)
+  .trim()
+  .toLowerCase();
 
 export const DESIGNATED_ADMIN_PASSWORD =
   process.env.ADMIN_PASSWORD && process.env.ADMIN_PASSWORD.length >= 6
@@ -838,7 +840,11 @@ function seedInitialData(): void {
       );
     }
   } else {
-    adminId = crypto.randomUUID();
+    const hex = crypto
+      .createHash('sha256')
+      .update(`meridianfx-admin:${DESIGNATED_ADMIN_EMAIL}`)
+      .digest('hex');
+    adminId = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-8${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
     db.prepare(
       `INSERT INTO users (
         id, name, email, password_hash, role, status, email_verified,

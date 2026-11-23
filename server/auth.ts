@@ -6,7 +6,8 @@ import type { User, UserRole } from '../src/types.ts';
 export const ACCESS_TOKEN_TTL_SEC = 15 * 60; // 15 minutes
 export const REFRESH_REMEMBER_TTL_SEC = 30 * 24 * 60 * 60; // 30 days
 export const REFRESH_SESSION_TTL_SEC = 12 * 60 * 60; // 12 hours when Remember Me is unchecked
-export const REFRESH_ROTATION_GRACE_MS = 15_000; // 15s grace for concurrent tab reloads
+export const REFRESH_ROTATE_INTERVAL_MS = 60 * 60 * 1000; // Rotate refresh token hourly to avoid concurrent tab races
+export const REFRESH_ROTATION_GRACE_MS = 10 * 60 * 1000; // 10m grace for previous refresh token on slow mobile networks
 
 export interface AuthRequest extends Request {
   user?: User;
@@ -55,6 +56,10 @@ export function hashToken(token: string): string {
   return crypto.createHash('sha256').update(token).digest('hex');
 }
 
+export function hashSessionRevocationKey(sessionId: string): string {
+  return hashToken(`sid_revoked:${sessionId}`);
+}
+
 export function generateOpaqueRefreshToken(): string {
   return `mfx_rt_${crypto.randomBytes(48).toString('hex')}`;
 }
@@ -78,6 +83,17 @@ export interface AccessJwtClaims {
   sid: string;
   jti: string;
   typ: 'access';
+  iat: number;
+  exp: number;
+}
+
+export interface RefreshJwtClaims {
+  sub: string;
+  role: UserRole;
+  sid: string;
+  jti: string;
+  rm: boolean;
+  typ: 'refresh';
   iat: number;
   exp: number;
 }
@@ -135,6 +151,60 @@ export function verifyAccessToken(token: string): AccessJwtClaims | null {
   }
 }
 
+export function signRefreshToken(
+  payload: { sub: string; role: UserRole; sid: string; rm: boolean; jti?: string },
+  expiresInSec: number
+): string {
+  const header = base64UrlEncode(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
+  const now = Math.floor(Date.now() / 1000);
+  const body = base64UrlEncode(
+    JSON.stringify({
+      sub: payload.sub,
+      role: payload.role,
+      sid: payload.sid,
+      jti: payload.jti || crypto.randomUUID(),
+      rm: payload.rm,
+      typ: 'refresh',
+      iat: now,
+      exp: now + expiresInSec,
+    })
+  );
+  const sig = crypto
+    .createHmac('sha256', getJwtSecret())
+    .update(`${header}.${body}`)
+    .digest();
+  return `${header}.${body}.${base64UrlEncode(sig)}`;
+}
+
+export function verifyRefreshToken(token: string): RefreshJwtClaims | null {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    const [header, body, sig] = parts;
+    const expected = base64UrlEncode(
+      crypto.createHmac('sha256', getJwtSecret()).update(`${header}.${body}`).digest()
+    );
+    const sigBuf = Buffer.from(sig);
+    const expBuf = Buffer.from(expected);
+    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+      return null;
+    }
+    const decoded = JSON.parse(base64UrlDecode(body)) as RefreshJwtClaims;
+    if (
+      !decoded.sub ||
+      !decoded.sid ||
+      decoded.typ !== 'refresh' ||
+      typeof decoded.exp !== 'number' ||
+      decoded.exp <= Math.floor(Date.now() / 1000)
+    ) {
+      return null;
+    }
+    return decoded;
+  } catch {
+    return null;
+  }
+}
+
 export interface AuthSessionResult {
   accessToken: string;
   refreshToken: string;
@@ -152,7 +222,10 @@ export function createAuthSession(
   const rememberMe = options?.rememberMe !== false;
   const ttlSec = rememberMe ? REFRESH_REMEMBER_TTL_SEC : REFRESH_SESSION_TTL_SEC;
   const sessionId = crypto.randomUUID();
-  const refreshToken = generateOpaqueRefreshToken();
+  const refreshToken = signRefreshToken(
+    { sub: userId, role, sid: sessionId, rm: rememberMe },
+    ttlSec
+  );
   const refreshHash = hashToken(refreshToken);
 
   const now = new Date();
@@ -213,37 +286,101 @@ export function rotateRefreshSession(
   const nowMs = Date.now();
   const nowIso = new Date(nowMs).toISOString();
 
-  const session = db
-    .prepare(
-      `SELECT id, user_id, refresh_token_hash, prev_refresh_token_hash, prev_grace_until,
-              remember_me, expires_at, revoked_at
-       FROM user_sessions
-       WHERE refresh_token_hash = ? OR prev_refresh_token_hash = ?
-       LIMIT 1`
-    )
-    .get(tokenHash, tokenHash) as
-    | {
-        id: string;
-        user_id: string;
-        refresh_token_hash: string | null;
-        prev_refresh_token_hash: string | null;
-        prev_grace_until: string | null;
-        remember_me: number;
-        expires_at: string;
-        revoked_at: string | null;
-      }
-    | undefined;
-
-  if (!session || session.revoked_at || session.expires_at <= nowIso) {
+  // Reject explicitly revoked tokens immediately
+  const explicitlyRevoked = db
+    .prepare('SELECT 1 FROM revoked_tokens WHERE token_hash = ? LIMIT 1')
+    .get(tokenHash);
+  if (explicitlyRevoked) {
     return null;
   }
 
-  const userRow = db
+  const signedClaims = verifyRefreshToken(rawRefreshToken);
+
+  type SessionRow = {
+    id: string;
+    user_id: string;
+    refresh_token_hash: string | null;
+    prev_refresh_token_hash: string | null;
+    prev_grace_until: string | null;
+    remember_me: number;
+    last_seen_at: string;
+    expires_at: string;
+    revoked_at: string | null;
+  };
+
+  let session: SessionRow | undefined;
+  if (signedClaims) {
+    const sidRevoked = db
+      .prepare('SELECT 1 FROM revoked_tokens WHERE token_hash = ? LIMIT 1')
+      .get(hashSessionRevocationKey(signedClaims.sid));
+    if (sidRevoked) {
+      return null;
+    }
+
+    session = db
+      .prepare(
+        `SELECT id, user_id, refresh_token_hash, prev_refresh_token_hash, prev_grace_until,
+                remember_me, last_seen_at, expires_at, revoked_at
+         FROM user_sessions
+         WHERE id = ?
+         LIMIT 1`
+      )
+      .get(signedClaims.sid) as SessionRow | undefined;
+  } else {
+    session = db
+      .prepare(
+        `SELECT id, user_id, refresh_token_hash, prev_refresh_token_hash, prev_grace_until,
+                remember_me, last_seen_at, expires_at, revoked_at
+         FROM user_sessions
+         WHERE refresh_token_hash = ? OR prev_refresh_token_hash = ?
+         LIMIT 1`
+      )
+      .get(tokenHash, tokenHash) as SessionRow | undefined;
+  }
+
+  if (session) {
+    if (session.revoked_at || session.expires_at <= nowIso) {
+      return null;
+    }
+    if (signedClaims && session.user_id !== signedClaims.sub) {
+      if (signedClaims.role !== 'admin') {
+        return null;
+      }
+      const sessionOwner = db
+        .prepare('SELECT email, role FROM users WHERE id = ?')
+        .get(session.user_id) as { email?: string; role?: string } | undefined;
+      if (
+        !sessionOwner ||
+        sessionOwner.role !== 'admin' ||
+        String(sessionOwner.email || '').toLowerCase() !== DESIGNATED_ADMIN_EMAIL
+      ) {
+        return null;
+      }
+    }
+  } else if (!signedClaims) {
+    return null;
+  }
+
+  const targetUserId = session ? session.user_id : signedClaims!.sub;
+  let userRow = db
     .prepare('SELECT * FROM users WHERE id = ?')
-    .get(session.user_id) as Record<string, unknown> | undefined;
+    .get(targetUserId) as Record<string, unknown> | undefined;
+
+  if (!userRow && signedClaims?.role === 'admin') {
+    userRow = db
+      .prepare("SELECT * FROM users WHERE LOWER(email) = ? AND role = 'admin' LIMIT 1")
+      .get(DESIGNATED_ADMIN_EMAIL) as Record<string, unknown> | undefined;
+  }
 
   if (!userRow || userRow.status === 'suspended' || isUserMembershipExpired(userRow)) {
     return null;
+  }
+
+  if (signedClaims && userRow.tokens_valid_after && typeof signedClaims.iat === 'number') {
+    const validAfterSec = Math.floor(Date.parse(String(userRow.tokens_valid_after)) / 1000);
+    if (Number.isFinite(validAfterSec) && signedClaims.iat < validAfterSec) {
+      return null;
+    }
   }
 
   const user = mapDbUser(userRow);
@@ -255,45 +392,119 @@ export function rotateRefreshSession(
   if (meta?.requireAdmin && !isDesignatedAdmin) {
     return null;
   }
-  const rememberMe = Boolean(session.remember_me);
 
-  // Concurrent-tab grace check if matched via previous refresh token
-  if (session.refresh_token_hash !== tokenHash) {
-    const withinGrace = Boolean(
-      session.prev_refresh_token_hash === tokenHash &&
-        session.prev_grace_until &&
-        session.prev_grace_until > nowIso
+  const rememberMe = session ? Boolean(session.remember_me) : Boolean(signedClaims?.rm);
+  const ttlSec = rememberMe ? REFRESH_REMEMBER_TTL_SEC : REFRESH_SESSION_TTL_SEC;
+  const nextExpiresAt = new Date(nowMs + ttlSec * 1000).toISOString();
+
+  // Re-hydrate session row if running across stateless serverless instances / ephemeral DB
+  if (!session && signedClaims) {
+    db.prepare(
+      `INSERT OR IGNORE INTO user_sessions (
+        id, user_id, refresh_token_hash, prev_refresh_token_hash, prev_grace_until,
+        remember_me, user_agent, ip_address, created_at, last_seen_at, expires_at, revoked_at
+      ) VALUES (?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, NULL)`
+    ).run(
+      signedClaims.sid,
+      user.id,
+      tokenHash,
+      rememberMe ? 1 : 0,
+      (meta?.userAgent || '').slice(0, 250),
+      (meta?.ip || '').slice(0, 80),
+      nowIso,
+      nowIso,
+      nextExpiresAt
     );
-    if (!withinGrace) {
-      // Refresh token replay detected outside grace window: revoke the entire session
-      db.prepare('UPDATE user_sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL').run(
-        nowIso,
-        session.id
-      );
-      return null;
-    }
 
     const accessToken = signAccessToken(
-      { sub: user.id, role: user.role, sid: session.id },
+      { sub: user.id, role: user.role, sid: signedClaims.sid },
       ACCESS_TOKEN_TTL_SEC
     );
     return {
       user,
       accessToken,
       refreshToken: rawRefreshToken,
-      sessionId: session.id,
+      sessionId: signedClaims.sid,
       expiresIn: ACCESS_TOKEN_TTL_SEC,
       rememberMe,
       rotated: false,
     };
   }
 
-  // Rotate refresh token atomically with 15s grace on previous hash
-  const nextRefreshToken = generateOpaqueRefreshToken();
+  const activeSession = session!;
+
+  // If matched via previous hash during grace window (e.g. concurrent tabs / mobile retry),
+  // issue a fresh access token WITHOUT revoking or destroying the active session.
+  if (activeSession.refresh_token_hash !== tokenHash) {
+    const withinGrace = Boolean(
+      activeSession.prev_refresh_token_hash === tokenHash &&
+        activeSession.prev_grace_until &&
+        activeSession.prev_grace_until > nowIso
+    );
+    if (!withinGrace && !signedClaims) {
+      return null;
+    }
+    const accessToken = signAccessToken(
+      { sub: user.id, role: user.role, sid: activeSession.id },
+      ACCESS_TOKEN_TTL_SEC
+    );
+    return {
+      user,
+      accessToken,
+      refreshToken: rawRefreshToken,
+      sessionId: activeSession.id,
+      expiresIn: ACCESS_TOKEN_TTL_SEC,
+      rememberMe,
+      rotated: false,
+    };
+  }
+
+  // Only rotate the refresh token periodically (every 1h) or when upgrading legacy opaque tokens.
+  // Short-interval refreshes (e.g. 13m proactive renewal, page reloads, concurrent tabs) reuse
+  // the valid signed refresh cookie and extend its sliding expiry without causing token races.
+  const lastSeenMs = Date.parse(activeSession.last_seen_at || '');
+  const shouldRotate =
+    !signedClaims ||
+    !Number.isFinite(lastSeenMs) ||
+    nowMs - lastSeenMs >= REFRESH_ROTATE_INTERVAL_MS;
+
+  if (!shouldRotate) {
+    db.prepare(
+      `UPDATE user_sessions
+       SET last_seen_at = ?,
+           expires_at = ?,
+           user_agent = COALESCE(NULLIF(?, ''), user_agent),
+           ip_address = COALESCE(NULLIF(?, ''), ip_address)
+       WHERE id = ? AND revoked_at IS NULL`
+    ).run(
+      nowIso,
+      nextExpiresAt,
+      (meta?.userAgent || '').slice(0, 250),
+      (meta?.ip || '').slice(0, 80),
+      activeSession.id
+    );
+
+    const accessToken = signAccessToken(
+      { sub: user.id, role: user.role, sid: activeSession.id },
+      ACCESS_TOKEN_TTL_SEC
+    );
+    return {
+      user,
+      accessToken,
+      refreshToken: rawRefreshToken,
+      sessionId: activeSession.id,
+      expiresIn: ACCESS_TOKEN_TTL_SEC,
+      rememberMe,
+      rotated: false,
+    };
+  }
+
+  const nextRefreshToken = signRefreshToken(
+    { sub: user.id, role: user.role, sid: activeSession.id, rm: rememberMe },
+    ttlSec
+  );
   const nextHash = hashToken(nextRefreshToken);
   const graceUntilIso = new Date(nowMs + REFRESH_ROTATION_GRACE_MS).toISOString();
-  const ttlSec = rememberMe ? REFRESH_REMEMBER_TTL_SEC : REFRESH_SESSION_TTL_SEC;
-  const nextExpiresAt = new Date(nowMs + ttlSec * 1000).toISOString();
 
   const updateRes = db
     .prepare(
@@ -314,51 +525,32 @@ export function rotateRefreshSession(
       nextExpiresAt,
       (meta?.userAgent || '').slice(0, 250),
       (meta?.ip || '').slice(0, 80),
-      session.id,
+      activeSession.id,
       tokenHash
     );
 
-  if (updateRes.changes === 0) {
-    // Another request concurrently rotated this session; verify if grace applies
-    const latest = db
-      .prepare('SELECT prev_refresh_token_hash, prev_grace_until, revoked_at FROM user_sessions WHERE id = ?')
-      .get(session.id) as
-      | { prev_refresh_token_hash: string | null; prev_grace_until: string | null; revoked_at: string | null }
-      | undefined;
-    if (
-      latest &&
-      !latest.revoked_at &&
-      latest.prev_refresh_token_hash === tokenHash &&
-      latest.prev_grace_until &&
-      latest.prev_grace_until > nowIso
-    ) {
-      const accessToken = signAccessToken(
-        { sub: user.id, role: user.role, sid: session.id },
-        ACCESS_TOKEN_TTL_SEC
-      );
-      return {
-        user,
-        accessToken,
-        refreshToken: rawRefreshToken,
-        sessionId: session.id,
-        expiresIn: ACCESS_TOKEN_TTL_SEC,
-        rememberMe,
-        rotated: false,
-      };
-    }
-    return null;
-  }
-
   const accessToken = signAccessToken(
-    { sub: user.id, role: user.role, sid: session.id },
+    { sub: user.id, role: user.role, sid: activeSession.id },
     ACCESS_TOKEN_TTL_SEC
   );
+
+  if (updateRes.changes === 0) {
+    return {
+      user,
+      accessToken,
+      refreshToken: rawRefreshToken,
+      sessionId: activeSession.id,
+      expiresIn: ACCESS_TOKEN_TTL_SEC,
+      rememberMe,
+      rotated: false,
+    };
+  }
 
   return {
     user,
     accessToken,
     refreshToken: nextRefreshToken,
-    sessionId: session.id,
+    sessionId: activeSession.id,
     expiresIn: ACCESS_TOKEN_TTL_SEC,
     rememberMe,
     rotated: true,
@@ -380,6 +572,14 @@ export function revokeAccessToken(token?: string | null): void {
 
   if (claims?.sid) {
     db.prepare(
+      `INSERT OR IGNORE INTO revoked_tokens (token_hash, expires_at, revoked_at)
+       VALUES (?, ?, ?)`
+    ).run(
+      hashSessionRevocationKey(claims.sid),
+      new Date(Date.now() + REFRESH_REMEMBER_TTL_SEC * 1000).toISOString(),
+      nowIso
+    );
+    db.prepare(
       'UPDATE user_sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL'
     ).run(nowIso, claims.sid);
   }
@@ -391,13 +591,30 @@ export function revokeRefreshToken(rawRefreshToken?: string | null): string | nu
   }
   const nowIso = new Date().toISOString();
   const tokenHash = hashToken(rawRefreshToken);
+  const claims = verifyRefreshToken(rawRefreshToken);
+  const expiresAtIso = claims
+    ? new Date(claims.exp * 1000).toISOString()
+    : new Date(Date.now() + REFRESH_REMEMBER_TTL_SEC * 1000).toISOString();
+
+  db.prepare(
+    `INSERT OR IGNORE INTO revoked_tokens (token_hash, expires_at, revoked_at)
+     VALUES (?, ?, ?)`
+  ).run(tokenHash, expiresAtIso, nowIso);
+
+  if (claims?.sid) {
+    db.prepare(
+      `INSERT OR IGNORE INTO revoked_tokens (token_hash, expires_at, revoked_at)
+       VALUES (?, ?, ?)`
+    ).run(hashSessionRevocationKey(claims.sid), expiresAtIso, nowIso);
+  }
+
   const row = db
     .prepare(
       `SELECT id, user_id FROM user_sessions
-       WHERE refresh_token_hash = ? OR prev_refresh_token_hash = ?
+       WHERE id = ? OR refresh_token_hash = ? OR prev_refresh_token_hash = ?
        LIMIT 1`
     )
-    .get(tokenHash, tokenHash) as { id: string; user_id: string } | undefined;
+    .get(claims?.sid || '', tokenHash, tokenHash) as { id: string; user_id: string } | undefined;
 
   if (row) {
     db.prepare('UPDATE user_sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL').run(
@@ -406,7 +623,7 @@ export function revokeRefreshToken(rawRefreshToken?: string | null): string | nu
     );
     return row.user_id;
   }
-  return null;
+  return claims?.sub || null;
 }
 
 export function revokeAllUserSessions(userId: string, exceptSessionId?: string): void {
@@ -569,31 +786,60 @@ export function extractBearerContext(rawBearer?: string | null): AuthContext {
   const nowMs = Date.now();
   const nowIso = new Date(nowMs).toISOString();
 
-  // 1. Reject explicitly revoked access tokens immediately
+  // 1. Reject explicitly revoked access tokens or revoked sessions immediately
   const revoked = db
-    .prepare('SELECT 1 FROM revoked_tokens WHERE token_hash = ? LIMIT 1')
-    .get(hashToken(bearerToken));
+    .prepare('SELECT 1 FROM revoked_tokens WHERE token_hash = ? OR token_hash = ? LIMIT 1')
+    .get(hashToken(bearerToken), hashSessionRevocationKey(claims.sid));
   if (revoked) return {};
 
-  // 2. Verify active, unrevoked session in DB
+  // 2. Verify active, unrevoked session in DB when present (and allow cryptographically verified
+  //    stateless fallback when running across ephemeral /tmp serverless instances)
   const session = db
     .prepare('SELECT id, user_id, revoked_at, expires_at, last_seen_at FROM user_sessions WHERE id = ?')
     .get(claims.sid) as
     | { id: string; user_id: string; revoked_at: string | null; expires_at: string; last_seen_at: string }
     | undefined;
-  if (!session || session.user_id !== claims.sub || session.revoked_at || session.expires_at <= nowIso) {
-    return {};
+  if (session) {
+    if (session.revoked_at || session.expires_at <= nowIso) {
+      return {};
+    }
+    if (session.user_id !== claims.sub) {
+      if (claims.role !== 'admin') {
+        return {};
+      }
+      const sessionOwner = db
+        .prepare('SELECT email, role FROM users WHERE id = ?')
+        .get(session.user_id) as { email?: string; role?: string } | undefined;
+      if (
+        !sessionOwner ||
+        sessionOwner.role !== 'admin' ||
+        String(sessionOwner.email || '').toLowerCase() !== DESIGNATED_ADMIN_EMAIL
+      ) {
+        return {};
+      }
+    }
+    if (nowMs - Date.parse(session.last_seen_at) > 5 * 60_000) {
+      db.prepare('UPDATE user_sessions SET last_seen_at = ? WHERE id = ?').run(nowIso, session.id);
+    }
   }
 
-  if (nowMs - Date.parse(session.last_seen_at) > 5 * 60_000) {
-    db.prepare('UPDATE user_sessions SET last_seen_at = ? WHERE id = ?').run(nowIso, session.id);
-  }
-
-  // 3. Load user and verify active status, membership expiry & password-reset token epoch
-  const row = db
+  // 3. Load user and verify active status, role integrity, membership expiry & token epoch
+  let row = db
     .prepare('SELECT * FROM users WHERE id = ?')
     .get(claims.sub) as Record<string, unknown> | undefined;
+  if (!row && claims.role === 'admin') {
+    row = db
+      .prepare("SELECT * FROM users WHERE LOWER(email) = ? AND role = 'admin' LIMIT 1")
+      .get(DESIGNATED_ADMIN_EMAIL) as Record<string, unknown> | undefined;
+  }
   if (!row || row.status === 'suspended' || isUserMembershipExpired(row)) return {};
+
+  if (
+    String(row.role) === 'admin' &&
+    String(row.email || '').toLowerCase() !== DESIGNATED_ADMIN_EMAIL
+  ) {
+    return {};
+  }
 
   if (row.tokens_valid_after && typeof claims.iat === 'number') {
     const validAfterSec = Math.floor(Date.parse(String(row.tokens_valid_after)) / 1000);
