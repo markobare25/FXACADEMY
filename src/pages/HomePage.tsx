@@ -57,78 +57,44 @@ export const HomePage: React.FC = () => {
 
   return (
     <div className="space-y-20">
-      {/* Hero Split Section */}
+      {/* Hero Section */}
       <section className="mx-auto max-w-7xl px-4 sm:px-6 pt-10 lg:pt-14">
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 lg:gap-12 items-stretch">
-          <div className="lg:col-span-6 flex flex-col justify-center">
-            <p className="text-xs font-semibold text-[#881337] dark:text-rose-400 tracking-wide">
-              Forex Signals · Live Intelligence · Trading Academy
-            </p>
-            <h1
-              className="mt-3 text-3xl sm:text-4xl lg:text-[46px] font-bold tracking-tight text-slate-900 dark:text-white leading-[1.12]"
-              style={{ textWrap: 'balance' }}
-            >
-              {settings.hero_title}
-            </h1>
-            <p className="mt-5 text-base text-slate-600 dark:text-slate-300 leading-relaxed max-w-xl">
-              {settings.hero_subtitle}
-            </p>
+        <div className="max-w-3xl">
+          <p className="text-xs font-semibold text-[#881337] dark:text-rose-400 tracking-wide">
+            Forex Signals · Live Intelligence · Trading Academy
+          </p>
+          <h1
+            className="mt-3 text-3xl sm:text-4xl lg:text-[46px] font-bold tracking-tight text-slate-900 dark:text-white leading-[1.12]"
+            style={{ textWrap: 'balance' }}
+          >
+            {settings.hero_title}
+          </h1>
+          <p className="mt-5 text-base text-slate-600 dark:text-slate-300 leading-relaxed max-w-xl">
+            {settings.hero_subtitle}
+          </p>
 
-            <div className="mt-8 flex flex-wrap items-center gap-3">
-              {user ? (
-                <button
-                  type="button"
-                  onClick={() => navigate('/dashboard')}
-                  className="inline-flex items-center gap-2 rounded-lg bg-[#881337] px-5 py-3 text-sm font-semibold text-white hover:bg-[#6B0F2B] transition-colors min-h-[44px]"
-                >
-                  <span>Open Member Dashboard</span>
-                  <ArrowRight className="w-4 h-4" />
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => navigate('/signals')}
-                  className="inline-flex items-center gap-2 rounded-lg bg-[#881337] px-5 py-3 text-sm font-semibold text-white hover:bg-[#6B0F2B] transition-colors min-h-[44px]"
-                >
-                  <span>Free Signal Channel</span>
-                  <ArrowRight className="w-4 h-4" />
-                </button>
-              )}
+          <div className="mt-8 flex flex-wrap items-center gap-3">
+            {user ? (
+              <button
+                type="button"
+                onClick={() => navigate('/dashboard')}
+                className="inline-flex items-center gap-2 rounded-lg bg-[#881337] px-5 py-3 text-sm font-semibold text-white hover:bg-[#6B0F2B] transition-colors min-h-[44px]"
+              >
+                <span>Open Member Dashboard</span>
+                <ArrowRight className="w-4 h-4" />
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => navigate('/signals')}
+                className="inline-flex items-center gap-2 rounded-lg bg-[#881337] px-5 py-3 text-sm font-semibold text-white hover:bg-[#6B0F2B] transition-colors min-h-[44px]"
+              >
+                <span>Free Signal Channel</span>
+                <ArrowRight className="w-4 h-4" />
+              </button>
+            )}
 
-              <PWAInstallButton variant="primary" label="INSTALL APP" />
-            </div>
-
-            <p className="mt-6 text-xs text-slate-500 dark:text-slate-400">
-              Trading involves substantial risk of loss. All signals are educational setups—no guaranteed returns.
-            </p>
-          </div>
-
-          <div className="lg:col-span-6">
-            <div className="relative h-full min-h-[280px] lg:min-h-[420px] rounded-2xl overflow-hidden border border-slate-200 dark:border-slate-800 bg-white shadow-sm">
-              <img
-                src="/src/assets/images/hero_light_trading_1795086732029.jpg"
-                alt="Bright institutional London Forex trading office with live green and maroon candlestick charts"
-                referrerPolicy="no-referrer"
-                className="w-full h-full object-cover"
-              />
-              <div className="absolute inset-x-0 bottom-0 p-5 bg-white/92 dark:bg-[#090D16]/90 backdrop-blur-md border-t border-slate-200/80 dark:border-slate-800 flex flex-wrap items-center justify-between gap-4">
-                <div>
-                  <p className="text-xs font-semibold text-emerald-700 dark:text-emerald-400">
-                    Synchronized Terminal
-                  </p>
-                  <p className="text-sm font-bold text-slate-900 dark:text-white mt-0.5">
-                    Instant WebSocket & Push Signal Delivery
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => navigate('/markets')}
-                  className="rounded-lg bg-[#881337] px-4 py-2 text-xs font-semibold text-white hover:bg-[#6B0F2B] transition-colors"
-                >
-                  View Live Charts
-                </button>
-              </div>
-            </div>
+            <PWAInstallButton variant="primary" label="INSTALL APP" />
           </div>
         </div>
 

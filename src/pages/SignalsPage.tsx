@@ -8,7 +8,6 @@ import {
   BellOff,
   CheckCircle2,
   Eye,
-  Info,
   Loader2,
   MessageSquareText,
   Moon,
@@ -64,8 +63,13 @@ function emptyReactions(): SignalReactionsMap {
 
 function formatCompactCount(count: number): string {
   if (!Number.isFinite(count) || count <= 0) return '0';
-  if (count < 1000) return String(Math.floor(count));
-  return `${(count / 1000).toFixed(1).replace(/\.0$/, '')}K`;
+  if (count >= 1_000_000) {
+    return `${(count / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`;
+  }
+  if (count >= 1000) {
+    return `${(count / 1000).toFixed(1).replace(/\.0$/, '')}K`;
+  }
+  return String(Math.floor(count));
 }
 
 const MESSAGE_TYPE_LABELS: Record<SignalChatMessageType, string> = {
@@ -180,17 +184,14 @@ export const SignalsPage: React.FC = () => {
     theme,
     toggleTheme,
     navigate,
-    onlineCount,
-    unreadCount,
     subscribeSignalChatEvents,
   } = usePlatform();
 
   // Default live channel view
   const [view, setView] = useState<ChannelView>('chat');
 
-  // Header Menu & Channel Info Modal
+  // Header Menu
   const [showChannelMenu, setShowChannelMenu] = useState(false);
-  const [showChannelInfo, setShowChannelInfo] = useState(false);
 
   // Smoothly fluctuating Active Now counter between 35,678 and 98,678
   const [activeNowCount, setActiveNowCount] = useState<number>(() => {
@@ -208,7 +209,6 @@ export const SignalsPage: React.FC = () => {
   const [activeLoading, setActiveLoading] = useState(true);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [completedCount, setCompletedCount] = useState(0);
-  const [realOnlineCount, setRealOnlineCount] = useState(onlineCount);
   const [showScrollBottomBtn, setShowScrollBottomBtn] = useState(false);
   const [hasUnseenBelow, setHasUnseenBelow] = useState(false);
   const [highlightedMsgId, setHighlightedMsgId] = useState<string | null>(null);
@@ -220,9 +220,6 @@ export const SignalsPage: React.FC = () => {
   const [loadingMoreCompleted, setLoadingMoreCompleted] = useState(false);
   const [completedSearch, setCompletedSearch] = useState('');
   const [selectedCompleted, setSelectedCompleted] = useState<SignalChatMessage | null>(null);
-
-  // Real channel subscriber counter
-  const [subscriberCount, setSubscriberCount] = useState<number>(0);
 
   const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
   const [channelNotice, setChannelNotice] = useState<string | null>(null);
@@ -236,10 +233,6 @@ export const SignalsPage: React.FC = () => {
   const prevUserIdRef = useRef<string | null | undefined>(undefined);
   const messageRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const handledDeepLinkRef = useRef<string | null>(null);
-
-  useEffect(() => {
-    setRealOnlineCount(onlineCount);
-  }, [onlineCount]);
 
   // Fluctuate live Active Now counter smoothly between 35,678 and 98,678
   useEffect(() => {
@@ -345,12 +338,6 @@ export const SignalsPage: React.FC = () => {
         setPinnedMessages(res.pinned);
         setActiveHasMore(res.has_more);
         setCompletedCount(res.counts.completed);
-        if (typeof res.online_count === 'number') {
-          setRealOnlineCount(res.online_count);
-        }
-        if (typeof res.subscriber_count === 'number') {
-          setSubscriberCount(res.subscriber_count);
-        }
         if (!keepScrollPosition) {
           requestAnimationFrame(() => scrollToBottom(false));
         }
@@ -392,8 +379,6 @@ export const SignalsPage: React.FC = () => {
       if (res.installed_at) syncInstalledAtFromServer(res.installed_at);
       setPinnedMessages(res.pinned);
       setCompletedCount(res.counts.completed);
-      if (typeof res.online_count === 'number') setRealOnlineCount(res.online_count);
-      if (typeof res.subscriber_count === 'number') setSubscriberCount(res.subscriber_count);
 
       if (res.messages.length > 0) {
         setActiveMessages((prev) => {
@@ -915,11 +900,7 @@ export const SignalsPage: React.FC = () => {
                 <ArrowLeft className="w-5 h-5" />
               </button>
 
-              <button
-                type="button"
-                onClick={() => setShowChannelInfo(true)}
-                className="flex items-center gap-2.5 min-w-0 text-left py-1 pr-2 rounded-xl hover:bg-slate-50 dark:hover:bg-slate-800/60 transition-colors"
-              >
+              <div className="flex items-center gap-2.5 min-w-0 py-1 pr-2">
                 <div className="w-10 h-10 rounded-full bg-[#881337] text-white flex items-center justify-center font-display font-bold text-xs shrink-0 overflow-hidden ring-1 ring-slate-200 dark:ring-slate-700">
                   {!avatarFailed ? (
                     <img
@@ -947,7 +928,7 @@ export const SignalsPage: React.FC = () => {
                     {activeNowCount.toLocaleString('en-US')} Active Now
                   </p>
                 </div>
-              </button>
+              </div>
             </div>
 
             {/* Right Three-Dot Action Menu */}
@@ -964,17 +945,6 @@ export const SignalsPage: React.FC = () => {
 
               {showChannelMenu && (
                 <div className="absolute right-0 top-12 w-56 rounded-2xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-[#111827] shadow-xl py-1.5 z-50 text-sm">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setShowChannelMenu(false);
-                      setShowChannelInfo(true);
-                    }}
-                    className="w-full px-4 py-2.5 text-left flex items-center gap-2.5 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800/80"
-                  >
-                    <Info className="w-4 h-4 text-[#0284C7] dark:text-sky-400 shrink-0" />
-                    <span>Channel Info</span>
-                  </button>
 
                   <button
                     type="button"
@@ -1432,118 +1402,6 @@ export const SignalsPage: React.FC = () => {
                     {loadingMoreCompleted ? 'Loading...' : 'Load older completed updates'}
                   </button>
                 </div>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Channel Info & Quick Settings Modal */}
-      {showChannelInfo && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4"
-          onClick={() => setShowChannelInfo(false)}
-        >
-          <div
-            className="w-full max-w-md rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5 space-y-4 shadow-xl"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-start justify-between gap-3">
-              <div className="flex items-center gap-3">
-                <div className="w-11 h-11 rounded-full bg-[#881337] text-white flex items-center justify-center font-display font-bold text-sm overflow-hidden shrink-0">
-                  {!avatarFailed ? (
-                    <img
-                      src="/pwa-192x192.png"
-                      alt="MeridianFX"
-                      className="w-full h-full object-cover"
-                    />
-                  ) : (
-                    'MFX'
-                  )}
-                </div>
-                <div>
-                  <div className="flex items-center gap-1">
-                    <h3 className="text-base font-bold text-slate-900 dark:text-white">
-                      MeridianFX Signals
-                    </h3>
-                    <BadgeCheck className="w-4 h-4 text-[#15803D] dark:text-emerald-400" />
-                  </div>
-                  <p className="text-xs font-medium text-[#15803D] dark:text-emerald-400 tabular-nums">
-                    {activeNowCount.toLocaleString('en-US')} Active Now
-                  </p>
-                </div>
-              </div>
-              <button
-                type="button"
-                onClick={() => setShowChannelInfo(false)}
-                className="p-2 rounded-lg text-slate-400 hover:text-slate-800 dark:hover:text-white min-h-[40px] min-w-[40px] flex items-center justify-center"
-                aria-label="Close channel info"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            <div className="rounded-xl bg-slate-50 dark:bg-slate-900/80 p-3.5 space-y-2 text-xs">
-              <div className="flex items-center justify-between">
-                <span className="text-slate-500 dark:text-slate-400">Active Subscribers Now</span>
-                <span className="font-mono font-semibold text-[#15803D] dark:text-emerald-400 tabular-nums">
-                  {activeNowCount.toLocaleString('en-US')}
-                </span>
-              </div>
-              <div className="flex items-center justify-between">
-                <span className="text-slate-500 dark:text-slate-400">Subscribed Push Devices</span>
-                <span className="font-mono font-semibold text-slate-800 dark:text-slate-200 tabular-nums">
-                  {subscriberCount} device{subscriberCount === 1 ? '' : 's'}
-                </span>
-              </div>
-              <div className="flex items-center justify-between">
-                <span className="text-slate-500 dark:text-slate-400">Connected Live Readers</span>
-                <span className="font-mono font-semibold text-[#15803D] dark:text-emerald-400 tabular-nums">
-                  {realOnlineCount} online
-                </span>
-              </div>
-              <div className="flex items-center justify-between">
-                <span className="text-slate-500 dark:text-slate-400">Channel Notifications</span>
-                <span className="font-semibold text-slate-800 dark:text-slate-200">
-                  {isMuted ? 'Muted' : 'Active'}
-                </span>
-              </div>
-            </div>
-
-            <div className="grid grid-cols-2 gap-2 text-xs">
-              <button
-                type="button"
-                onClick={() => {
-                  setShowChannelInfo(false);
-                  setView('completed');
-                }}
-                className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-slate-200 dark:border-slate-700 py-2.5 font-semibold text-slate-700 dark:text-slate-200 hover:border-[#881337]/50"
-              >
-                <Archive className="w-3.5 h-3.5 text-[#881337] dark:text-rose-400" />
-                <span>Completed Archive</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={toggleTheme}
-                className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-slate-200 dark:border-slate-700 py-2.5 font-semibold text-slate-700 dark:text-slate-200"
-              >
-                {theme === 'dark' ? <Sun className="w-3.5 h-3.5" /> : <Moon className="w-3.5 h-3.5" />}
-                <span>{theme === 'dark' ? 'Light Theme' : 'Dark Theme'}</span>
-              </button>
-
-              {user && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setShowChannelInfo(false);
-                    navigate('/notifications');
-                  }}
-                  className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-slate-200 dark:border-slate-700 py-2.5 font-semibold text-slate-700 dark:text-slate-200"
-                >
-                  <Bell className="w-3.5 h-3.5 text-[#15803D] dark:text-emerald-400" />
-                  <span>Alerts {unreadCount > 0 ? `(${unreadCount})` : ''}</span>
-                </button>
               )}
             </div>
           </div>

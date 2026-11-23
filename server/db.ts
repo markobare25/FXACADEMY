@@ -951,6 +951,23 @@ export function initDatabase(): void {
   `);
 }
 
+export const WELCOME_SEED_TOTAL = 3_568_890;
+export const WELCOME_SEED_VIEWS = 20_800_000;
+
+export function getWelcomeSeedReactions(): {
+  love: number;
+  like: number;
+  fire: number;
+  hundred: number;
+} {
+  const total = WELCOME_SEED_TOTAL;
+  const love = Math.round(total * 0.35);
+  const like = Math.round(total * 0.25);
+  const fire = Math.round(total * 0.20);
+  const hundred = total - love - like - fire;
+  return { love, like, fire, hundred };
+}
+
 export function generateSeededViews(minFloor = 0): number {
   const base = Math.floor(Math.random() * (28500 - 11200 + 1)) + 11200;
   return Math.max(base, minFloor + 1800);
@@ -1312,13 +1329,25 @@ function seedInitialData(): void {
 
   // Ensure a single canonical pinned Welcome Message exists for MeridianFX Signals
   const existingWelcome = db
-    .prepare("SELECT id FROM signal_messages WHERE is_welcome = 1 OR source_type = 'welcome' LIMIT 1")
-    .get() as { id: string } | undefined;
+    .prepare(
+      'SELECT id, seed_love, seed_like, seed_fire, seed_hundred, seed_views FROM signal_messages WHERE is_welcome = 1 OR source_type = \'welcome\' LIMIT 1'
+    )
+    .get() as
+    | {
+        id: string;
+        seed_love: number;
+        seed_like: number;
+        seed_fire: number;
+        seed_hundred: number;
+        seed_views: number;
+      }
+    | undefined;
+
+  const welcomeSeeds = getWelcomeSeedReactions();
+  const welcomeViews = WELCOME_SEED_VIEWS;
 
   if (!existingWelcome) {
     const welcomeId = '00000000-0000-4000-8000-000000000001';
-    const seeds = generateSeededReactions();
-    const views = generateSeededViews(seeds.love + seeds.like + seeds.fire + seeds.hundred);
     const welcomeText = [
       'Welcome to MeridianFX Signals!',
       'You are now connected to the official MeridianFX broadcast channel. Real-time Forex, Gold, and Crypto trade setups, chart markups, and desk alerts posted by our analysts appear here the moment they are published.',
@@ -1339,21 +1368,45 @@ function seedInitialData(): void {
       'MeridianFX Desk',
       welcomeText,
       welcomeId,
-      seeds.love,
-      seeds.like,
-      seeds.fire,
-      seeds.hundred,
-      seeds.love,
-      seeds.like,
-      seeds.fire,
-      seeds.hundred,
-      views,
+      welcomeSeeds.love,
+      welcomeSeeds.like,
+      welcomeSeeds.fire,
+      welcomeSeeds.hundred,
+      welcomeSeeds.love,
+      welcomeSeeds.like,
+      welcomeSeeds.fire,
+      welcomeSeeds.hundred,
+      welcomeViews,
       now
     );
   } else {
     db.prepare(
-      "UPDATE signal_messages SET is_welcome = 1, pinned = 1, status = 'active' WHERE id = ?"
-    ).run(existingWelcome.id);
+      `UPDATE signal_messages
+       SET is_welcome = 1,
+           pinned = 1,
+           status = 'active',
+           seed_love = ?,
+           seed_like = ?,
+           seed_fire = ?,
+           seed_hundred = ?,
+           seed_views = ?,
+           love_count = ? + (SELECT COUNT(*) FROM signal_message_reactions r WHERE r.message_id = signal_messages.id AND r.reaction = 'love'),
+           like_count = ? + (SELECT COUNT(*) FROM signal_message_reactions r WHERE r.message_id = signal_messages.id AND r.reaction = 'like'),
+           fire_count = ? + (SELECT COUNT(*) FROM signal_message_reactions r WHERE r.message_id = signal_messages.id AND r.reaction = 'fire'),
+           hundred_count = ? + (SELECT COUNT(*) FROM signal_message_reactions r WHERE r.message_id = signal_messages.id AND r.reaction = 'hundred')
+       WHERE id = ?`
+    ).run(
+      welcomeSeeds.love,
+      welcomeSeeds.like,
+      welcomeSeeds.fire,
+      welcomeSeeds.hundred,
+      welcomeViews,
+      welcomeSeeds.love,
+      welcomeSeeds.like,
+      welcomeSeeds.fire,
+      welcomeSeeds.hundred,
+      existingWelcome.id
+    );
   }
 }
 

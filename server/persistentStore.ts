@@ -1,4 +1,10 @@
-import { db, DESIGNATED_ADMIN_EMAIL, ensureDesignatedAdminUser } from './db.ts';
+import {
+  db,
+  DESIGNATED_ADMIN_EMAIL,
+  ensureDesignatedAdminUser,
+  getWelcomeSeedReactions,
+  WELCOME_SEED_VIEWS,
+} from './db.ts';
 
 function getSupabaseConfig(): { url: string; key: string } | null {
   const url = (process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || '')
@@ -66,14 +72,17 @@ function upsertLocalSignalMessage(row: Record<string, unknown>): void {
   const authorExists = db.prepare('SELECT 1 FROM users WHERE id = ?').get(rawAuthorId);
   const authorId = authorExists ? rawAuthorId : fallbackAdminId;
 
-  const seedLove = Number(row.seed_love || 0);
-  const seedLike = Number(row.seed_like || 0);
-  const seedFire = Number(row.seed_fire || 0);
-  const seedHundred = Number(row.seed_hundred || 0);
-  const loveCount = Number(row.love_count ?? seedLove);
-  const likeCount = Number(row.like_count ?? seedLike);
-  const fireCount = Number(row.fire_count ?? seedFire);
-  const hundredCount = Number(row.hundred_count ?? seedHundred);
+  const isWelcomeMsg = Number(row.is_welcome || 0) === 1 || String(row.source_type || '') === 'welcome';
+  const welcomeSeeds = isWelcomeMsg ? getWelcomeSeedReactions() : null;
+  const seedLove = welcomeSeeds ? welcomeSeeds.love : Number(row.seed_love || 0);
+  const seedLike = welcomeSeeds ? welcomeSeeds.like : Number(row.seed_like || 0);
+  const seedFire = welcomeSeeds ? welcomeSeeds.fire : Number(row.seed_fire || 0);
+  const seedHundred = welcomeSeeds ? welcomeSeeds.hundred : Number(row.seed_hundred || 0);
+  const seedViews = isWelcomeMsg ? WELCOME_SEED_VIEWS : Number(row.seed_views || 0);
+  const loveCount = Math.max(Number(row.love_count ?? seedLove), seedLove);
+  const likeCount = Math.max(Number(row.like_count ?? seedLike), seedLike);
+  const fireCount = Math.max(Number(row.fire_count ?? seedFire), seedFire);
+  const hundredCount = Math.max(Number(row.hundred_count ?? seedHundred), seedHundred);
 
   db.prepare(
     `INSERT INTO signal_messages (
@@ -138,7 +147,7 @@ function upsertLocalSignalMessage(row: Record<string, unknown>): void {
     likeCount,
     fireCount,
     hundredCount,
-    Number(row.seed_views || 0),
+    seedViews,
     String(row.created_at || new Date().toISOString())
   );
 }
