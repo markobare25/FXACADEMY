@@ -40,6 +40,8 @@ registerRoute(
     url.pathname.startsWith('/api/push/') ||
     url.pathname.startsWith('/api/auth/') ||
     url.pathname.startsWith('/api/admin/') ||
+    url.pathname === '/api/signals/stream' ||
+    url.pathname === '/api/signals/messages/stream' ||
     url.searchParams.get('includeAll') === 'true' ||
     (url.pathname === '/api/signals/messages' && url.searchParams.has('after')),
   new NetworkOnly()

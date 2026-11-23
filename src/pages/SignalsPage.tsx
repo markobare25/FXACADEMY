@@ -19,15 +19,6 @@ import {
 } from 'lucide-react';
 import { usePlatform, type SignalChatWsEvent } from '../context/PlatformContext';
 import { apiFetch, formatLocalDateTime, getOrCreateVisitorId } from '../lib/api';
-import {
-  detectPushPlatform,
-  dismissNotificationPrompt,
-  getCurrentPushSubscription,
-  isNotificationPromptDismissed,
-  isPushSupported,
-  isStandalonePWA,
-  subscribeToPushNotifications,
-} from '../lib/pushClient';
 import type {
   SignalChatMessage,
   SignalChatMessageType,
@@ -44,14 +35,19 @@ const REACTION_OPTIONS: Array<{
   activeClass: string;
 }> = [
   { key: 'love', emoji: '❤️', label: 'Love', activeClass: 'bg-[#881337] text-white' },
-  { key: 'like', emoji: '👍', label: 'Like', activeClass: 'bg-[#15803D] text-white' },
+  { key: 'like', emoji: '🤙', label: 'Shaka', activeClass: 'bg-[#15803D] text-white' },
   { key: 'fire', emoji: '💥', label: 'Fire', activeClass: 'bg-amber-600 text-white' },
   { key: 'hundred', emoji: '💯', label: '100', activeClass: 'bg-indigo-600 text-white' },
-  { key: 'dislike', emoji: '👎', label: 'Dislike', activeClass: 'bg-slate-700 text-white' },
 ];
 
 function emptyReactions(): SignalReactionsMap {
-  return { love: 0, like: 0, fire: 0, hundred: 0, dislike: 0 };
+  return { love: 0, like: 0, fire: 0, hundred: 0 };
+}
+
+function formatCompactCount(count: number): string {
+  if (!Number.isFinite(count) || count <= 0) return '0';
+  if (count < 1000) return String(Math.floor(count));
+  return `${(count / 1000).toFixed(1).replace(/\.0$/, '')}K`;
 }
 
 const MESSAGE_TYPE_LABELS: Record<SignalChatMessageType, string> = {
@@ -165,9 +161,7 @@ export const SignalsPage: React.FC = () => {
     toggleTheme,
     navigate,
     onlineCount,
-    wsConnected,
     unreadCount,
-    showNotifModal,
     setShowNotifModal,
     subscribeSignalChatEvents,
   } = usePlatform();
@@ -200,13 +194,6 @@ export const SignalsPage: React.FC = () => {
 
   // Real channel subscriber counter
   const [subscriberCount, setSubscriberCount] = useState<number>(0);
-
-  // Inline notification prompt state
-  const [pushSubscribed, setPushSubscribed] = useState(false);
-  const [promptDismissed, setPromptDismissed] = useState<boolean>(() => isNotificationPromptDismissed());
-  const [enablingInlinePush, setEnablingInlinePush] = useState(false);
-  const [inlinePushStatus, setInlinePushStatus] = useState<string | null>(null);
-  const [inlinePushError, setInlinePushError] = useState<string | null>(null);
 
   const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
   const [reactionNotice, setReactionNotice] = useState<string | null>(null);
@@ -353,13 +340,6 @@ export const SignalsPage: React.FC = () => {
     fetchActiveMessages(false);
   }, [fetchActiveMessages]);
 
-  // Refresh push subscription indicator when page loads or modal closes
-  useEffect(() => {
-    getCurrentPushSubscription()
-      .then((sub) => setPushSubscribed(Boolean(sub)))
-      .catch(() => setPushSubscribed(false));
-  }, [showNotifModal]);
-
   useEffect(() => {
     const curId = user?.id ?? null;
     if (prevUserIdRef.current === undefined) {
@@ -379,9 +359,8 @@ export const SignalsPage: React.FC = () => {
     }
   }, [view, completedSearch, fetchCompletedMessages]);
 
-  // Real-time WebSocket subscription for Signal Chat
-  useEffect(() => {
-    const unsubscribe = subscribeSignalChatEvents((event: SignalChatWsEvent) => {
+  const applySignalChannelEvent = useCallback(
+    (event: SignalChatWsEvent) => {
       switch (event.type) {
         case 'reconnected': {
           syncMissedMessages();
@@ -457,17 +436,75 @@ export const SignalsPage: React.FC = () => {
           break;
         }
       }
-    });
+    },
+    [syncMissedMessages, fetchCompletedMessages, completedSearch, view, scrollToBottom]
+  );
 
-    return unsubscribe;
-  }, [
-    subscribeSignalChatEvents,
-    syncMissedMessages,
-    fetchCompletedMessages,
-    completedSearch,
-    view,
-    scrollToBottom,
-  ]);
+  // Real-time WebSocket subscription for Signal Chat
+  useEffect(() => {
+    return subscribeSignalChatEvents(applySignalChannelEvent);
+  }, [subscribeSignalChatEvents, applySignalChannelEvent]);
+
+  // Seamless Server-Sent Events (SSE) + silent background polling fallback (works on serverless/Vercel)
+  useEffect(() => {
+    let source: EventSource | null = null;
+    if (typeof EventSource !== 'undefined') {
+      try {
+        source = new EventSource('/api/signals/stream');
+        source.addEventListener('signals_chat:created', (e) => {
+          try {
+            const msg = JSON.parse((e as MessageEvent).data) as SignalChatMessage;
+            applySignalChannelEvent({ type: 'created', message: msg });
+          } catch {
+            // ignore malformed event
+          }
+        });
+        source.addEventListener('signals_chat:updated', (e) => {
+          try {
+            const msg = JSON.parse((e as MessageEvent).data) as SignalChatMessage;
+            applySignalChannelEvent({ type: 'updated', message: msg });
+          } catch {
+            // ignore malformed event
+          }
+        });
+        source.addEventListener('signals_chat:deleted', (e) => {
+          try {
+            const payload = JSON.parse((e as MessageEvent).data) as { id: string };
+            applySignalChannelEvent({ type: 'deleted', id: payload.id });
+          } catch {
+            // ignore malformed event
+          }
+        });
+        source.addEventListener('signals_chat:reacted', (e) => {
+          try {
+            const payload = JSON.parse((e as MessageEvent).data) as {
+              message_id: string;
+              reactions: SignalReactionsMap;
+              viewer_key: string;
+              reaction: SignalReactionType | null;
+            };
+            applySignalChannelEvent({ type: 'reacted', ...payload });
+          } catch {
+            // ignore malformed event
+          }
+        });
+      } catch {
+        source = null;
+      }
+    }
+
+    const pollTimer = window.setInterval(() => {
+      if (document.visibilityState !== 'visible') return;
+      if (view === 'chat') {
+        fetchActiveMessages(true);
+      }
+    }, 6000);
+
+    return () => {
+      if (source) source.close();
+      clearInterval(pollTimer);
+    };
+  }, [applySignalChannelEvent, fetchActiveMessages, view]);
 
   const handleLoadOlderActive = useCallback(async () => {
     if (loadingOlder || !activeHasMore || activeMessages.length === 0) return;
@@ -551,25 +588,7 @@ export const SignalsPage: React.FC = () => {
     }
   };
 
-  const handleInlineEnablePush = async () => {
-    setEnablingInlinePush(true);
-    setInlinePushError(null);
-    const res = await subscribeToPushNotifications();
-    setEnablingInlinePush(false);
-    if (res.ok) {
-      setPushSubscribed(true);
-      setSubscriberCount((c) => c + 1);
-      setInlinePushStatus('Notifications Enabled — instant alerts active on this device.');
-      setTimeout(() => setInlinePushStatus(null), 5000);
-    } else {
-      setInlinePushError(res.error || 'Could not enable push notifications.');
-    }
-  };
-
-  const handleInlineMaybeLater = () => {
-    dismissNotificationPrompt();
-    setPromptDismissed(true);
-  };
+  // Reactions click handler uses persisted database ID directly
 
   const handleReact = async (msg: SignalChatMessage, reaction: SignalReactionType) => {
     const previousReaction = msg.user_reaction;
@@ -722,7 +741,7 @@ export const SignalsPage: React.FC = () => {
       {/* LIVE CHAT CHANNEL VIEW (DEFAULT) */}
       {view === 'chat' && (
         <>
-          {/* Compact Telegram-Style Channel Header */}
+          {/* Clean Telegram-Style Channel Header */}
           <header className="px-3 sm:px-5 h-14 border-b border-slate-200 dark:border-slate-800/90 bg-white dark:bg-[#0F172A] flex items-center justify-between gap-2 shrink-0 z-20">
             <div className="flex items-center gap-2.5 min-w-0">
               <div className="w-9 h-9 rounded-full bg-[#881337] text-white flex items-center justify-center font-display font-bold text-xs shrink-0 overflow-hidden">
@@ -738,63 +757,19 @@ export const SignalsPage: React.FC = () => {
                 )}
               </div>
 
-              <div className="min-w-0">
-                <div className="flex items-center gap-1 min-w-0">
-                  <h1 className="text-sm sm:text-[15px] font-bold text-slate-900 dark:text-white truncate leading-tight">
-                    MeridianFX Signal Channel
-                  </h1>
-                  <BadgeCheck
-                    className="w-4 h-4 text-[#15803D] dark:text-emerald-400 shrink-0"
-                    aria-label="Verified channel"
-                  />
-                </div>
-                <p
-                  className={`inline-flex items-center gap-1.5 text-[11px] sm:text-xs font-semibold truncate leading-tight tabular-nums ${
-                    wsConnected
-                      ? 'text-[#15803D] dark:text-emerald-400'
-                      : 'text-amber-600 dark:text-amber-400'
-                  }`}
-                >
-                  <span className="relative flex h-2 w-2 shrink-0" aria-hidden="true">
-                    {wsConnected && (
-                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-80" />
-                    )}
-                    <span
-                      className={`relative inline-flex rounded-full h-2 w-2 ${
-                        wsConnected ? 'bg-emerald-500' : 'bg-amber-500'
-                      }`}
-                    />
-                  </span>
-                  <span>
-                    {wsConnected
-                      ? `Live Channel · ${realOnlineCount} live${
-                          subscriberCount > 0 ? ` · ${subscriberCount} subscribed` : ''
-                        }`
-                      : 'Reconnecting live channel...'}
-                  </span>
-                </p>
+              <div className="flex items-center gap-1.5 min-w-0">
+                <h1 className="text-sm sm:text-[15px] font-bold text-slate-900 dark:text-white truncate leading-tight">
+                  MeridianFX Signals
+                </h1>
+                <BadgeCheck
+                  className="w-4 h-4 text-[#15803D] dark:text-emerald-400 shrink-0"
+                  aria-label="Verified channel"
+                />
               </div>
             </div>
 
-            {/* Channel Header Toolbar: Push Alerts + Info */}
+            {/* Channel Info Action */}
             <div className="flex items-center gap-1 shrink-0">
-              <button
-                type="button"
-                onClick={() => setShowNotifModal(true)}
-                aria-label={pushSubscribed ? 'Notifications Enabled' : 'Enable Notifications'}
-                title={pushSubscribed ? 'Notifications enabled on this device' : 'Enable real-time push notifications'}
-                className={`relative min-h-[38px] px-2.5 flex items-center justify-center gap-1.5 rounded-lg text-xs font-semibold whitespace-nowrap shrink-0 transition-colors ${
-                  pushSubscribed
-                    ? 'text-[#15803D] dark:text-emerald-400 bg-emerald-50/80 dark:bg-emerald-950/30 hover:bg-emerald-100/80'
-                    : 'text-[#881337] dark:text-rose-300 bg-rose-50/70 dark:bg-rose-950/30 hover:bg-rose-100/70'
-                }`}
-              >
-                {pushSubscribed ? <BellRing className="w-4 h-4" /> : <Bell className="w-4 h-4" />}
-                <span>
-                  {pushSubscribed ? 'Notifications On' : 'Get Alerts'}
-                </span>
-              </button>
-
               <button
                 type="button"
                 onClick={() => setShowChannelInfo(true)}
@@ -832,63 +807,6 @@ export const SignalsPage: React.FC = () => {
                 </span>
               )}
             </button>
-          )}
-
-          {/* Non-Intrusive First-Visit Notification Invitation Banner */}
-          {!pushSubscribed &&
-            !promptDismissed &&
-            (typeof Notification === 'undefined' || Notification.permission !== 'denied') && (
-              <div className="border-b border-rose-200/80 dark:border-rose-900/40 bg-white dark:bg-[#111827] px-3.5 sm:px-5 py-3 shrink-0 z-10">
-                <div className="mx-auto max-w-3xl flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                  <div className="flex items-start gap-2.5 min-w-0">
-                    <div className="w-8 h-8 rounded-lg bg-[#881337]/10 text-[#881337] dark:text-rose-400 flex items-center justify-center shrink-0 mt-0.5">
-                      <BellRing className="w-4 h-4" />
-                    </div>
-                    <div className="min-w-0">
-                      <p className="text-xs font-bold tracking-wide text-slate-900 dark:text-white">
-                        NEVER MISS A TRADING UPDATE
-                      </p>
-                      <p className="text-xs text-slate-600 dark:text-slate-300 leading-snug mt-0.5">
-                        Get instant notifications whenever MeridianFX publishes new Forex signals, market analysis and important announcements.
-                      </p>
-                      {detectPushPlatform() === 'ios' && !isStandalonePWA() && (
-                        <p className="text-[11px] text-amber-700 dark:text-amber-400 mt-1 font-medium">
-                          iPhone/iPad: Tap Safari Share → Add to Home Screen first, then open the installed app to enable notifications.
-                        </p>
-                      )}
-                      {inlinePushError && (
-                        <p className="text-[11px] text-red-600 dark:text-red-400 mt-1 font-medium">
-                          {inlinePushError}
-                        </p>
-                      )}
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-2 shrink-0 sm:pl-2">
-                    <button
-                      type="button"
-                      disabled={enablingInlinePush || !isPushSupported()}
-                      onClick={handleInlineEnablePush}
-                      className="rounded-lg bg-[#881337] px-3.5 py-2 text-[11px] font-bold uppercase tracking-wide text-white hover:bg-[#6B0F2B] disabled:opacity-60 transition-colors min-h-[36px]"
-                    >
-                      {enablingInlinePush ? 'Enabling...' : 'ENABLE NOTIFICATIONS'}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={handleInlineMaybeLater}
-                      className="rounded-lg border border-slate-300 dark:border-slate-700 px-3 py-2 text-[11px] font-bold uppercase tracking-wide text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors min-h-[36px]"
-                    >
-                      MAYBE LATER
-                    </button>
-                  </div>
-                </div>
-              </div>
-            )}
-
-          {inlinePushStatus && (
-            <div className="px-4 py-2 bg-emerald-50 dark:bg-emerald-950/30 border-b border-emerald-200 dark:border-emerald-900/40 flex items-center justify-center gap-2 text-xs font-medium text-[#15803D] dark:text-emerald-400 shrink-0">
-              <CheckCircle2 className="w-4 h-4 shrink-0" />
-              <span>{inlinePushStatus}</span>
-            </div>
           )}
 
           {/* Rate limit / transient reaction notice */}
@@ -1034,7 +952,7 @@ export const SignalsPage: React.FC = () => {
                             </p>
                           )}
 
-                          {/* Telegram-Style 5-Emoji Reaction Row + Timestamp */}
+                          {/* Telegram-Style 4-Emoji Reaction Row + Timestamp */}
                           <div className="mt-2 flex flex-wrap items-center justify-between gap-2 pt-1">
                             <div className="flex flex-wrap items-center gap-1.5">
                               {REACTION_OPTIONS.map((opt) => {
@@ -1048,14 +966,16 @@ export const SignalsPage: React.FC = () => {
                                     aria-pressed={active}
                                     aria-label={`${opt.label} (${count})`}
                                     title={opt.label}
-                                    className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-semibold transition-colors min-h-[30px] ${
+                                    className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-semibold whitespace-nowrap transition-colors min-h-[30px] ${
                                       active
                                         ? opt.activeClass
                                         : 'bg-slate-100 dark:bg-slate-800/90 text-slate-700 dark:text-slate-200 hover:bg-slate-200/80 dark:hover:bg-slate-700'
                                     }`}
                                   >
                                     <span aria-hidden="true">{opt.emoji}</span>
-                                    <span className="font-mono text-[11px] tabular-nums">{count}</span>
+                                    <span className="font-mono text-[11px] tabular-nums">
+                                      {formatCompactCount(count)}
+                                    </span>
                                   </button>
                                 );
                               })}
@@ -1211,8 +1131,8 @@ export const SignalsPage: React.FC = () => {
                       <div className="pt-2 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between gap-2 text-xs text-slate-500">
                         <div className="flex flex-wrap items-center gap-2 font-mono tabular-nums">
                           {REACTION_OPTIONS.map((opt) => (
-                            <span key={opt.key} title={opt.label}>
-                              {opt.emoji} {msg.reactions?.[opt.key] ?? 0}
+                            <span key={opt.key} title={opt.label} className="whitespace-nowrap">
+                              {opt.emoji} {formatCompactCount(msg.reactions?.[opt.key] ?? 0)}
                             </span>
                           ))}
                         </div>
@@ -1293,7 +1213,7 @@ export const SignalsPage: React.FC = () => {
               <div className="flex items-center justify-between">
                 <span className="text-slate-500 dark:text-slate-400">Live Connected Viewers</span>
                 <span className="font-mono font-semibold text-[#15803D] dark:text-emerald-400 tabular-nums">
-                  {realOnlineCount} online · {wsConnected ? 'Live Sync' : 'Reconnecting'}
+                  {realOnlineCount} online · Live Sync
                 </span>
               </div>
               <div className="flex items-center justify-between">
@@ -1429,14 +1349,16 @@ export const SignalsPage: React.FC = () => {
                       onClick={() => handleReact(selectedCompleted, opt.key)}
                       aria-pressed={active}
                       aria-label={`${opt.label} (${count})`}
-                      className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-semibold transition-colors ${
+                      className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-semibold whitespace-nowrap transition-colors ${
                         active
                           ? opt.activeClass
                           : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 hover:bg-slate-200/80 dark:hover:bg-slate-700'
                       }`}
                     >
                       <span aria-hidden="true">{opt.emoji}</span>
-                      <span className="font-mono tabular-nums">{count}</span>
+                      <span className="font-mono tabular-nums">
+                        {formatCompactCount(count)}
+                      </span>
                     </button>
                   );
                 })}

@@ -718,11 +718,10 @@ export const AdminSignalsBroadcastStudio: React.FC<AdminSignalsBroadcastStudioPr
                           </p>
                         )}
                         <div className="flex flex-wrap items-center gap-3 pt-1 text-[11px] text-slate-500 font-mono">
-                          <span>❤️ {m.reactions.love}</span>
-                          <span>👍 {m.reactions.like}</span>
-                          <span>💥 {m.reactions.fire}</span>
-                          <span>💯 {m.reactions.hundred}</span>
-                          <span>👎 {m.reactions.dislike}</span>
+                          <span>❤️ {m.reactions.love >= 1000 ? `${(m.reactions.love / 1000).toFixed(1).replace(/\.0$/, '')}K` : m.reactions.love}</span>
+                          <span>🤙 {m.reactions.like >= 1000 ? `${(m.reactions.like / 1000).toFixed(1).replace(/\.0$/, '')}K` : m.reactions.like}</span>
+                          <span>💥 {m.reactions.fire >= 1000 ? `${(m.reactions.fire / 1000).toFixed(1).replace(/\.0$/, '')}K` : m.reactions.fire}</span>
+                          <span>💯 {m.reactions.hundred >= 1000 ? `${(m.reactions.hundred / 1000).toFixed(1).replace(/\.0$/, '')}K` : m.reactions.hundred}</span>
                         </div>
                       </>
                     )}

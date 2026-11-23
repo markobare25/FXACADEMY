@@ -15,6 +15,7 @@ import {
   createDatabaseBackup,
   db,
   ensureDesignatedAdminUser,
+  generateSeededReactions,
   hashPassword,
   initDatabase,
   logSystemEvent,
@@ -208,11 +209,25 @@ if (!process.env.VERCEL) {
   }, 25_000);
 }
 
+const sseClients = new Set<Response>();
+
 function broadcastWs(event: string, data: unknown): void {
   const payload = JSON.stringify({ event, data });
   for (const client of wsClients) {
     if (client.readyState === WebSocket.OPEN) {
       client.send(payload);
+    }
+  }
+}
+
+function broadcastSignalChatEvent(event: string, data: unknown): void {
+  broadcastWs(event, data);
+  const frame = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const res of sseClients) {
+    try {
+      res.write(frame);
+    } catch {
+      sseClients.delete(res);
     }
   }
 }
@@ -1078,11 +1093,11 @@ app.delete('/api/users/account', requireAuth, (req: AuthRequest, res: Response) 
 // ---------- Signals Community Chat (Active Live Stream & Completed Archive) ----------
 const recentSignalChatDedup = new Map<string, number>();
 const reactionBurstBuckets = new Map<string, number[]>();
-const REACTION_TYPES: readonly SignalReactionType[] = ['love', 'like', 'fire', 'hundred', 'dislike'];
+const REACTION_TYPES: readonly SignalReactionType[] = ['love', 'like', 'fire', 'hundred'];
 const UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function emptyReactions(): SignalReactionsMap {
-  return { love: 0, like: 0, fire: 0, hundred: 0, dislike: 0 };
+  return { love: 0, like: 0, fire: 0, hundred: 0 };
 }
 
 function hashActorKey(actorKey: string): string {
@@ -1167,10 +1182,18 @@ function hydrateSignalMessages(rows: Array<Record<string, unknown>>, actorKey?: 
     .all(...messageIds) as Array<{ message_id: string; reaction: SignalReactionType; cnt: number }>;
 
   const reactMap = new Map<string, SignalReactionsMap>();
+  for (const row of rows) {
+    reactMap.set(String(row.id), {
+      love: Number(row.seed_love || 0),
+      like: Number(row.seed_like || 0),
+      fire: Number(row.seed_fire || 0),
+      hundred: Number(row.seed_hundred || 0),
+    });
+  }
   for (const r of reactRows) {
     const cur = reactMap.get(r.message_id) || emptyReactions();
     if (REACTION_TYPES.includes(r.reaction)) {
-      cur[r.reaction] = r.cnt;
+      cur[r.reaction] += r.cnt;
     }
     reactMap.set(r.message_id, cur);
   }
@@ -1271,12 +1294,14 @@ function publishMirrorToSignalChannel(params: {
   const resolvedMediaType = params.mediaType || (params.imageUrl ? 'image' : null);
   const resolvedMediaName = params.mediaName || params.imageName || null;
 
+  const seeds = generateSeededReactions();
+
   db.prepare(
     `INSERT OR IGNORE INTO signal_messages (
       id, author_id, author_name, content, image_url, image_name,
       media_url, media_type, media_name, message_type, priority, status, pinned,
-      source_type, source_id, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)`
+      source_type, source_id, seed_love, seed_like, seed_fire, seed_hundred, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     id,
     authorId,
@@ -1292,6 +1317,10 @@ function publishMirrorToSignalChannel(params: {
     params.pinned ? 1 : 0,
     params.sourceType,
     params.sourceId,
+    seeds.love,
+    seeds.like,
+    seeds.fire,
+    seeds.hundred,
     createdAt
   );
 
@@ -1301,7 +1330,7 @@ function publishMirrorToSignalChannel(params: {
   if (!row) return null;
 
   const hydrated = hydrateSignalMessages([row], null)[0];
-  broadcastWs('signals_chat:created', hydrated);
+  broadcastSignalChatEvent('signals_chat:created', hydrated);
   return { message: hydrated, created: String(row.id) === id };
 }
 
@@ -1310,6 +1339,24 @@ function mapMessageTypeToPushCategory(messageType: string): PushCategory {
   if (messageType === 'news') return 'market_updates';
   if (messageType === 'announcement') return 'announcements';
   return 'signal_chat';
+}
+
+function buildSignalChannelPushTitle(
+  messageType: string,
+  priority: 'normal' | 'urgent',
+  content: string
+): string {
+  const prefix = priority === 'urgent' ? 'URGENT · ' : '';
+  const firstLine = content.split('\n')[0]?.trim() || '';
+  const pairMatch = firstLine.match(/\b(BUY|SELL)?\s*([A-Z]{3,6}\/?[A-Z]{3}|XAUUSD|XAGUSD|US30|NAS100|SPX500|BTCUSD|ETHUSD)\b/i);
+  if (pairMatch) {
+    const headline = pairMatch[0].replace(/\s+/g, ' ').trim().toUpperCase();
+    return `${prefix}MeridianFX Signal · ${headline}`;
+  }
+  if (messageType === 'signal' || messageType === 'setup') {
+    return `${prefix}MeridianFX Signal Alert`;
+  }
+  return `${prefix}MeridianFX Signals`;
 }
 
 function buildSignalChannelPushPreview(
@@ -1440,10 +1487,38 @@ app.get('/api/signals/messages', optionalAuth, (req: AuthRequest, res: Response)
   });
 });
 
+function handleSignalsStream(req: Request, res: Response): void {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders?.();
+
+  sseClients.add(res);
+  res.write(`event: connected\ndata: ${JSON.stringify({ ok: true, server_time: new Date().toISOString() })}\n\n`);
+
+  const keepAlive = setInterval(() => {
+    try {
+      res.write(': ping\n\n');
+    } catch {
+      clearInterval(keepAlive);
+      sseClients.delete(res);
+    }
+  }, 15_000);
+
+  req.on('close', () => {
+    clearInterval(keepAlive);
+    sseClients.delete(res);
+  });
+}
+
+app.get('/api/signals/stream', handleSignalsStream);
+app.get('/api/signals/messages/stream', handleSignalsStream);
+
 app.get('/api/signals/messages/:id', optionalAuth, (req: AuthRequest, res: Response) => {
-  const row = db.prepare('SELECT * FROM signal_messages WHERE id = ?').get(req.params.id) as
-    | Record<string, unknown>
-    | undefined;
+  const row = db
+    .prepare('SELECT * FROM signal_messages WHERE id = ? OR source_id = ? LIMIT 1')
+    .get(req.params.id, req.params.id) as Record<string, unknown> | undefined;
   if (!row) {
     res.status(404).json({ error: 'Message not found.' });
     return;
@@ -1522,12 +1597,17 @@ app.post('/api/signals/messages', requireRole('admin'), async (req: AuthRequest,
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
   const initialStatus = d.status === 'draft' ? 'draft' : 'active';
+  const seeds =
+    initialStatus === 'active'
+      ? generateSeededReactions()
+      : { love: 0, like: 0, fire: 0, hundred: 0 };
 
   db.prepare(
     `INSERT INTO signal_messages (
       id, author_id, author_name, content, image_url, image_name,
-      media_url, media_type, media_name, message_type, priority, status, pinned, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      media_url, media_type, media_name, message_type, priority, status, pinned,
+      seed_love, seed_like, seed_fire, seed_hundred, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     id,
     req.user!.id,
@@ -1542,6 +1622,10 @@ app.post('/api/signals/messages', requireRole('admin'), async (req: AuthRequest,
     d.priority,
     initialStatus,
     initialStatus === 'active' && d.pinned ? 1 : 0,
+    seeds.love,
+    seeds.like,
+    seeds.fire,
+    seeds.hundred,
     now
   );
 
@@ -1550,7 +1634,7 @@ app.post('/api/signals/messages', requireRole('admin'), async (req: AuthRequest,
 
   let pushJob = null;
   if (initialStatus === 'active') {
-    broadcastWs('signals_chat:created', hydrated);
+    broadcastSignalChatEvent('signals_chat:created', hydrated);
 
     const preview = buildSignalChannelPushPreview(
       d.message_type,
@@ -1559,9 +1643,8 @@ app.post('/api/signals/messages', requireRole('admin'), async (req: AuthRequest,
       req.user!.name
     );
     if (d.send_push !== false) {
-      const titlePrefix = d.priority === 'urgent' ? 'URGENT · ' : '';
       const dispatchRes = await dispatchNotification({
-        title: `${titlePrefix}MeridianFX Signals`,
+        title: buildSignalChannelPushTitle(d.message_type, d.priority, trimmedContent),
         body: preview,
         category: mapMessageTypeToPushCategory(d.message_type),
         linkUrl: `/signals?message=${id}`,
@@ -1668,6 +1751,21 @@ app.patch('/api/signals/messages/:id', requireRole('admin'), async (req: AuthReq
   const nextType = d.message_type ?? String(existing.message_type || 'update');
   const nextPriority = d.priority ?? (existing.priority === 'urgent' ? 'urgent' : 'normal');
 
+  const existingSeedSum =
+    Number(existing.seed_love || 0) +
+    Number(existing.seed_like || 0) +
+    Number(existing.seed_fire || 0) +
+    Number(existing.seed_hundred || 0);
+  const nextSeeds =
+    publishingFromDraft && existingSeedSum === 0
+      ? generateSeededReactions()
+      : {
+          love: Number(existing.seed_love || 0),
+          like: Number(existing.seed_like || 0),
+          fire: Number(existing.seed_fire || 0),
+          hundred: Number(existing.seed_hundred || 0),
+        };
+
   db.prepare(
     `UPDATE signal_messages SET
       content = ?,
@@ -1683,6 +1781,10 @@ app.patch('/api/signals/messages/:id', requireRole('admin'), async (req: AuthReq
       edited_at = ?,
       completed_at = ?,
       completed_summary = ?,
+      seed_love = ?,
+      seed_like = ?,
+      seed_fire = ?,
+      seed_hundred = ?,
       created_at = ?
      WHERE id = ?`
   ).run(
@@ -1699,6 +1801,10 @@ app.patch('/api/signals/messages/:id', requireRole('admin'), async (req: AuthReq
     nextEditedAt,
     nextCompletedAt,
     d.completed_summary !== undefined ? d.completed_summary : existing.completed_summary,
+    nextSeeds.love,
+    nextSeeds.like,
+    nextSeeds.fire,
+    nextSeeds.hundred,
     nextCreatedAt,
     req.params.id
   );
@@ -1711,7 +1817,7 @@ app.patch('/api/signals/messages/:id', requireRole('admin'), async (req: AuthReq
 
   let pushJob = null;
   if (publishingFromDraft) {
-    broadcastWs('signals_chat:created', hydrated);
+    broadcastSignalChatEvent('signals_chat:created', hydrated);
     if (d.send_push !== false) {
       const preview = buildSignalChannelPushPreview(
         nextType,
@@ -1719,9 +1825,8 @@ app.patch('/api/signals/messages/:id', requireRole('admin'), async (req: AuthReq
         nextMediaType,
         String(existing.author_name || req.user!.name)
       );
-      const titlePrefix = nextPriority === 'urgent' ? 'URGENT · ' : '';
       const dispatchRes = await dispatchNotification({
-        title: `${titlePrefix}MeridianFX Signals`,
+        title: buildSignalChannelPushTitle(nextType, nextPriority, nextContent),
         body: preview,
         category: mapMessageTypeToPushCategory(nextType),
         linkUrl: `/signals?message=${hydrated.id}`,
@@ -1735,7 +1840,7 @@ app.patch('/api/signals/messages/:id', requireRole('admin'), async (req: AuthReq
       pushJob = dispatchRes.push_job;
     }
   } else if (nextStatus !== 'draft') {
-    broadcastWs('signals_chat:updated', hydrated);
+    broadcastSignalChatEvent('signals_chat:updated', hydrated);
   }
 
   res.json({ message: hydrated, push_job: pushJob });
@@ -1751,105 +1856,134 @@ app.delete('/api/signals/messages/:id', requireRole('admin'), (req: AuthRequest,
     res.status(404).json({ error: 'Message not found.' });
     return;
   }
-  broadcastWs('signals_chat:deleted', { id: req.params.id });
+  broadcastSignalChatEvent('signals_chat:deleted', { id: req.params.id });
   res.json({ ok: true });
 });
+
+function handleSignalMessageReaction(req: AuthRequest, res: Response): void {
+  const schema = z.object({
+    reaction: z.enum(['love', 'like', 'fire', 'hundred']).nullable(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Valid reaction (love, like, fire, or hundred) is required.' });
+    return;
+  }
+
+  const targetId = String(req.params.id || '').trim();
+  const msg = db
+    .prepare(
+      `SELECT id, seed_love, seed_like, seed_fire, seed_hundred
+       FROM signal_messages
+       WHERE id = ? OR source_id = ?
+       LIMIT 1`
+    )
+    .get(targetId, targetId) as
+    | {
+        id: string;
+        seed_love: number | null;
+        seed_like: number | null;
+        seed_fire: number | null;
+        seed_hundred: number | null;
+      }
+    | undefined;
+
+  if (!msg) {
+    res.status(404).json({ error: 'Message not found.' });
+    return;
+  }
+
+  const actor = resolveReactionActor(req, res, true);
+  if (!actor) {
+    res.status(400).json({ error: 'Unable to establish visitor session.' });
+    return;
+  }
+
+  if (!checkReactionBurst(actor.actorKey, req.ip || 'unknown')) {
+    res.status(429).json({ error: 'Too many reaction updates. Please wait a few seconds.' });
+    return;
+  }
+
+  const existing = db
+    .prepare('SELECT reaction FROM signal_message_reactions WHERE message_id = ? AND actor_key = ?')
+    .get(msg.id, actor.actorKey) as { reaction: SignalReactionType } | undefined;
+
+  let nextUserReaction: SignalReactionType | null = null;
+  if (parsed.data.reaction === null || (existing && existing.reaction === parsed.data.reaction)) {
+    db.prepare('DELETE FROM signal_message_reactions WHERE message_id = ? AND actor_key = ?').run(
+      msg.id,
+      actor.actorKey
+    );
+    nextUserReaction = null;
+  } else {
+    db.prepare(
+      `INSERT INTO signal_message_reactions (message_id, actor_key, user_id, visitor_id, reaction, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(message_id, actor_key) DO UPDATE SET
+         user_id = COALESCE(excluded.user_id, signal_message_reactions.user_id),
+         visitor_id = COALESCE(excluded.visitor_id, signal_message_reactions.visitor_id),
+         reaction = excluded.reaction,
+         created_at = excluded.created_at`
+    ).run(
+      msg.id,
+      actor.actorKey,
+      actor.userId,
+      actor.visitorId,
+      parsed.data.reaction,
+      new Date().toISOString()
+    );
+    nextUserReaction = parsed.data.reaction;
+  }
+
+  const counts = db
+    .prepare(
+      `SELECT reaction, COUNT(*) as cnt
+       FROM signal_message_reactions
+       WHERE message_id = ?
+       GROUP BY reaction`
+    )
+    .all(msg.id) as Array<{ reaction: SignalReactionType; cnt: number }>;
+
+  const reactions: SignalReactionsMap = {
+    love: Number(msg.seed_love || 0),
+    like: Number(msg.seed_like || 0),
+    fire: Number(msg.seed_fire || 0),
+    hundred: Number(msg.seed_hundred || 0),
+  };
+  for (const c of counts) {
+    if (REACTION_TYPES.includes(c.reaction)) {
+      reactions[c.reaction] += c.cnt;
+    }
+  }
+
+  const viewerKey = hashActorKey(actor.actorKey);
+  broadcastSignalChatEvent('signals_chat:reacted', {
+    message_id: msg.id,
+    reactions,
+    viewer_key: viewerKey,
+    reaction: nextUserReaction,
+  });
+
+  res.json({
+    message_id: msg.id,
+    reactions,
+    user_reaction: nextUserReaction,
+    viewer_key: viewerKey,
+  });
+}
 
 app.post(
   '/api/signals/messages/:id/react',
   optionalAuth,
   rateLimit(45, 60_000),
-  (req: AuthRequest, res: Response) => {
-    const schema = z.object({
-      reaction: z.enum(['love', 'like', 'fire', 'hundred', 'dislike']).nullable(),
-    });
-    const parsed = schema.safeParse(req.body);
-    if (!parsed.success) {
-      res.status(400).json({ error: 'Valid reaction (love, like, fire, hundred, or dislike) is required.' });
-      return;
-    }
+  handleSignalMessageReaction
+);
 
-    const msg = db.prepare('SELECT id FROM signal_messages WHERE id = ?').get(req.params.id) as
-      | { id: string }
-      | undefined;
-    if (!msg) {
-      res.status(404).json({ error: 'Message not found.' });
-      return;
-    }
-
-    const actor = resolveReactionActor(req, res, true);
-    if (!actor) {
-      res.status(400).json({ error: 'Unable to establish visitor session.' });
-      return;
-    }
-
-    if (!checkReactionBurst(actor.actorKey, req.ip || 'unknown')) {
-      res.status(429).json({ error: 'Too many reaction updates. Please wait a few seconds.' });
-      return;
-    }
-
-    const existing = db
-      .prepare('SELECT reaction FROM signal_message_reactions WHERE message_id = ? AND actor_key = ?')
-      .get(req.params.id, actor.actorKey) as { reaction: SignalReactionType } | undefined;
-
-    let nextUserReaction: SignalReactionType | null = null;
-    if (parsed.data.reaction === null || (existing && existing.reaction === parsed.data.reaction)) {
-      db.prepare('DELETE FROM signal_message_reactions WHERE message_id = ? AND actor_key = ?').run(
-        req.params.id,
-        actor.actorKey
-      );
-      nextUserReaction = null;
-    } else {
-      db.prepare(
-        `INSERT INTO signal_message_reactions (message_id, actor_key, user_id, visitor_id, reaction, created_at)
-         VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT(message_id, actor_key) DO UPDATE SET
-           user_id = COALESCE(excluded.user_id, signal_message_reactions.user_id),
-           visitor_id = COALESCE(excluded.visitor_id, signal_message_reactions.visitor_id),
-           reaction = excluded.reaction,
-           created_at = excluded.created_at`
-      ).run(
-        req.params.id,
-        actor.actorKey,
-        actor.userId,
-        actor.visitorId,
-        parsed.data.reaction,
-        new Date().toISOString()
-      );
-      nextUserReaction = parsed.data.reaction;
-    }
-
-    const counts = db
-      .prepare(
-        `SELECT reaction, COUNT(*) as cnt
-         FROM signal_message_reactions
-         WHERE message_id = ?
-         GROUP BY reaction`
-      )
-      .all(req.params.id) as Array<{ reaction: SignalReactionType; cnt: number }>;
-
-    const reactions = emptyReactions();
-    for (const c of counts) {
-      if (REACTION_TYPES.includes(c.reaction)) {
-        reactions[c.reaction] = c.cnt;
-      }
-    }
-
-    const viewerKey = hashActorKey(actor.actorKey);
-    broadcastWs('signals_chat:reacted', {
-      message_id: String(req.params.id),
-      reactions,
-      viewer_key: viewerKey,
-      reaction: nextUserReaction,
-    });
-
-    res.json({
-      message_id: String(req.params.id),
-      reactions,
-      user_reaction: nextUserReaction,
-      viewer_key: viewerKey,
-    });
-  }
+app.post(
+  '/api/signals/:id/react',
+  optionalAuth,
+  rateLimit(45, 60_000),
+  handleSignalMessageReaction
 );
 
 // ---------- Legacy Structured Trading Signals (Home / Dashboard summary compatibility) ----------

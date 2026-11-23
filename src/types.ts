@@ -128,14 +128,13 @@ export type SignalChatMessageType =
   | 'news';
 export type SignalChatPriority = 'normal' | 'urgent';
 export type SignalChatStatus = 'draft' | 'active' | 'completed';
-export type SignalReactionType = 'love' | 'like' | 'fire' | 'hundred' | 'dislike';
+export type SignalReactionType = 'love' | 'like' | 'fire' | 'hundred';
 
 export interface SignalReactionsMap {
   love: number;
   like: number;
   fire: number;
   hundred: number;
-  dislike: number;
 }
 
 export interface SignalChatMessage {

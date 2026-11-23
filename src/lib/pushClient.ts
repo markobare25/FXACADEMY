@@ -132,15 +132,17 @@ export async function syncExistingPushSubscriptionIfGranted(): Promise<boolean> 
   try {
     const registration = await getReadyServiceWorkerRegistration(4000);
     let sub = await registration.pushManager.getSubscription();
-    if (!sub) return false;
-
     const { publicKey } = await apiFetch<{ publicKey: string }>('/api/push/vapid-public-key');
     const expectedKey = urlBase64ToUint8Array(publicKey);
-    const currentKeyBuf = sub.options?.applicationServerKey;
 
     let oldEndpoint: string | undefined;
-    if (currentKeyBuf) {
-      const currentKey = new Uint8Array(currentKeyBuf);
+    if (!sub) {
+      sub = await registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: expectedKey as unknown as BufferSource,
+      });
+    } else if (sub.options?.applicationServerKey) {
+      const currentKey = new Uint8Array(sub.options.applicationServerKey);
       if (!uint8ArraysEqual(currentKey, expectedKey)) {
         oldEndpoint = sub.endpoint;
         await sub.unsubscribe().catch(() => undefined);
@@ -176,6 +178,50 @@ export async function syncExistingPushSubscriptionIfGranted(): Promise<boolean> 
     return true;
   } catch {
     return false;
+  }
+}
+
+let autoPushGestureBound = false;
+let autoPushAttemptedThisLoad = false;
+
+export async function autoEnablePushNotifications(): Promise<void> {
+  if (!isPushSupported()) return;
+
+  if (Notification.permission === 'granted') {
+    await syncExistingPushSubscriptionIfGranted().catch(() => false);
+    return;
+  }
+
+  if (Notification.permission === 'denied') return;
+
+  const trySubscribe = async () => {
+    if (Notification.permission === 'granted') {
+      await syncExistingPushSubscriptionIfGranted().catch(() => false);
+      return;
+    }
+    if (Notification.permission !== 'default') return;
+    try {
+      const res = await subscribeToPushNotifications();
+      if (res.ok) return;
+    } catch {
+      // Browser may require a user gesture for Notification.requestPermission()
+    }
+  };
+
+  if (!autoPushAttemptedThisLoad) {
+    autoPushAttemptedThisLoad = true;
+    await trySubscribe();
+  }
+
+  if (Notification.permission === 'default' && !autoPushGestureBound && typeof window !== 'undefined') {
+    autoPushGestureBound = true;
+    const onFirstGesture = () => {
+      window.removeEventListener('pointerdown', onFirstGesture, true);
+      window.removeEventListener('keydown', onFirstGesture, true);
+      trySubscribe().catch(() => undefined);
+    };
+    window.addEventListener('pointerdown', onFirstGesture, { capture: true, once: true, passive: true });
+    window.addEventListener('keydown', onFirstGesture, { capture: true, once: true, passive: true });
   }
 }
 

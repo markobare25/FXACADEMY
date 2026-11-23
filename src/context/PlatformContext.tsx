@@ -8,6 +8,7 @@ import {
   setAuthRefreshHandler,
 } from '../lib/api';
 import {
+  autoEnablePushNotifications,
   isNotificationPromptDismissed,
   isPushSupported,
   syncExistingPushSubscriptionIfGranted,
@@ -406,7 +407,7 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     setAuthRefreshHandler(performSessionRefresh);
     performSessionRefresh();
     refreshPublicData();
-    syncExistingPushSubscriptionIfGranted().catch(() => undefined);
+    autoEnablePushNotifications().catch(() => undefined);
 
     return () => {
       setAuthRefreshHandler(null);
@@ -416,8 +417,8 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
   // Keep push subscription tied to current user state
   useEffect(() => {
-    if (!authLoading) {
-      syncExistingPushSubscriptionIfGranted().catch(() => undefined);
+    if (!authLoading && user?.id) {
+      autoEnablePushNotifications().catch(() => undefined);
     }
   }, [user?.id, authLoading]);
 

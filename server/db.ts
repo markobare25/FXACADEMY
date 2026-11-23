@@ -276,6 +276,10 @@ export function initDatabase(): void {
       completed_summary TEXT,
       source_type TEXT,
       source_id TEXT,
+      seed_love INTEGER NOT NULL DEFAULT 0,
+      seed_like INTEGER NOT NULL DEFAULT 0,
+      seed_fire INTEGER NOT NULL DEFAULT 0,
+      seed_hundred INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
       FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE CASCADE
     );
@@ -288,7 +292,7 @@ export function initDatabase(): void {
       actor_key TEXT NOT NULL,
       user_id TEXT,
       visitor_id TEXT,
-      reaction TEXT NOT NULL CHECK (reaction IN ('love', 'like', 'fire', 'hundred', 'dislike')),
+      reaction TEXT NOT NULL CHECK (reaction IN ('love', 'like', 'fire', 'hundred')),
       created_at TEXT NOT NULL,
       PRIMARY KEY (message_id, actor_key),
       FOREIGN KEY (message_id) REFERENCES signal_messages(id) ON DELETE CASCADE
@@ -740,6 +744,10 @@ export function initDatabase(): void {
   ensureColumn('users', 'needs_password_setup', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('signal_messages', 'source_type', 'TEXT');
   ensureColumn('signal_messages', 'source_id', 'TEXT');
+  ensureColumn('signal_messages', 'seed_love', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('signal_messages', 'seed_like', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('signal_messages', 'seed_fire', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('signal_messages', 'seed_hundred', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('signal_messages', 'media_url', 'TEXT');
   ensureColumn('signal_messages', 'media_type', 'TEXT');
   ensureColumn('signal_messages', 'media_name', 'TEXT');
@@ -798,31 +806,36 @@ export function initDatabase(): void {
       ON support_messages(conversation_id, created_at);
   `);
 
-  // Migrate legacy signal_message_reactions table (2 reactions + user_id PK) to 5-reaction public actor_key schema
+  // Migrate signal_message_reactions table to 4-reaction public actor_key schema (remove 'dislike')
   const reactionTableMeta = db
     .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'signal_message_reactions'")
     .get() as { sql?: string } | undefined;
 
   if (
     reactionTableMeta?.sql &&
-    (!reactionTableMeta.sql.includes('actor_key') || !reactionTableMeta.sql.includes("'fire'"))
+    (!reactionTableMeta.sql.includes('actor_key') ||
+      !reactionTableMeta.sql.includes("'fire'") ||
+      reactionTableMeta.sql.includes("'dislike'"))
   ) {
     const migrateReactions = db.transaction(() => {
+      const actorSelect = reactionTableMeta.sql!.includes('actor_key')
+        ? 'actor_key, user_id, visitor_id'
+        : "'user:' || user_id, user_id, NULL";
       db.exec(`
         CREATE TABLE signal_message_reactions_migrated (
           message_id TEXT NOT NULL,
           actor_key TEXT NOT NULL,
           user_id TEXT,
           visitor_id TEXT,
-          reaction TEXT NOT NULL CHECK (reaction IN ('love', 'like', 'fire', 'hundred', 'dislike')),
+          reaction TEXT NOT NULL CHECK (reaction IN ('love', 'like', 'fire', 'hundred')),
           created_at TEXT NOT NULL,
           PRIMARY KEY (message_id, actor_key),
           FOREIGN KEY (message_id) REFERENCES signal_messages(id) ON DELETE CASCADE
         );
         INSERT INTO signal_message_reactions_migrated (message_id, actor_key, user_id, visitor_id, reaction, created_at)
-        SELECT message_id, 'user:' || user_id, user_id, NULL, reaction, created_at
+        SELECT message_id, ${actorSelect}, reaction, created_at
         FROM signal_message_reactions
-        WHERE reaction IN ('love', 'like', 'fire', 'hundred', 'dislike');
+        WHERE reaction IN ('love', 'like', 'fire', 'hundred');
         DROP TABLE signal_message_reactions;
         ALTER TABLE signal_message_reactions_migrated RENAME TO signal_message_reactions;
         CREATE INDEX IF NOT EXISTS idx_signal_reactions_msg ON signal_message_reactions(message_id);
@@ -843,6 +856,42 @@ export function initDatabase(): void {
   ).run();
 
   seedInitialData();
+
+  // Backfill any published signal_messages with zero seeded reactions
+  const unseededMessages = db
+    .prepare(
+      `SELECT id FROM signal_messages
+       WHERE status != 'draft'
+         AND (COALESCE(seed_love, 0) + COALESCE(seed_like, 0) + COALESCE(seed_fire, 0) + COALESCE(seed_hundred, 0)) = 0`
+    )
+    .all() as Array<{ id: string }>;
+
+  if (unseededMessages.length > 0) {
+    const updateSeed = db.prepare(
+      'UPDATE signal_messages SET seed_love = ?, seed_like = ?, seed_fire = ?, seed_hundred = ? WHERE id = ?'
+    );
+    const backfillTx = db.transaction(() => {
+      for (const row of unseededMessages) {
+        const s = generateSeededReactions();
+        updateSeed.run(s.love, s.like, s.fire, s.hundred, row.id);
+      }
+    });
+    backfillTx();
+  }
+}
+
+export function generateSeededReactions(): {
+  love: number;
+  like: number;
+  fire: number;
+  hundred: number;
+} {
+  const total = Math.floor(Math.random() * (20000 - 5000 + 1)) + 5000;
+  const love = Math.round(total * 0.35);
+  const like = Math.round(total * 0.25);
+  const fire = Math.round(total * 0.20);
+  const hundred = total - love - like - fire;
+  return { love, like, fire, hundred };
 }
 
 function seedInitialData(): void {
@@ -1192,8 +1241,9 @@ function seedInitialData(): void {
       INSERT OR IGNORE INTO signal_messages (
         id, author_id, author_name, content, image_url, image_name,
         media_url, media_type, media_name, message_type, priority,
-        status, pinned, completed_at, completed_summary, source_type, source_id, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        status, pinned, completed_at, completed_summary, source_type, source_id,
+        seed_love, seed_like, seed_fire, seed_hundred, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const publicSignals = db
@@ -1215,6 +1265,7 @@ function seedInitialData(): void {
       const isCompleted = sigStatus === 'TP Hit' || sigStatus === 'SL Hit' || sigStatus === 'Closed';
       const imgUrl = sig.chart_image_url ? String(sig.chart_image_url) : null;
       const imgName = imgUrl ? `${String(sig.pair)} Chart` : null;
+      const seeds = generateSeededReactions();
 
       insertSignalMsg.run(
         crypto.randomUUID(),
@@ -1234,6 +1285,10 @@ function seedInitialData(): void {
         isCompleted ? String(sig.admin_remarks || sigStatus) : null,
         'signal',
         String(sig.id),
+        seeds.love,
+        seeds.like,
+        seeds.fire,
+        seeds.hundred,
         String(sig.created_at)
       );
     }
@@ -1248,6 +1303,7 @@ function seedInitialData(): void {
       const content = [`${cat}: ${String(upd.title)}`, String(upd.content || '')].join('\n\n');
       const imgUrl = upd.image_url ? String(upd.image_url) : null;
       const imgName = imgUrl ? String(upd.title) : null;
+      const seeds = generateSeededReactions();
 
       insertSignalMsg.run(
         crypto.randomUUID(),
@@ -1267,6 +1323,10 @@ function seedInitialData(): void {
         null,
         'market_update',
         String(upd.id),
+        seeds.love,
+        seeds.like,
+        seeds.fire,
+        seeds.hundred,
         String(upd.created_at)
       );
     }
