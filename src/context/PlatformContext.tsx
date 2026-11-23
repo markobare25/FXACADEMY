@@ -93,6 +93,7 @@ const DEFAULT_SETTINGS: PlatformSettings = {
 
 const DEFAULT_STATS: PublicStats = {
   total_signals: 0,
+  total_published_signals: 18782,
   active_signals: 0,
   completed_signals: 0,
   total_updates: 0,
@@ -250,8 +251,8 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   const refreshPublicData = useCallback(async () => {
     try {
       const [settingsRes, sigRes, updRes, acadRes] = await Promise.all([
-        apiFetch<{ settings: PlatformSettings; stats: PublicStats }>('/api/settings'),
-        apiFetch<{ signals: TradingSignal[] }>('/api/signals'),
+        apiFetch<{ settings: PlatformSettings; stats: PublicStats }>('/api/settings', { cache: 'no-store' }),
+        apiFetch<{ signals: TradingSignal[] }>('/api/signals', { cache: 'no-store' }),
         apiFetch<{ updates: MarketUpdate[] }>('/api/updates'),
         apiFetch<{ courses: Course[]; resume_state?: AcademyResumeState | null }>('/api/academy/courses'),
       ]);
@@ -672,6 +673,18 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
             }
             case 'settings:updated': {
               setSettings(msg.data as PlatformSettings);
+              break;
+            }
+            case 'stats:updated': {
+              const payload = msg.data as Partial<PublicStats>;
+              if (payload && typeof payload === 'object') {
+                setStats((st) => ({
+                  ...st,
+                  ...(typeof payload.total_published_signals === 'number'
+                    ? { total_published_signals: payload.total_published_signals }
+                    : {}),
+                }));
+              }
               break;
             }
             case 'notification:new': {

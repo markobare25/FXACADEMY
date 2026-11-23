@@ -34,7 +34,7 @@ clientsClaim();
 cleanupOutdatedCaches();
 precacheAndRoute(self.__WB_MANIFEST || []);
 
-// Never cache auth, admin APIs, push registration/ack, or live signal channel messages/reactions
+// Never cache auth, admin APIs, push registration/ack, live signal feeds, or dynamic counters
 registerRoute(
   ({ url }) =>
     url.pathname.startsWith('/api/push/') ||
@@ -42,19 +42,19 @@ registerRoute(
     url.pathname.startsWith('/api/admin/') ||
     url.pathname === '/api/signals/stream' ||
     url.pathname.startsWith('/api/signals/messages') ||
+    url.pathname === '/api/signals' ||
+    url.pathname === '/api/settings' ||
     url.pathname === '/api/updates/news' ||
     url.pathname === '/api/updates/calendar' ||
     url.searchParams.get('includeAll') === 'true',
   new NetworkOnly()
 );
 
-// Cache previously loaded educational materials, signals overview, and updates for offline reading
+// Cache previously loaded educational materials and updates for offline reading
 registerRoute(
   ({ url }) =>
     url.pathname.startsWith('/api/academy') ||
-    url.pathname.startsWith('/api/signals') ||
-    url.pathname.startsWith('/api/updates') ||
-    url.pathname.startsWith('/api/settings'),
+    url.pathname.startsWith('/api/updates'),
   new NetworkFirst({
     cacheName: 'meridianfx-content-cache',
     networkTimeoutSeconds: 2,

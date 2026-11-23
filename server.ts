@@ -11,13 +11,16 @@ import { z } from 'zod';
 import {
   BACKUP_DIR,
   DESIGNATED_ADMIN_EMAIL,
+  SIGNAL_MESSAGE_TTL_MS,
   UPLOAD_DIR,
   createDatabaseBackup,
   db,
   ensureDesignatedAdminUser,
   generateSeededReactions,
   generateSeededViews,
+  getTotalPublishedSignals,
   hashPassword,
+  incrementTotalPublishedSignals,
   initDatabase,
   logSystemEvent,
   verifyAdminFallbackPassword,
@@ -71,13 +74,18 @@ import {
   type PushTargetGroup,
 } from './server/push.ts';
 import {
+  deleteRemoteSignal,
   deleteRemoteSignalMessage,
   ensureRemoteHydrated,
   fetchRemoteSignalMessageById,
+  refreshSignalsAndStatsFromRemote,
   syncMarketUpdateToRemote,
   syncPushSubscriptionToRemote,
   syncSignalMessageToRemote,
   syncSignalReactionToRemote,
+  syncSignalToRemote,
+  syncSignalUpdateToRemote,
+  syncTotalPublishedSignalsToRemote,
 } from './server/persistentStore.ts';
 import {
   getEconomicCalendar,
@@ -499,6 +507,7 @@ function getPlatformSettings(): PlatformSettings {
 
 function getPublicStats(): PublicStats {
   const totalSignals = (db.prepare('SELECT COUNT(*) as c FROM signals').get() as { c: number }).c;
+  const totalPublishedSignals = getTotalPublishedSignals();
   const activeSignals = (
     db.prepare("SELECT COUNT(*) as c FROM signals WHERE status IN ('Active','Pending')").get() as { c: number }
   ).c;
@@ -523,6 +532,7 @@ function getPublicStats(): PublicStats {
 
   return {
     total_signals: totalSignals,
+    total_published_signals: totalPublishedSignals,
     active_signals: activeSignals,
     completed_signals: completedSignals,
     total_updates: totalUpdates,
@@ -538,7 +548,11 @@ app.get('/api/health', (_req, res) => {
   res.json({ ok: true, timestamp: new Date().toISOString() });
 });
 
-app.get('/api/settings', (_req, res) => {
+app.get('/api/settings', async (_req, res) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  await refreshSignalsAndStatsFromRemote();
   res.json({
     settings: getPlatformSettings(),
     stats: getPublicStats(),
@@ -1444,17 +1458,49 @@ function buildSignalChannelPushPreview(
   return `${sender} (${label}): New message posted in Signal Channel.`;
 }
 
-function parseInstalledAtParam(raw: unknown): string | null {
-  if (typeof raw !== 'string') return null;
-  const trimmed = raw.trim();
-  if (!trimmed) return null;
-  const ms = Date.parse(trimmed);
-  if (!Number.isFinite(ms)) return null;
-  return new Date(ms).toISOString();
+async function cleanupExpiredSignalMessages(): Promise<number> {
+  const cutoffIso = new Date(Date.now() - SIGNAL_MESSAGE_TTL_MS).toISOString();
+  const expiredRows = db
+    .prepare(
+      `SELECT id FROM signal_messages
+       WHERE status = 'active'
+         AND COALESCE(is_welcome, 0) = 0
+         AND COALESCE(pinned, 0) = 0
+         AND created_at <= ?`
+    )
+    .all(cutoffIso) as Array<{ id: string }>;
+
+  if (expiredRows.length === 0) return 0;
+
+  const delStmt = db.prepare('DELETE FROM signal_messages WHERE id = ?');
+  const delTx = db.transaction((ids: string[]) => {
+    let deleted = 0;
+    for (const id of ids) {
+      deleted += delStmt.run(id).changes;
+    }
+    return deleted;
+  });
+
+  const ids = expiredRows.map((r) => String(r.id));
+  const count = delTx(ids);
+
+  for (const id of ids) {
+    broadcastSignalChatEvent('signals_chat:deleted', { id });
+  }
+  await Promise.allSettled(ids.map((id) => deleteRemoteSignalMessage(id)));
+  return count;
 }
 
-app.get('/api/signals/messages', optionalAuth, (req: AuthRequest, res: Response) => {
+void cleanupExpiredSignalMessages();
+
+app.get('/api/signals/messages', optionalAuth, async (req: AuthRequest, res: Response) => {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+
+  await refreshSignalsAndStatsFromRemote();
+  await cleanupExpiredSignalMessages();
+
   const requestedStatus = String(req.query.status || 'active');
   const isAdmin =
     Boolean(req.user) &&
@@ -1475,45 +1521,20 @@ app.get('/api/signals/messages', optionalAuth, (req: AuthRequest, res: Response)
         ? 'draft'
         : 'active';
 
-  let effectiveInstalledAt: string | null = null;
-  if (!isAdminScope) {
-    const clientInstalledAt =
-      parseInstalledAtParam(req.query.installed_at) ||
-      parseInstalledAtParam(req.headers['x-installed-at']);
-
-    if (req.user) {
-      const dbInstalled = parseInstalledAtParam(req.user.installed_at);
-      if (dbInstalled) {
-        effectiveInstalledAt = dbInstalled;
-      } else {
-        effectiveInstalledAt = clientInstalledAt || new Date().toISOString();
-        db.prepare('UPDATE users SET installed_at = COALESCE(installed_at, ?) WHERE id = ?').run(
-          effectiveInstalledAt,
-          req.user.id
-        );
-      }
-    } else {
-      effectiveInstalledAt = clientInstalledAt || new Date().toISOString();
-    }
-  }
-
   const limitRaw = Number(req.query.limit || 40);
   const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(Math.floor(limitRaw), 1), 100) : 40;
   const before = typeof req.query.before === 'string' && req.query.before.trim() ? req.query.before.trim() : null;
   const after = typeof req.query.after === 'string' && req.query.after.trim() ? req.query.after.trim() : null;
   const search = typeof req.query.search === 'string' && req.query.search.trim() ? req.query.search.trim() : null;
 
+  const cutoff24hIso = new Date(Date.now() - SIGNAL_MESSAGE_TTL_MS).toISOString();
   const orderCol = status === 'completed' ? 'COALESCE(completed_at, created_at)' : 'created_at';
   const conditions: string[] = ['status = ?'];
   const params: unknown[] = [status];
 
-  if (effectiveInstalledAt) {
-    if (status === 'active') {
-      // Non-welcome messages must be created at or after the user's install time
-      conditions.push('COALESCE(is_welcome, 0) = 0');
-    }
-    conditions.push('created_at >= ?');
-    params.push(effectiveInstalledAt);
+  if (status === 'active') {
+    conditions.push('(COALESCE(is_welcome, 0) = 1 OR COALESCE(pinned, 0) = 1 OR created_at > ?)');
+    params.push(cutoff24hIso);
   }
   if (before) {
     conditions.push(`${orderCol} < ?`);
@@ -1554,50 +1575,31 @@ app.get('/api/signals/messages', optionalAuth, (req: AuthRequest, res: Response)
 
   const pinnedRows =
     status === 'active'
-      ? effectiveInstalledAt
-        ? (db
-            .prepare(
-              `SELECT * FROM signal_messages
-               WHERE status = 'active' AND pinned = 1
-                 AND (COALESCE(is_welcome, 0) = 1 OR created_at >= ?)
-               ORDER BY COALESCE(is_welcome, 0) ASC, created_at DESC
-               LIMIT 5`
-            )
-            .all(effectiveInstalledAt) as Array<Record<string, unknown>>)
-        : (db
-            .prepare(
-              "SELECT * FROM signal_messages WHERE status = 'active' AND pinned = 1 ORDER BY created_at DESC LIMIT 5"
-            )
-            .all() as Array<Record<string, unknown>>)
+      ? (db
+          .prepare(
+            `SELECT * FROM signal_messages
+             WHERE status = 'active' AND pinned = 1
+             ORDER BY COALESCE(is_welcome, 0) ASC, created_at DESC
+             LIMIT 5`
+          )
+          .all() as Array<Record<string, unknown>>)
       : [];
 
-  const activeCount = effectiveInstalledAt
-    ? (
-        db
-          .prepare(
-            "SELECT COUNT(*) as c FROM signal_messages WHERE status = 'active' AND (COALESCE(is_welcome, 0) = 1 OR created_at >= ?)"
-          )
-          .get(effectiveInstalledAt) as { c: number }
-      ).c
-    : (
-        db.prepare("SELECT COUNT(*) as c FROM signal_messages WHERE status = 'active'").get() as {
-          c: number;
-        }
-      ).c;
+  const activeCount = (
+    db
+      .prepare(
+        `SELECT COUNT(*) as c FROM signal_messages
+         WHERE status = 'active'
+           AND (COALESCE(is_welcome, 0) = 1 OR COALESCE(pinned, 0) = 1 OR created_at > ?)`
+      )
+      .get(cutoff24hIso) as { c: number }
+  ).c;
 
-  const completedCount = effectiveInstalledAt
-    ? (
-        db
-          .prepare(
-            "SELECT COUNT(*) as c FROM signal_messages WHERE status = 'completed' AND created_at >= ?"
-          )
-          .get(effectiveInstalledAt) as { c: number }
-      ).c
-    : (
-        db.prepare("SELECT COUNT(*) as c FROM signal_messages WHERE status = 'completed'").get() as {
-          c: number;
-        }
-      ).c;
+  const completedCount = (
+    db.prepare("SELECT COUNT(*) as c FROM signal_messages WHERE status = 'completed'").get() as {
+      c: number;
+    }
+  ).c;
 
   const draftCount = isAdmin
     ? (db.prepare("SELECT COUNT(*) as c FROM signal_messages WHERE status = 'draft'").get() as { c: number }).c
@@ -1622,7 +1624,7 @@ app.get('/api/signals/messages', optionalAuth, (req: AuthRequest, res: Response)
     online_count: wsClients.size,
     subscriber_count: subscriberCount,
     viewer_key: actor ? hashActorKey(actor.actorKey) : null,
-    installed_at: effectiveInstalledAt,
+    installed_at: null,
     server_time: new Date().toISOString(),
   });
 });
@@ -1657,6 +1659,8 @@ app.get('/api/signals/messages/stream', handleSignalsStream);
 
 app.get('/api/signals/messages/:id', optionalAuth, async (req: AuthRequest, res: Response) => {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
   const lookupId = String(req.params.id || '').trim();
   let row = db
     .prepare('SELECT * FROM signal_messages WHERE id = ? OR source_id = ? LIMIT 1')
@@ -1670,6 +1674,21 @@ app.get('/api/signals/messages/:id', optionalAuth, async (req: AuthRequest, res:
     }
   }
   if (!row) {
+    res.status(404).json({ error: 'Message not found.' });
+    return;
+  }
+
+  const isExpiredActive =
+    String(row.status) === 'active' &&
+    !Number(row.is_welcome || 0) &&
+    !Number(row.pinned || 0) &&
+    Number.isFinite(Date.parse(String(row.created_at || ''))) &&
+    Date.now() - Date.parse(String(row.created_at || '')) >= SIGNAL_MESSAGE_TTL_MS;
+
+  if (isExpiredActive) {
+    const expiredId = String(row.id);
+    db.prepare('DELETE FROM signal_messages WHERE id = ?').run(expiredId);
+    await deleteRemoteSignalMessage(expiredId);
     res.status(404).json({ error: 'Message not found.' });
     return;
   }
@@ -1756,6 +1775,10 @@ app.post('/api/signals/messages', requireRole('admin'), async (req: AuthRequest,
       ? generateSeededViews(seeds.love + seeds.like + seeds.fire + seeds.hundred)
       : 0;
 
+  if (initialStatus === 'active') {
+    await refreshSignalsAndStatsFromRemote();
+  }
+
   db.prepare(
     `INSERT INTO signal_messages (
       id, author_id, author_name, content, image_url, image_name,
@@ -1789,7 +1812,17 @@ app.post('/api/signals/messages', requireRole('admin'), async (req: AuthRequest,
     now
   );
 
-  await syncSignalMessageToRemote(id);
+  let totalPublishedSignals: number | undefined;
+  if (initialStatus === 'active') {
+    totalPublishedSignals = incrementTotalPublishedSignals();
+    await Promise.all([
+      syncSignalMessageToRemote(id),
+      syncTotalPublishedSignalsToRemote(totalPublishedSignals),
+    ]);
+    broadcastWs('stats:updated', { total_published_signals: totalPublishedSignals });
+  } else {
+    await syncSignalMessageToRemote(id);
+  }
 
   const row = db.prepare('SELECT * FROM signal_messages WHERE id = ?').get(id) as Record<string, unknown>;
   const hydrated = hydrateSignalMessages([row], `user:${req.user!.id}`)[0];
@@ -1829,7 +1862,11 @@ app.post('/api/signals/messages', requireRole('admin'), async (req: AuthRequest,
     }
   }
 
-  res.status(201).json({ message: hydrated, push_job: pushJob });
+  res.status(201).json({
+    message: hydrated,
+    push_job: pushJob,
+    ...(totalPublishedSignals !== undefined ? { total_published_signals: totalPublishedSignals } : {}),
+  });
 });
 
 const signalMessagePatchSchema = z.object({
@@ -2017,6 +2054,14 @@ app.patch('/api/signals/messages/:id', requireRole('admin'), async (req: AuthReq
 
   await syncSignalMessageToRemote(String(req.params.id));
 
+  let totalPublishedSignals: number | undefined;
+  if (publishingFromDraft) {
+    await refreshSignalsAndStatsFromRemote();
+    totalPublishedSignals = incrementTotalPublishedSignals();
+    await syncTotalPublishedSignalsToRemote(totalPublishedSignals);
+    broadcastWs('stats:updated', { total_published_signals: totalPublishedSignals });
+  }
+
   const updatedRow = db.prepare('SELECT * FROM signal_messages WHERE id = ?').get(req.params.id) as Record<
     string,
     unknown
@@ -2051,7 +2096,11 @@ app.patch('/api/signals/messages/:id', requireRole('admin'), async (req: AuthReq
     broadcastSignalChatEvent('signals_chat:updated', hydrated);
   }
 
-  res.json({ message: hydrated, push_job: pushJob });
+  res.json({
+    message: hydrated,
+    push_job: pushJob,
+    ...(totalPublishedSignals !== undefined ? { total_published_signals: totalPublishedSignals } : {}),
+  });
 });
 
 app.delete('/api/signals/messages/:id', requireRole('admin'), async (req: AuthRequest, res: Response) => {
@@ -2242,7 +2291,11 @@ function hydrateSignals(rows: Array<Record<string, unknown>>) {
   }));
 }
 
-app.get('/api/signals', optionalAuth, (req: AuthRequest, res: Response) => {
+app.get('/api/signals', optionalAuth, async (req: AuthRequest, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  await refreshSignalsAndStatsFromRemote();
   const canViewPremium = isActivePremiumUser(req.user);
   const rows = db
     .prepare(
@@ -2281,8 +2334,11 @@ app.post('/api/signals', requireRole('admin'), async (req: AuthRequest, res: Res
     return;
   }
 
+  await refreshSignalsAndStatsFromRemote();
+
   const d = parsed.data;
   const id = crypto.randomUUID();
+  const signalUpdateId = crypto.randomUUID();
   const now = new Date().toISOString();
   const isPremium = Boolean(d.is_premium);
 
@@ -2319,7 +2375,7 @@ app.post('/api/signals', requireRole('admin'), async (req: AuthRequest, res: Res
     `INSERT INTO signal_updates (id, signal_id, note, status_snapshot, created_by, created_at)
      VALUES (?, ?, ?, ?, ?, ?)`
   ).run(
-    crypto.randomUUID(),
+    signalUpdateId,
     id,
     `Signal published (${d.classification}): ${d.direction} ${d.pair.toUpperCase()} @ ${d.entry_price}`,
     d.status,
@@ -2327,11 +2383,14 @@ app.post('/api/signals', requireRole('admin'), async (req: AuthRequest, res: Res
     now
   );
 
+  const totalPublishedSignals = incrementTotalPublishedSignals();
+
   const row = db.prepare('SELECT * FROM signals WHERE id = ?').get(id) as Record<string, unknown>;
   const hydrated = hydrateSignals([row])[0];
   if (!isPremium) {
     broadcastWs('signal:created', hydrated);
   }
+  broadcastWs('stats:updated', { total_published_signals: totalPublishedSignals });
 
   const tpList = [d.tp1, d.tp2, d.tp3, d.tp4].filter(Boolean).join(' · ');
   const mirrorText = [
@@ -2356,6 +2415,13 @@ app.post('/api/signals', requireRole('admin'), async (req: AuthRequest, res: Res
         createdAt: now,
       })
     : null;
+
+  await Promise.all([
+    syncSignalToRemote(id),
+    syncSignalUpdateToRemote(signalUpdateId),
+    syncTotalPublishedSignalsToRemote(totalPublishedSignals),
+    ...(mirrored?.message?.id ? [syncSignalMessageToRemote(mirrored.message.id)] : []),
+  ]);
 
   const targetUrl = isPremium
     ? '/dashboard'
@@ -2392,6 +2458,7 @@ app.post('/api/signals', requireRole('admin'), async (req: AuthRequest, res: Res
     signal: hydrated,
     signal_message: mirrored?.message || null,
     push_job: pushJob,
+    total_published_signals: totalPublishedSignals,
   });
 });
 
@@ -2478,6 +2545,11 @@ app.patch('/api/signals/:id', requireRole('admin'), async (req: AuthRequest, res
       : null;
     mirroredMsg = mirrored?.message || null;
 
+    await Promise.all([
+      syncSignalUpdateToRemote(signalUpdateId),
+      ...(mirrored?.message?.id ? [syncSignalMessageToRemote(mirrored.message.id)] : []),
+    ]);
+
     if (d.send_push !== false) {
       const updateBody =
         d.admin_remarks ||
@@ -2510,6 +2582,8 @@ app.patch('/api/signals/:id', requireRole('admin'), async (req: AuthRequest, res
       });
     }
   }
+
+  await syncSignalToRemote(String(req.params.id));
 
   const updatedRow = db.prepare('SELECT * FROM signals WHERE id = ?').get(req.params.id) as Record<
     string,
@@ -2580,6 +2654,12 @@ app.post('/api/signals/:id/updates', requireRole('admin'), async (req: AuthReque
       })
     : null;
 
+  await Promise.all([
+    syncSignalToRemote(String(req.params.id)),
+    syncSignalUpdateToRemote(signalUpdateId),
+    ...(mirrored?.message?.id ? [syncSignalMessageToRemote(mirrored.message.id)] : []),
+  ]);
+
   let pushJob = null;
   if (parsed.data.send_push !== false) {
     const dispatchRes = await dispatchNotification({
@@ -2615,12 +2695,13 @@ app.post('/api/signals/:id/updates', requireRole('admin'), async (req: AuthReque
   });
 });
 
-app.delete('/api/signals/:id', requireRole('admin'), (req: Request, res: Response) => {
+app.delete('/api/signals/:id', requireRole('admin'), async (req: Request, res: Response) => {
   const info = db.prepare('DELETE FROM signals WHERE id = ?').run(req.params.id);
   if (info.changes === 0) {
     res.status(404).json({ error: 'Signal not found.' });
     return;
   }
+  await deleteRemoteSignal(String(req.params.id));
   broadcastWs('signal:deleted', { id: req.params.id });
   res.json({ ok: true });
 });
@@ -6636,6 +6717,9 @@ if (!process.env.VERCEL) {
     const nowIso = new Date().toISOString();
 
     try {
+      // 0. Expire non-pinned signal channel messages older than 24 hours
+      await cleanupExpiredSignalMessages();
+
       // 1. Publish due scheduled market updates
       const dueUpdates = db
         .prepare('SELECT * FROM market_updates WHERE published = 0 AND scheduled_at IS NOT NULL AND scheduled_at <= ?')

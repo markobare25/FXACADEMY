@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   ArrowDownRight,
   ArrowRight,
@@ -25,7 +25,12 @@ export const HomePage: React.FC = () => {
     updates,
     courses,
     navigate,
+    refreshAll,
   } = usePlatform();
+
+  useEffect(() => {
+    void refreshAll();
+  }, [refreshAll]);
 
   const [contactForm, setContactForm] = useState({
     name: '',
@@ -103,7 +108,7 @@ export const HomePage: React.FC = () => {
           <div>
             <p className="text-xs font-medium text-slate-500 dark:text-slate-400">Published Signals</p>
             <p className="mt-1 text-2xl font-bold font-mono tabular-nums text-[#881337] dark:text-rose-400">
-              18,782
+              {(stats.total_published_signals ?? 18782).toLocaleString()}
             </p>
             <p className="mt-0.5 text-xs text-emerald-700 dark:text-emerald-400">
               {stats.active_signals} active · {stats.completed_signals} completed

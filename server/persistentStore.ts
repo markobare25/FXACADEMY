@@ -3,6 +3,8 @@ import {
   DESIGNATED_ADMIN_EMAIL,
   ensureDesignatedAdminUser,
   getWelcomeSeedReactions,
+  SIGNAL_MESSAGE_TTL_MS,
+  syncLocalTotalPublishedSignalsIfHigher,
   WELCOME_SEED_VIEWS,
 } from './db.ts';
 
@@ -63,9 +65,24 @@ function getFallbackAdminId(): string {
   return row?.id || ensureDesignatedAdminUser();
 }
 
+function isExpiredNonPinnedActiveMessage(row: Record<string, unknown>): boolean {
+  const status = String(row.status || 'active');
+  if (status !== 'active') return false;
+  const isWelcome = Number(row.is_welcome || 0) === 1 || String(row.source_type || '') === 'welcome';
+  const isPinned = Number(row.pinned || 0) === 1;
+  if (isWelcome || isPinned) return false;
+  const createdMs = Date.parse(String(row.created_at || ''));
+  if (!Number.isFinite(createdMs)) return false;
+  return Date.now() - createdMs >= SIGNAL_MESSAGE_TTL_MS;
+}
+
 function upsertLocalSignalMessage(row: Record<string, unknown>): void {
   const id = String(row.id || '').trim();
   if (!id) return;
+  if (isExpiredNonPinnedActiveMessage(row)) {
+    db.prepare('DELETE FROM signal_messages WHERE id = ?').run(id);
+    return;
+  }
 
   const fallbackAdminId = getFallbackAdminId();
   const rawAuthorId = row.author_id ? String(row.author_id) : fallbackAdminId;
@@ -148,6 +165,80 @@ function upsertLocalSignalMessage(row: Record<string, unknown>): void {
     fireCount,
     hundredCount,
     seedViews,
+    String(row.created_at || new Date().toISOString())
+  );
+}
+
+function upsertLocalSignal(row: Record<string, unknown>): void {
+  const id = String(row.id || '').trim();
+  if (!id) return;
+  const fallbackAdminId = getFallbackAdminId();
+  db.prepare(
+    `INSERT INTO signals (
+      id, pair, direction, entry_price, stop_loss, tp1, tp2, tp3, tp4,
+      risk_reward, timeframe, status, classification, analysis, chart_image_url,
+      admin_remarks, is_premium, created_by, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      pair = excluded.pair,
+      direction = excluded.direction,
+      entry_price = excluded.entry_price,
+      stop_loss = excluded.stop_loss,
+      tp1 = excluded.tp1,
+      tp2 = excluded.tp2,
+      tp3 = excluded.tp3,
+      tp4 = excluded.tp4,
+      risk_reward = excluded.risk_reward,
+      timeframe = excluded.timeframe,
+      status = excluded.status,
+      classification = excluded.classification,
+      analysis = excluded.analysis,
+      chart_image_url = excluded.chart_image_url,
+      admin_remarks = excluded.admin_remarks,
+      is_premium = excluded.is_premium,
+      updated_at = excluded.updated_at`
+  ).run(
+    id,
+    String(row.pair || 'EURUSD'),
+    String(row.direction || 'BUY'),
+    String(row.entry_price || ''),
+    String(row.stop_loss || ''),
+    String(row.tp1 || ''),
+    row.tp2 ? String(row.tp2) : null,
+    row.tp3 ? String(row.tp3) : null,
+    row.tp4 ? String(row.tp4) : null,
+    String(row.risk_reward || '1 : 2.0'),
+    String(row.timeframe || 'H1'),
+    String(row.status || 'Active'),
+    String(row.classification || 'Educational'),
+    String(row.analysis || ''),
+    row.chart_image_url ? String(row.chart_image_url) : null,
+    row.admin_remarks ? String(row.admin_remarks) : null,
+    Number(row.is_premium || 0) ? 1 : 0,
+    row.created_by ? String(row.created_by) : fallbackAdminId,
+    String(row.created_at || new Date().toISOString()),
+    String(row.updated_at || new Date().toISOString())
+  );
+}
+
+function upsertLocalSignalUpdate(row: Record<string, unknown>): void {
+  const id = String(row.id || '').trim();
+  const signalId = String(row.signal_id || '').trim();
+  if (!id || !signalId) return;
+  const sigExists = db.prepare('SELECT 1 FROM signals WHERE id = ?').get(signalId);
+  if (!sigExists) return;
+  db.prepare(
+    `INSERT INTO signal_updates (id, signal_id, note, status_snapshot, created_by, created_at)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       note = excluded.note,
+       status_snapshot = excluded.status_snapshot`
+  ).run(
+    id,
+    signalId,
+    String(row.note || ''),
+    String(row.status_snapshot || 'Active'),
+    String(row.created_by || 'MeridianFX Desk'),
     String(row.created_at || new Date().toISOString())
   );
 }
@@ -293,24 +384,42 @@ export async function ensureRemoteHydrated(): Promise<void> {
 
   hydrationInFlight = (async () => {
     try {
-      const [remoteMsgs, remoteReacts, remoteUpdates, remoteSubs] = await Promise.all([
-        restRequest<Array<Record<string, unknown>>>(
-          'signal_messages?select=*&order=created_at.asc&limit=500'
-        ),
-        restRequest<Array<Record<string, unknown>>>(
-          'signal_message_reactions?select=*&limit=5000'
-        ),
-        restRequest<Array<Record<string, unknown>>>(
-          'market_updates?select=*&order=created_at.desc&limit=300'
-        ),
-        restRequest<Array<Record<string, unknown>>>(
-          'push_subscriptions?select=*&limit=1000'
-        ),
-      ]);
+      const [remoteMsgs, remoteReacts, remoteUpdates, remoteSubs, remoteSignals, remoteSignalUpdates, remoteSettings] =
+        await Promise.all([
+          restRequest<Array<Record<string, unknown>>>(
+            'signal_messages?select=*&order=created_at.asc&limit=500'
+          ),
+          restRequest<Array<Record<string, unknown>>>(
+            'signal_message_reactions?select=*&limit=5000'
+          ),
+          restRequest<Array<Record<string, unknown>>>(
+            'market_updates?select=*&order=created_at.desc&limit=300'
+          ),
+          restRequest<Array<Record<string, unknown>>>(
+            'push_subscriptions?select=*&limit=1000'
+          ),
+          restRequest<Array<Record<string, unknown>>>(
+            'signals?select=*&order=created_at.desc&limit=300'
+          ),
+          restRequest<Array<Record<string, unknown>>>(
+            'signal_updates?select=*&order=created_at.desc&limit=500'
+          ),
+          restRequest<Array<{ key?: string; value?: string }>>(
+            'platform_settings?select=key,value&key=eq.total_published_signals&limit=1'
+          ),
+        ]);
 
+      const expiredRemoteIds: string[] = [];
       const tx = db.transaction(() => {
         if (Array.isArray(remoteMsgs)) {
-          for (const row of remoteMsgs) upsertLocalSignalMessage(row);
+          for (const row of remoteMsgs) {
+            if (isExpiredNonPinnedActiveMessage(row)) {
+              const id = String(row.id || '').trim();
+              if (id) expiredRemoteIds.push(id);
+            } else {
+              upsertLocalSignalMessage(row);
+            }
+          }
         }
         if (Array.isArray(remoteReacts)) {
           for (const row of remoteReacts) upsertLocalReaction(row);
@@ -321,8 +430,24 @@ export async function ensureRemoteHydrated(): Promise<void> {
         if (Array.isArray(remoteSubs)) {
           for (const row of remoteSubs) upsertLocalPushSubscription(row);
         }
+        if (Array.isArray(remoteSignals)) {
+          for (const row of remoteSignals) upsertLocalSignal(row);
+        }
+        if (Array.isArray(remoteSignalUpdates)) {
+          for (const row of remoteSignalUpdates) upsertLocalSignalUpdate(row);
+        }
+        if (Array.isArray(remoteSettings) && remoteSettings[0]?.value) {
+          const parsed = Number.parseInt(String(remoteSettings[0].value), 10);
+          if (Number.isFinite(parsed)) {
+            syncLocalTotalPublishedSignalsIfHigher(parsed);
+          }
+        }
       });
       tx();
+
+      if (expiredRemoteIds.length > 0) {
+        void Promise.allSettled(expiredRemoteIds.map((id) => deleteRemoteSignalMessage(id)));
+      }
       hydrationDone = true;
     } finally {
       hydrationInFlight = null;
@@ -330,6 +455,53 @@ export async function ensureRemoteHydrated(): Promise<void> {
   })();
 
   return hydrationInFlight;
+}
+
+export async function refreshSignalsAndStatsFromRemote(): Promise<void> {
+  if (!isRemotePersistentStoreEnabled()) return;
+  try {
+    const [remoteMsgs, remoteSignals, remoteSettings] = await Promise.all([
+      restRequest<Array<Record<string, unknown>>>(
+        'signal_messages?select=*&order=created_at.asc&limit=500'
+      ),
+      restRequest<Array<Record<string, unknown>>>(
+        'signals?select=*&order=created_at.desc&limit=300'
+      ),
+      restRequest<Array<{ key?: string; value?: string }>>(
+        'platform_settings?select=key,value&key=eq.total_published_signals&limit=1'
+      ),
+    ]);
+
+    const expiredRemoteIds: string[] = [];
+    const tx = db.transaction(() => {
+      if (Array.isArray(remoteMsgs)) {
+        for (const row of remoteMsgs) {
+          if (isExpiredNonPinnedActiveMessage(row)) {
+            const id = String(row.id || '').trim();
+            if (id) expiredRemoteIds.push(id);
+          } else {
+            upsertLocalSignalMessage(row);
+          }
+        }
+      }
+      if (Array.isArray(remoteSignals)) {
+        for (const row of remoteSignals) upsertLocalSignal(row);
+      }
+      if (Array.isArray(remoteSettings) && remoteSettings[0]?.value) {
+        const parsed = Number.parseInt(String(remoteSettings[0].value), 10);
+        if (Number.isFinite(parsed)) {
+          syncLocalTotalPublishedSignalsIfHigher(parsed);
+        }
+      }
+    });
+    tx();
+
+    if (expiredRemoteIds.length > 0) {
+      void Promise.allSettled(expiredRemoteIds.map((id) => deleteRemoteSignalMessage(id)));
+    }
+  } catch {
+    // Fall back cleanly to local SQLite
+  }
 }
 
 export async function fetchRemoteSignalMessageById(idOrSourceId: string): Promise<boolean> {
@@ -404,6 +576,51 @@ export async function deleteRemoteSignalMessage(messageId: string): Promise<void
   await restRequest(`signal_messages?id=eq.${encodeURIComponent(messageId)}`, {
     method: 'DELETE',
     headers: { Prefer: 'return=minimal' },
+  });
+}
+
+export async function syncSignalToRemote(signalId: string): Promise<void> {
+  if (!isRemotePersistentStoreEnabled()) return;
+  const row = db.prepare('SELECT * FROM signals WHERE id = ?').get(signalId) as
+    | Record<string, unknown>
+    | undefined;
+  if (!row) return;
+
+  await restRequest('signals?on_conflict=id', {
+    method: 'POST',
+    headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
+    body: JSON.stringify([row]),
+  });
+}
+
+export async function syncSignalUpdateToRemote(updateId: string): Promise<void> {
+  if (!isRemotePersistentStoreEnabled()) return;
+  const row = db.prepare('SELECT * FROM signal_updates WHERE id = ?').get(updateId) as
+    | Record<string, unknown>
+    | undefined;
+  if (!row) return;
+
+  await restRequest('signal_updates?on_conflict=id', {
+    method: 'POST',
+    headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
+    body: JSON.stringify([row]),
+  });
+}
+
+export async function deleteRemoteSignal(signalId: string): Promise<void> {
+  if (!isRemotePersistentStoreEnabled()) return;
+  await restRequest(`signals?id=eq.${encodeURIComponent(signalId)}`, {
+    method: 'DELETE',
+    headers: { Prefer: 'return=minimal' },
+  });
+}
+
+export async function syncTotalPublishedSignalsToRemote(count: number): Promise<void> {
+  if (!isRemotePersistentStoreEnabled()) return;
+  await restRequest('platform_settings?on_conflict=key', {
+    method: 'POST',
+    headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
+    body: JSON.stringify([{ key: 'total_published_signals', value: String(count) }]),
   });
 }
 

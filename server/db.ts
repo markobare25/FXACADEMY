@@ -989,6 +989,60 @@ export function generateSeededReactions(): {
   return { love, like, fire, hundred };
 }
 
+export const DEFAULT_TOTAL_PUBLISHED_SIGNALS = 18782;
+export const SIGNAL_MESSAGE_TTL_MS = 24 * 60 * 60 * 1000;
+
+export function getTotalPublishedSignals(): number {
+  const row = db
+    .prepare("SELECT value FROM platform_settings WHERE key = 'total_published_signals'")
+    .get() as { value: string } | undefined;
+  const parsed = row ? Number.parseInt(String(row.value), 10) : NaN;
+  if (Number.isFinite(parsed) && parsed >= DEFAULT_TOTAL_PUBLISHED_SIGNALS) {
+    return parsed;
+  }
+  db.prepare(
+    "INSERT OR REPLACE INTO platform_settings (key, value) VALUES ('total_published_signals', ?)"
+  ).run(String(DEFAULT_TOTAL_PUBLISHED_SIGNALS));
+  return DEFAULT_TOTAL_PUBLISHED_SIGNALS;
+}
+
+export function incrementTotalPublishedSignals(): number {
+  const tx = db.transaction((): number => {
+    db.prepare(
+      "INSERT OR IGNORE INTO platform_settings (key, value) VALUES ('total_published_signals', ?)"
+    ).run(String(DEFAULT_TOTAL_PUBLISHED_SIGNALS));
+    db.prepare(
+      `UPDATE platform_settings
+       SET value = CAST(MAX(COALESCE(CAST(value AS INTEGER), ?), ?) + 1 AS TEXT)
+       WHERE key = 'total_published_signals'`
+    ).run(DEFAULT_TOTAL_PUBLISHED_SIGNALS, DEFAULT_TOTAL_PUBLISHED_SIGNALS);
+    const row = db
+      .prepare("SELECT value FROM platform_settings WHERE key = 'total_published_signals'")
+      .get() as { value: string } | undefined;
+    const parsed = row ? Number.parseInt(String(row.value), 10) : NaN;
+    return Number.isFinite(parsed) ? parsed : DEFAULT_TOTAL_PUBLISHED_SIGNALS + 1;
+  });
+  return tx();
+}
+
+export function syncLocalTotalPublishedSignalsIfHigher(remoteValue: number): number {
+  if (!Number.isFinite(remoteValue) || remoteValue < DEFAULT_TOTAL_PUBLISHED_SIGNALS) {
+    return getTotalPublishedSignals();
+  }
+  const normalized = Math.floor(remoteValue);
+  const tx = db.transaction((): number => {
+    const current = getTotalPublishedSignals();
+    if (normalized > current) {
+      db.prepare(
+        "INSERT OR REPLACE INTO platform_settings (key, value) VALUES ('total_published_signals', ?)"
+      ).run(String(normalized));
+      return normalized;
+    }
+    return current;
+  });
+  return tx();
+}
+
 function seedInitialData(): void {
   const now = new Date().toISOString();
 
@@ -1012,6 +1066,7 @@ function seedInitialData(): void {
     push_enabled: 'true',
     market_api_provider: 'Yahoo Finance / Frankfurter / CoinGecko',
     calendar_api_provider: 'ForexFactory Economic Feed',
+    total_published_signals: String(DEFAULT_TOTAL_PUBLISHED_SIGNALS),
   };
 
   const upsertSetting = db.prepare(

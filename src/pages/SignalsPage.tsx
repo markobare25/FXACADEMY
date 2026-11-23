@@ -22,9 +22,7 @@ import { usePlatform, type SignalChatWsEvent } from '../context/PlatformContext'
 import {
   apiFetch,
   formatLocalDateTime,
-  getOrCreateInstalledAt,
   getOrCreateVisitorId,
-  syncInstalledAtFromServer,
 } from '../lib/api';
 import {
   getDevicePushPreferences,
@@ -59,6 +57,16 @@ const REACTION_OPTIONS: Array<{
 
 function emptyReactions(): SignalReactionsMap {
   return { love: 0, like: 0, fire: 0, hundred: 0 };
+}
+
+const SIGNAL_TTL_MS = 24 * 60 * 60 * 1000;
+
+function isWithin24HoursOrPinned(msg: SignalChatMessage): boolean {
+  if (msg.is_welcome || msg.pinned) return true;
+  if (msg.status !== 'active') return true;
+  const createdMs = Date.parse(msg.created_at);
+  if (!Number.isFinite(createdMs)) return true;
+  return Date.now() - createdMs < SIGNAL_TTL_MS;
 }
 
 function formatCompactCount(count: number): string {
@@ -287,10 +295,9 @@ export const SignalsPage: React.FC = () => {
     setShowScrollBottomBtn(false);
   }, []);
 
-  // Ensure persistent visitor ID, installed_at timestamp, and push mute status are initialized
+  // Ensure persistent visitor ID and push mute status are initialized
   useEffect(() => {
     getOrCreateVisitorId();
-    getOrCreateInstalledAt();
 
     let cancelled = false;
     getDevicePushPreferences()
@@ -319,12 +326,10 @@ export const SignalsPage: React.FC = () => {
   // Load initial Active chat messages
   const fetchActiveMessages = useCallback(
     async (keepScrollPosition = false) => {
-      const installedAt = getOrCreateInstalledAt();
       try {
         const qs = new URLSearchParams({
           status: 'active',
           limit: '40',
-          installed_at: installedAt,
         });
         const res = await apiFetch<{
           messages: SignalChatMessage[];
@@ -334,11 +339,9 @@ export const SignalsPage: React.FC = () => {
           online_count: number;
           subscriber_count?: number;
           viewer_key?: string | null;
-          installed_at?: string | null;
         }>(`/api/signals/messages?${qs.toString()}`, { cache: 'no-store' });
         if (res.viewer_key) viewerKeyRef.current = res.viewer_key;
-        if (res.installed_at) syncInstalledAtFromServer(res.installed_at);
-        setActiveMessages(res.messages);
+        setActiveMessages(res.messages.filter(isWithin24HoursOrPinned));
         setPinnedMessages(res.pinned);
         setActiveHasMore(res.has_more);
         setCompletedCount(res.counts.completed);
@@ -361,13 +364,11 @@ export const SignalsPage: React.FC = () => {
       await fetchActiveMessages(true);
       return;
     }
-    const installedAt = getOrCreateInstalledAt();
     try {
       const qs = new URLSearchParams({
         status: 'active',
         after: afterIso,
         limit: '60',
-        installed_at: installedAt,
       });
       const res = await apiFetch<{
         messages: SignalChatMessage[];
@@ -376,18 +377,17 @@ export const SignalsPage: React.FC = () => {
         online_count: number;
         subscriber_count?: number;
         viewer_key?: string | null;
-        installed_at?: string | null;
       }>(`/api/signals/messages?${qs.toString()}`, { cache: 'no-store' });
 
       if (res.viewer_key) viewerKeyRef.current = res.viewer_key;
-      if (res.installed_at) syncInstalledAtFromServer(res.installed_at);
       setPinnedMessages(res.pinned);
       setCompletedCount(res.counts.completed);
 
-      if (res.messages.length > 0) {
+      const validIncoming = res.messages.filter(isWithin24HoursOrPinned);
+      if (validIncoming.length > 0) {
         setActiveMessages((prev) => {
-          const map = new Map(prev.map((m) => [m.id, m]));
-          for (const incoming of res.messages) {
+          const map = new Map(prev.filter(isWithin24HoursOrPinned).map((m) => [m.id, m]));
+          for (const incoming of validIncoming) {
             map.set(incoming.id, incoming);
           }
           return Array.from(map.values()).sort((a, b) => {
@@ -411,12 +411,10 @@ export const SignalsPage: React.FC = () => {
   // Load Completed archive messages
   const fetchCompletedMessages = useCallback(async (searchTerm = '') => {
     setCompletedLoading(true);
-    const installedAt = getOrCreateInstalledAt();
     try {
       const qs = new URLSearchParams({
         status: 'completed',
         limit: '30',
-        installed_at: installedAt,
       });
       if (searchTerm.trim()) qs.set('search', searchTerm.trim());
       const res = await apiFetch<{
@@ -473,8 +471,7 @@ export const SignalsPage: React.FC = () => {
         }
         case 'created': {
           const incoming = event.message;
-          const installedAt = getOrCreateInstalledAt();
-          if (!incoming.is_welcome && incoming.created_at < installedAt) {
+          if (!isWithin24HoursOrPinned(incoming)) {
             return;
           }
           if (incoming.status === 'active') {
@@ -496,8 +493,9 @@ export const SignalsPage: React.FC = () => {
         }
         case 'updated': {
           const updated = event.message;
-          const installedAt = getOrCreateInstalledAt();
-          if (!updated.is_welcome && updated.created_at < installedAt) {
+          if (updated.status === 'active' && !isWithin24HoursOrPinned(updated)) {
+            setActiveMessages((prev) => prev.filter((m) => m.id !== updated.id));
+            setPinnedMessages((prev) => prev.filter((m) => m.id !== updated.id));
             return;
           }
           if (updated.status === 'active') {
@@ -627,13 +625,23 @@ export const SignalsPage: React.FC = () => {
     };
   }, [authLoading, applySignalChannelEvent, fetchActiveMessages, view]);
 
+  // Periodically prune expired non-pinned messages (>24h) on the client
+  useEffect(() => {
+    const pruneTimer = window.setInterval(() => {
+      setActiveMessages((prev) => {
+        const filtered = prev.filter(isWithin24HoursOrPinned);
+        return filtered.length === prev.length ? prev : filtered;
+      });
+    }, 60_000);
+    return () => clearInterval(pruneTimer);
+  }, []);
+
   const handleLoadOlderActive = useCallback(async () => {
     const firstNonWelcome = activeMessages.find((m) => !m.is_welcome);
     if (loadingOlder || !activeHasMore || !firstNonWelcome) return;
     const el = scrollContainerRef.current;
     const prevHeight = el?.scrollHeight || 0;
     const prevTop = el?.scrollTop || 0;
-    const installedAt = getOrCreateInstalledAt();
 
     setLoadingOlder(true);
     try {
@@ -641,7 +649,6 @@ export const SignalsPage: React.FC = () => {
         status: 'active',
         limit: '40',
         before: firstNonWelcome.created_at,
-        installed_at: installedAt,
       });
       const res = await apiFetch<{
         messages: SignalChatMessage[];
@@ -651,7 +658,7 @@ export const SignalsPage: React.FC = () => {
         const welcomeRows = prev.filter((m) => m.is_welcome);
         const regularRows = prev.filter((m) => !m.is_welcome);
         const existingIds = new Set(prev.map((m) => m.id));
-        const older = res.messages.filter((m) => !existingIds.has(m.id));
+        const older = res.messages.filter((m) => !existingIds.has(m.id) && isWithin24HoursOrPinned(m));
         return [...welcomeRows, ...older, ...regularRows];
       });
       setActiveHasMore(res.has_more);
@@ -689,14 +696,12 @@ export const SignalsPage: React.FC = () => {
     if (loadingMoreCompleted || completedMessages.length === 0) return;
     const oldest = completedMessages[completedMessages.length - 1];
     const cursor = oldest.completed_at || oldest.created_at;
-    const installedAt = getOrCreateInstalledAt();
     setLoadingMoreCompleted(true);
     try {
       const qs = new URLSearchParams({
         status: 'completed',
         limit: '30',
         before: cursor,
-        installed_at: installedAt,
       });
       if (completedSearch.trim()) qs.set('search', completedSearch.trim());
       const res = await apiFetch<{

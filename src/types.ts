@@ -504,6 +504,7 @@ export interface PlatformSettings {
 
 export interface PublicStats {
   total_signals: number;
+  total_published_signals: number;
   active_signals: number;
   completed_signals: number;
   total_updates: number;
