@@ -807,6 +807,7 @@ export function mapDbUser(row: Record<string, unknown>): User {
     timezone: row.timezone ? String(row.timezone) : 'UTC',
     notification_prefs: normalizeNotificationPrefs(row.notification_prefs),
     watchlist: JSON.parse(String(row.watchlist || '[]')),
+    installed_at: row.installed_at ? String(row.installed_at) : null,
     created_at: String(row.created_at),
     last_login_at: row.last_login_at ? String(row.last_login_at) : null,
   };

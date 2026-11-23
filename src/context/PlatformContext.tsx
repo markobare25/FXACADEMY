@@ -4,8 +4,10 @@ import {
   clearAccessToken,
   getAccessToken,
   getAccessTokenRemainingMs,
+  getOrCreateInstalledAt,
   setAccessToken,
   setAuthRefreshHandler,
+  syncInstalledAtFromServer,
 } from '../lib/api';
 import {
   autoEnablePushNotifications,
@@ -370,6 +372,20 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
         const expiresIn = typeof data.expires_in === 'number' ? data.expires_in : 900;
         setAccessToken(data.access_token, expiresIn);
+        if (data.user.installed_at) {
+          syncInstalledAtFromServer(data.user.installed_at);
+        } else {
+          const clientInstalled = getOrCreateInstalledAt();
+          apiFetch<{ installed_at: string; user?: User }>('/api/users/installed-at', {
+            method: 'POST',
+            body: JSON.stringify({ installed_at: clientInstalled }),
+          })
+            .then((syncRes) => {
+              if (syncRes.user) setUser(syncRes.user);
+              if (syncRes.installed_at) syncInstalledAtFromServer(syncRes.installed_at);
+            })
+            .catch(() => undefined);
+        }
         setUser(data.user);
         scheduleProactiveRefreshRef.current(expiresIn);
         refreshNotifications().catch(() => undefined);
@@ -404,6 +420,7 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
   // Register automatic 401 refresh handler & boot session from HttpOnly refresh cookie
   useEffect(() => {
+    getOrCreateInstalledAt();
     setAuthRefreshHandler(performSessionRefresh);
     performSessionRefresh();
     refreshPublicData();
@@ -762,6 +779,20 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     );
     const expiresIn = typeof res.expires_in === 'number' ? res.expires_in : 900;
     setAccessToken(res.access_token, expiresIn);
+    if (res.user.installed_at) {
+      syncInstalledAtFromServer(res.user.installed_at);
+    } else {
+      const clientInstalled = getOrCreateInstalledAt();
+      apiFetch<{ installed_at: string; user?: User }>('/api/users/installed-at', {
+        method: 'POST',
+        body: JSON.stringify({ installed_at: clientInstalled }),
+      })
+        .then((syncRes) => {
+          if (syncRes.user) setUser(syncRes.user);
+          if (syncRes.installed_at) syncInstalledAtFromServer(syncRes.installed_at);
+        })
+        .catch(() => undefined);
+    }
     setUser(res.user);
     setAuthLoading(false);
     scheduleProactiveRefreshRef.current(expiresIn);

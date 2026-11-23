@@ -88,6 +88,7 @@ export const AdminSignalsBroadcastStudio: React.FC<AdminSignalsBroadcastStudioPr
       const qs = new URLSearchParams({
         status: channelTab,
         limit: '50',
+        scope: 'admin',
       });
       if (search.trim()) qs.set('search', search.trim());
 

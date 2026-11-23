@@ -34,20 +34,19 @@ clientsClaim();
 cleanupOutdatedCaches();
 precacheAndRoute(self.__WB_MANIFEST || []);
 
-// Never cache auth, admin APIs, push registration/ack, or real-time delta sync calls
+// Never cache auth, admin APIs, push registration/ack, or live signal channel messages/reactions
 registerRoute(
   ({ url }) =>
     url.pathname.startsWith('/api/push/') ||
     url.pathname.startsWith('/api/auth/') ||
     url.pathname.startsWith('/api/admin/') ||
     url.pathname === '/api/signals/stream' ||
-    url.pathname === '/api/signals/messages/stream' ||
-    url.searchParams.get('includeAll') === 'true' ||
-    (url.pathname === '/api/signals/messages' && url.searchParams.has('after')),
+    url.pathname.startsWith('/api/signals/messages') ||
+    url.searchParams.get('includeAll') === 'true',
   new NetworkOnly()
 );
 
-// Cache previously loaded educational materials, signals, and updates for offline reading
+// Cache previously loaded educational materials, signals overview, and updates for offline reading
 registerRoute(
   ({ url }) =>
     url.pathname.startsWith('/api/academy') ||

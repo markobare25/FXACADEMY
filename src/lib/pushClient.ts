@@ -50,6 +50,23 @@ async function getReadyServiceWorkerRegistration(timeoutMs = 6000): Promise<Serv
 }
 
 const PROMPT_DISMISSED_KEY = 'mfx_push_invite_dismissed_v1';
+const SIGNALS_MUTED_KEY = 'mfx_signals_muted_v1';
+
+export function isSignalsMuted(): boolean {
+  try {
+    return localStorage.getItem(SIGNALS_MUTED_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+export function setSignalsMutedLocal(muted: boolean): void {
+  try {
+    localStorage.setItem(SIGNALS_MUTED_KEY, muted ? '1' : '0');
+  } catch {
+    // ignore storage errors
+  }
+}
 
 export function detectPushPlatform(): 'android' | 'ios' | 'web' {
   if (typeof navigator === 'undefined') return 'web';
@@ -185,7 +202,7 @@ let autoPushGestureBound = false;
 let autoPushAttemptedThisLoad = false;
 
 export async function autoEnablePushNotifications(): Promise<void> {
-  if (!isPushSupported()) return;
+  if (!isPushSupported() || isSignalsMuted()) return;
 
   if (Notification.permission === 'granted') {
     await syncExistingPushSubscriptionIfGranted().catch(() => false);
@@ -335,7 +352,8 @@ export async function getDevicePushPreferences(): Promise<{
   const sub = await getCurrentPushSubscription();
   const query = sub ? `?endpoint=${encodeURIComponent(sub.endpoint)}` : '';
   return apiFetch<{ prefs: NotificationPreferences; subscribed: boolean }>(
-    `/api/push/preferences${query}`
+    `/api/push/preferences${query}`,
+    { cache: 'no-store' }
   );
 }
 
@@ -358,4 +376,53 @@ export async function sendTestPushNotification(): Promise<{ ok: boolean; statusC
     method: 'POST',
     body: JSON.stringify(sub ? { endpoint: sub.endpoint } : {}),
   });
+}
+
+export async function muteSignalChannelPush(): Promise<{ muted: boolean }> {
+  setSignalsMutedLocal(true);
+  try {
+    await saveDevicePushPreferences({
+      signals: false,
+      signal_updates: false,
+      signal_chat: false,
+      market_updates: false,
+      announcements: false,
+    });
+  } catch {
+    // localStorage state still protects client if offline
+  }
+  return { muted: true };
+}
+
+export async function unmuteSignalChannelPush(): Promise<{
+  muted: boolean;
+  permission?: NotificationPermission;
+  error?: string;
+}> {
+  setSignalsMutedLocal(false);
+  const unmutedPrefs: Partial<NotificationPreferences> = {
+    signals: true,
+    signal_updates: true,
+    signal_chat: true,
+    market_updates: true,
+    announcements: true,
+    sound_enabled: true,
+  };
+  let permission: NotificationPermission | undefined;
+  let error: string | undefined;
+
+  if (isPushSupported()) {
+    const subRes = await subscribeToPushNotifications(unmutedPrefs);
+    permission = subRes.permission;
+    if (!subRes.ok) {
+      error = subRes.error;
+    }
+  }
+
+  try {
+    await saveDevicePushPreferences(unmutedPrefs);
+  } catch {
+    // ignore transient network failure
+  }
+  return { muted: false, permission, error };
 }

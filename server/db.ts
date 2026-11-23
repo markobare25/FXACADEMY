@@ -166,6 +166,7 @@ export function initDatabase(): void {
       needs_password_setup INTEGER NOT NULL DEFAULT 0,
       tokens_valid_after TEXT,
       terms_accepted_at TEXT,
+      installed_at TEXT,
       created_at TEXT NOT NULL,
       last_login_at TEXT
     );
@@ -276,10 +277,12 @@ export function initDatabase(): void {
       completed_summary TEXT,
       source_type TEXT,
       source_id TEXT,
+      is_welcome INTEGER NOT NULL DEFAULT 0,
       seed_love INTEGER NOT NULL DEFAULT 0,
       seed_like INTEGER NOT NULL DEFAULT 0,
       seed_fire INTEGER NOT NULL DEFAULT 0,
       seed_hundred INTEGER NOT NULL DEFAULT 0,
+      seed_views INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
       FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE CASCADE
     );
@@ -604,6 +607,13 @@ export function initDatabase(): void {
     CREATE INDEX IF NOT EXISTS idx_push_deliveries_pending
       ON push_job_deliveries(status, next_attempt_at);
 
+    CREATE TABLE IF NOT EXISTS visitor_preferences (
+      visitor_id TEXT PRIMARY KEY,
+      prefs_json TEXT NOT NULL,
+      sound_enabled INTEGER NOT NULL DEFAULT 1,
+      updated_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS scheduled_notifications (
       id TEXT PRIMARY KEY,
       title TEXT NOT NULL,
@@ -744,10 +754,12 @@ export function initDatabase(): void {
   ensureColumn('users', 'needs_password_setup', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('signal_messages', 'source_type', 'TEXT');
   ensureColumn('signal_messages', 'source_id', 'TEXT');
+  ensureColumn('signal_messages', 'is_welcome', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('signal_messages', 'seed_love', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('signal_messages', 'seed_like', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('signal_messages', 'seed_fire', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('signal_messages', 'seed_hundred', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('signal_messages', 'seed_views', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('signal_messages', 'media_url', 'TEXT');
   ensureColumn('signal_messages', 'media_type', 'TEXT');
   ensureColumn('signal_messages', 'media_name', 'TEXT');
@@ -770,6 +782,7 @@ export function initDatabase(): void {
   ensureColumn('users', 'membership_notes', 'TEXT');
   ensureColumn('users', 'tokens_valid_after', 'TEXT');
   ensureColumn('users', 'terms_accepted_at', 'TEXT');
+  ensureColumn('users', 'installed_at', 'TEXT');
   ensureColumn('signals', 'is_premium', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('market_updates', 'is_premium', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('courses', 'is_premium', 'INTEGER NOT NULL DEFAULT 0');
@@ -857,27 +870,55 @@ export function initDatabase(): void {
 
   seedInitialData();
 
-  // Backfill any published signal_messages with zero seeded reactions
+  // Backfill any published signal_messages with zero seeded reactions or zero seeded views
   const unseededMessages = db
     .prepare(
-      `SELECT id FROM signal_messages
+      `SELECT id, seed_love, seed_like, seed_fire, seed_hundred, seed_views FROM signal_messages
        WHERE status != 'draft'
-         AND (COALESCE(seed_love, 0) + COALESCE(seed_like, 0) + COALESCE(seed_fire, 0) + COALESCE(seed_hundred, 0)) = 0`
+         AND ((COALESCE(seed_love, 0) + COALESCE(seed_like, 0) + COALESCE(seed_fire, 0) + COALESCE(seed_hundred, 0)) = 0
+              OR COALESCE(seed_views, 0) = 0)`
     )
-    .all() as Array<{ id: string }>;
+    .all() as Array<{
+      id: string;
+      seed_love: number;
+      seed_like: number;
+      seed_fire: number;
+      seed_hundred: number;
+      seed_views: number;
+    }>;
 
   if (unseededMessages.length > 0) {
     const updateSeed = db.prepare(
-      'UPDATE signal_messages SET seed_love = ?, seed_like = ?, seed_fire = ?, seed_hundred = ? WHERE id = ?'
+      'UPDATE signal_messages SET seed_love = ?, seed_like = ?, seed_fire = ?, seed_hundred = ?, seed_views = ? WHERE id = ?'
     );
     const backfillTx = db.transaction(() => {
       for (const row of unseededMessages) {
-        const s = generateSeededReactions();
-        updateSeed.run(s.love, s.like, s.fire, s.hundred, row.id);
+        const hasReacts =
+          Number(row.seed_love || 0) +
+            Number(row.seed_like || 0) +
+            Number(row.seed_fire || 0) +
+            Number(row.seed_hundred || 0) >
+          0;
+        const s = hasReacts
+          ? {
+              love: Number(row.seed_love || 0),
+              like: Number(row.seed_like || 0),
+              fire: Number(row.seed_fire || 0),
+              hundred: Number(row.seed_hundred || 0),
+            }
+          : generateSeededReactions();
+        const reactSum = s.love + s.like + s.fire + s.hundred;
+        const views = Number(row.seed_views || 0) > 0 ? Number(row.seed_views) : generateSeededViews(reactSum);
+        updateSeed.run(s.love, s.like, s.fire, s.hundred, views, row.id);
       }
     });
     backfillTx();
   }
+}
+
+export function generateSeededViews(minFloor = 0): number {
+  const base = Math.floor(Math.random() * (28500 - 11200 + 1)) + 11200;
+  return Math.max(base, minFloor + 1800);
 }
 
 export function generateSeededReactions(): {
@@ -1234,102 +1275,45 @@ function seedInitialData(): void {
     );
   }
 
-  // Seed public Signal Channel messages if empty so visitors immediately see live channel history
-  const signalMsgCount = db.prepare('SELECT COUNT(*) as cnt FROM signal_messages').get() as { cnt: number };
-  if (signalMsgCount.cnt === 0) {
-    const insertSignalMsg = db.prepare(`
-      INSERT OR IGNORE INTO signal_messages (
+  // Ensure a single canonical pinned Welcome Message exists for MeridianFX Signals
+  const existingWelcome = db
+    .prepare("SELECT id FROM signal_messages WHERE is_welcome = 1 OR source_type = 'welcome' LIMIT 1")
+    .get() as { id: string } | undefined;
+
+  if (!existingWelcome) {
+    const welcomeId = '00000000-0000-4000-8000-000000000001';
+    const seeds = generateSeededReactions();
+    const views = generateSeededViews(seeds.love + seeds.like + seeds.fire + seeds.hundred);
+    const welcomeText = [
+      'Welcome to MeridianFX Signals!',
+      'You are now connected to the official MeridianFX broadcast channel. Real-time Forex, Gold, and Crypto trade setups, chart markups, and desk alerts posted by our analysts appear here the moment they are published.',
+      '• Tap ❤️ 🤙 💥 💯 to react on any alert\n• Use the Mute / Unmute bar below anytime to control background lock-screen notifications\n• All setups are shared strictly for educational and informational analysis.',
+    ].join('\n\n');
+
+    db.prepare(
+      `INSERT OR IGNORE INTO signal_messages (
         id, author_id, author_name, content, image_url, image_name,
         media_url, media_type, media_name, message_type, priority,
-        status, pinned, completed_at, completed_summary, source_type, source_id,
-        seed_love, seed_like, seed_fire, seed_hundred, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-
-    const publicSignals = db
-      .prepare('SELECT * FROM signals WHERE COALESCE(is_premium, 0) = 0 ORDER BY created_at ASC')
-      .all() as Array<Record<string, unknown>>;
-
-    for (const sig of publicSignals) {
-      const tpList = [sig.tp1, sig.tp2, sig.tp3, sig.tp4].filter(Boolean).join(' · ');
-      const content = [
-        `${String(sig.direction)} ${String(sig.pair)} (${String(sig.timeframe)} · ${String(sig.classification)})`,
-        `Entry: ${String(sig.entry_price)} | SL: ${String(sig.stop_loss)} | TP: ${tpList} | R:R ${String(sig.risk_reward)}`,
-        String(sig.analysis || ''),
-        sig.admin_remarks ? `Note: ${String(sig.admin_remarks)}` : '',
-      ]
-        .filter(Boolean)
-        .join('\n\n');
-
-      const sigStatus = String(sig.status || 'Active');
-      const isCompleted = sigStatus === 'TP Hit' || sigStatus === 'SL Hit' || sigStatus === 'Closed';
-      const imgUrl = sig.chart_image_url ? String(sig.chart_image_url) : null;
-      const imgName = imgUrl ? `${String(sig.pair)} Chart` : null;
-      const seeds = generateSeededReactions();
-
-      insertSignalMsg.run(
-        crypto.randomUUID(),
-        adminId,
-        'MeridianFX Desk',
-        content,
-        imgUrl,
-        imgName,
-        imgUrl,
-        imgUrl ? 'image' : null,
-        imgName,
-        'signal',
-        'normal',
-        isCompleted ? 'completed' : 'active',
-        0,
-        isCompleted ? String(sig.updated_at || sig.created_at) : null,
-        isCompleted ? String(sig.admin_remarks || sigStatus) : null,
-        'signal',
-        String(sig.id),
-        seeds.love,
-        seeds.like,
-        seeds.fire,
-        seeds.hundred,
-        String(sig.created_at)
-      );
-    }
-
-    const publicUpdates = db
-      .prepare('SELECT * FROM market_updates WHERE published = 1 AND COALESCE(is_premium, 0) = 0 ORDER BY created_at ASC')
-      .all() as Array<Record<string, unknown>>;
-
-    for (const upd of publicUpdates) {
-      const cat = String(upd.category || 'Market Update');
-      const isAnnouncement = cat === 'Platform Announcement' || cat === 'Risk Warning';
-      const content = [`${cat}: ${String(upd.title)}`, String(upd.content || '')].join('\n\n');
-      const imgUrl = upd.image_url ? String(upd.image_url) : null;
-      const imgName = imgUrl ? String(upd.title) : null;
-      const seeds = generateSeededReactions();
-
-      insertSignalMsg.run(
-        crypto.randomUUID(),
-        adminId,
-        'MeridianFX Desk',
-        content,
-        imgUrl,
-        imgName,
-        imgUrl,
-        imgUrl ? 'image' : null,
-        imgName,
-        isAnnouncement ? 'announcement' : 'update',
-        'normal',
-        'active',
-        Number(upd.pinned || 0) ? 1 : 0,
-        null,
-        null,
-        'market_update',
-        String(upd.id),
-        seeds.love,
-        seeds.like,
-        seeds.fire,
-        seeds.hundred,
-        String(upd.created_at)
-      );
-    }
+        status, pinned, is_welcome, source_type, source_id,
+        seed_love, seed_like, seed_fire, seed_hundred, seed_views, created_at
+      ) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, 'announcement', 'normal', 'active', 1, 1, 'welcome', ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      welcomeId,
+      adminId,
+      'MeridianFX Desk',
+      welcomeText,
+      welcomeId,
+      seeds.love,
+      seeds.like,
+      seeds.fire,
+      seeds.hundred,
+      views,
+      now
+    );
+  } else {
+    db.prepare(
+      "UPDATE signal_messages SET is_welcome = 1, pinned = 1, status = 'active' WHERE id = ?"
+    ).run(existingWelcome.id);
   }
 }
 

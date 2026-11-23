@@ -1,8 +1,10 @@
 const VISITOR_ID_KEY = 'mfx_visitor_id';
+const INSTALLED_AT_KEY = 'mfx_installed_at_v1';
 const LEGACY_STORAGE_KEYS = ['mfx_auth_token', 'mfx_token', 'mfx_cached_user_v1'];
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 let memoryVisitorId: string | null = null;
+let memoryInstalledAt: string | null = null;
 let memoryAccessToken: string | null = null;
 let memoryAccessExpiresAt = 0;
 
@@ -49,6 +51,41 @@ export function getOrCreateVisitorId(): string {
   }
 }
 
+export function getOrCreateInstalledAt(): string {
+  try {
+    const stored = localStorage.getItem(INSTALLED_AT_KEY);
+    if (stored && !Number.isNaN(Date.parse(stored))) {
+      const normalized = new Date(Date.parse(stored)).toISOString();
+      memoryInstalledAt = normalized;
+      return normalized;
+    }
+    const created =
+      memoryInstalledAt && !Number.isNaN(Date.parse(memoryInstalledAt))
+        ? memoryInstalledAt
+        : new Date().toISOString();
+    memoryInstalledAt = created;
+    localStorage.setItem(INSTALLED_AT_KEY, created);
+    return created;
+  } catch {
+    if (!memoryInstalledAt) memoryInstalledAt = new Date().toISOString();
+    return memoryInstalledAt;
+  }
+}
+
+export function syncInstalledAtFromServer(serverIso?: string | null): string {
+  if (!serverIso || Number.isNaN(Date.parse(serverIso))) {
+    return getOrCreateInstalledAt();
+  }
+  const normalized = new Date(Date.parse(serverIso)).toISOString();
+  memoryInstalledAt = normalized;
+  try {
+    localStorage.setItem(INSTALLED_AT_KEY, normalized);
+  } catch {
+    // ignore storage errors
+  }
+  return normalized;
+}
+
 export function getAccessToken(): string | null {
   if (memoryAccessToken && memoryAccessToken.split('.').length === 3) {
     return memoryAccessToken;
@@ -89,6 +126,7 @@ function buildRequestHeaders(
 ): Headers {
   const token = tokenOverride !== undefined ? tokenOverride : getAccessToken();
   const visitorId = getOrCreateVisitorId();
+  const installedAt = getOrCreateInstalledAt();
   const headers = new Headers(options.headers || {});
   if (!headers.has('Content-Type') && !(options.body instanceof FormData)) {
     headers.set('Content-Type', 'application/json');
@@ -101,6 +139,9 @@ function buildRequestHeaders(
   }
   if (visitorId && !headers.has('X-Visitor-Id')) {
     headers.set('X-Visitor-Id', visitorId);
+  }
+  if (installedAt && !headers.has('X-Installed-At')) {
+    headers.set('X-Installed-At', installedAt);
   }
   return headers;
 }

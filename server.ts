@@ -16,6 +16,7 @@ import {
   db,
   ensureDesignatedAdminUser,
   generateSeededReactions,
+  generateSeededViews,
   hashPassword,
   initDatabase,
   logSystemEvent,
@@ -1074,6 +1075,20 @@ app.get('/api/users/activity', requireAuth, (req: AuthRequest, res: Response) =>
   res.json({ activity: rows });
 });
 
+app.post('/api/users/installed-at', requireAuth, (req: AuthRequest, res: Response) => {
+  const raw = typeof req.body?.installed_at === 'string' ? req.body.installed_at.trim() : '';
+  const parsedMs = raw ? Date.parse(raw) : NaN;
+  const candidateIso = Number.isFinite(parsedMs) ? new Date(parsedMs).toISOString() : new Date().toISOString();
+
+  db.prepare('UPDATE users SET installed_at = COALESCE(installed_at, ?) WHERE id = ?').run(
+    candidateIso,
+    req.user!.id
+  );
+  const updated = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user!.id) as Record<string, unknown>;
+  const mapped = mapDbUser(updated);
+  res.json({ installed_at: mapped.installed_at || candidateIso, user: mapped });
+});
+
 app.delete('/api/users/account', requireAuth, (req: AuthRequest, res: Response) => {
   if (req.user!.role === 'admin') {
     const adminCount = (
@@ -1122,7 +1137,7 @@ function resolveReactionActor(
   const headerVisitorRaw = String(req.headers['x-visitor-id'] || '').trim();
   const validHeaderVisitor = UUID_V4_RE.test(headerVisitorRaw) ? headerVisitorRaw.toLowerCase() : null;
 
-  let visitorId = signedVisitorId || validHeaderVisitor;
+  let visitorId = validHeaderVisitor || signedVisitorId;
   if (!visitorId && issueCookieIfMissing) {
     visitorId = crypto.randomUUID();
   }
@@ -1244,6 +1259,8 @@ function hydrateSignalMessages(rows: Array<Record<string, unknown>>, actorKey?: 
       completed_summary: row.completed_summary ? String(row.completed_summary) : null,
       source_type: row.source_type ? String(row.source_type) : null,
       source_id: row.source_id ? String(row.source_id) : null,
+      is_welcome: Boolean(row.is_welcome),
+      views: Number(row.seed_views || 0),
       created_at: String(row.created_at),
       reactions: reactMap.get(String(row.id)) || emptyReactions(),
       user_reaction: userReactMap.get(String(row.id)) || null,
@@ -1295,13 +1312,14 @@ function publishMirrorToSignalChannel(params: {
   const resolvedMediaName = params.mediaName || params.imageName || null;
 
   const seeds = generateSeededReactions();
+  const views = generateSeededViews(seeds.love + seeds.like + seeds.fire + seeds.hundred);
 
   db.prepare(
     `INSERT OR IGNORE INTO signal_messages (
       id, author_id, author_name, content, image_url, image_name,
       media_url, media_type, media_name, message_type, priority, status, pinned,
-      source_type, source_id, seed_love, seed_like, seed_fire, seed_hundred, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?)`
+      source_type, source_id, seed_love, seed_like, seed_fire, seed_hundred, seed_views, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     id,
     authorId,
@@ -1321,6 +1339,7 @@ function publishMirrorToSignalChannel(params: {
     seeds.like,
     seeds.fire,
     seeds.hundred,
+    views,
     createdAt
   );
 
@@ -1391,12 +1410,24 @@ function buildSignalChannelPushPreview(
   return `${sender} (${label}): New message posted in Signal Channel.`;
 }
 
+function parseInstalledAtParam(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const ms = Date.parse(trimmed);
+  if (!Number.isFinite(ms)) return null;
+  return new Date(ms).toISOString();
+}
+
 app.get('/api/signals/messages', optionalAuth, (req: AuthRequest, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
   const requestedStatus = String(req.query.status || 'active');
   const isAdmin =
     Boolean(req.user) &&
     req.user!.role === 'admin' &&
     req.user!.email.toLowerCase() === DESIGNATED_ADMIN_EMAIL;
+  const isAdminScope =
+    isAdmin && (String(req.query.scope || '') === 'admin' || String(req.query.includeAll || '') === 'true');
 
   if (requestedStatus === 'draft' && !isAdmin) {
     res.status(403).json({ error: 'Draft posts are restricted to administrators.' });
@@ -1410,6 +1441,28 @@ app.get('/api/signals/messages', optionalAuth, (req: AuthRequest, res: Response)
         ? 'draft'
         : 'active';
 
+  let effectiveInstalledAt: string | null = null;
+  if (!isAdminScope) {
+    const clientInstalledAt =
+      parseInstalledAtParam(req.query.installed_at) ||
+      parseInstalledAtParam(req.headers['x-installed-at']);
+
+    if (req.user) {
+      const dbInstalled = parseInstalledAtParam(req.user.installed_at);
+      if (dbInstalled) {
+        effectiveInstalledAt = dbInstalled;
+      } else {
+        effectiveInstalledAt = clientInstalledAt || new Date().toISOString();
+        db.prepare('UPDATE users SET installed_at = COALESCE(installed_at, ?) WHERE id = ?').run(
+          effectiveInstalledAt,
+          req.user.id
+        );
+      }
+    } else {
+      effectiveInstalledAt = clientInstalledAt || new Date().toISOString();
+    }
+  }
+
   const limitRaw = Number(req.query.limit || 40);
   const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(Math.floor(limitRaw), 1), 100) : 40;
   const before = typeof req.query.before === 'string' && req.query.before.trim() ? req.query.before.trim() : null;
@@ -1420,6 +1473,14 @@ app.get('/api/signals/messages', optionalAuth, (req: AuthRequest, res: Response)
   const conditions: string[] = ['status = ?'];
   const params: unknown[] = [status];
 
+  if (effectiveInstalledAt) {
+    if (status === 'active') {
+      // Non-welcome messages must be created at or after the user's install time
+      conditions.push('COALESCE(is_welcome, 0) = 0');
+    }
+    conditions.push('created_at >= ?');
+    params.push(effectiveInstalledAt);
+  }
   if (before) {
     conditions.push(`${orderCol} < ?`);
     params.push(before);
@@ -1445,21 +1506,65 @@ app.get('/api/signals/messages', optionalAuth, (req: AuthRequest, res: Response)
 
   const hasMore = rows.length > limit;
   const sliced = hasMore ? rows.slice(0, limit) : rows;
-  const ordered = after ? sliced : status === 'active' ? sliced.reverse() : sliced;
+  let ordered = after ? sliced : status === 'active' ? sliced.reverse() : sliced;
+
+  // For public channel active view, always keep the single canonical Welcome Message at the top of the feed
+  if (!isAdminScope && status === 'active' && !before && !after && !search) {
+    const welcomeRow = db
+      .prepare("SELECT * FROM signal_messages WHERE status = 'active' AND COALESCE(is_welcome, 0) = 1 LIMIT 1")
+      .get() as Record<string, unknown> | undefined;
+    if (welcomeRow && !ordered.some((r) => String(r.id) === String(welcomeRow.id))) {
+      ordered = [welcomeRow, ...ordered];
+    }
+  }
 
   const pinnedRows =
     status === 'active'
-      ? (db
-          .prepare("SELECT * FROM signal_messages WHERE status = 'active' AND pinned = 1 ORDER BY created_at DESC LIMIT 5")
-          .all() as Array<Record<string, unknown>>)
+      ? effectiveInstalledAt
+        ? (db
+            .prepare(
+              `SELECT * FROM signal_messages
+               WHERE status = 'active' AND pinned = 1
+                 AND (COALESCE(is_welcome, 0) = 1 OR created_at >= ?)
+               ORDER BY COALESCE(is_welcome, 0) ASC, created_at DESC
+               LIMIT 5`
+            )
+            .all(effectiveInstalledAt) as Array<Record<string, unknown>>)
+        : (db
+            .prepare(
+              "SELECT * FROM signal_messages WHERE status = 'active' AND pinned = 1 ORDER BY created_at DESC LIMIT 5"
+            )
+            .all() as Array<Record<string, unknown>>)
       : [];
 
-  const activeCount = (
-    db.prepare("SELECT COUNT(*) as c FROM signal_messages WHERE status = 'active'").get() as { c: number }
-  ).c;
-  const completedCount = (
-    db.prepare("SELECT COUNT(*) as c FROM signal_messages WHERE status = 'completed'").get() as { c: number }
-  ).c;
+  const activeCount = effectiveInstalledAt
+    ? (
+        db
+          .prepare(
+            "SELECT COUNT(*) as c FROM signal_messages WHERE status = 'active' AND (COALESCE(is_welcome, 0) = 1 OR created_at >= ?)"
+          )
+          .get(effectiveInstalledAt) as { c: number }
+      ).c
+    : (
+        db.prepare("SELECT COUNT(*) as c FROM signal_messages WHERE status = 'active'").get() as {
+          c: number;
+        }
+      ).c;
+
+  const completedCount = effectiveInstalledAt
+    ? (
+        db
+          .prepare(
+            "SELECT COUNT(*) as c FROM signal_messages WHERE status = 'completed' AND created_at >= ?"
+          )
+          .get(effectiveInstalledAt) as { c: number }
+      ).c
+    : (
+        db.prepare("SELECT COUNT(*) as c FROM signal_messages WHERE status = 'completed'").get() as {
+          c: number;
+        }
+      ).c;
+
   const draftCount = isAdmin
     ? (db.prepare("SELECT COUNT(*) as c FROM signal_messages WHERE status = 'draft'").get() as { c: number }).c
     : 0;
@@ -1469,7 +1574,7 @@ app.get('/api/signals/messages', optionalAuth, (req: AuthRequest, res: Response)
       .get() as { c: number }
   ).c;
 
-  const actor = resolveReactionActor(req, res, false);
+  const actor = resolveReactionActor(req, res, true);
 
   res.json({
     messages: hydrateSignalMessages(ordered, actor?.actorKey),
@@ -1483,6 +1588,7 @@ app.get('/api/signals/messages', optionalAuth, (req: AuthRequest, res: Response)
     online_count: wsClients.size,
     subscriber_count: subscriberCount,
     viewer_key: actor ? hashActorKey(actor.actorKey) : null,
+    installed_at: effectiveInstalledAt,
     server_time: new Date().toISOString(),
   });
 });
@@ -1516,6 +1622,7 @@ app.get('/api/signals/stream', handleSignalsStream);
 app.get('/api/signals/messages/stream', handleSignalsStream);
 
 app.get('/api/signals/messages/:id', optionalAuth, (req: AuthRequest, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
   const row = db
     .prepare('SELECT * FROM signal_messages WHERE id = ? OR source_id = ? LIMIT 1')
     .get(req.params.id, req.params.id) as Record<string, unknown> | undefined;
@@ -1533,7 +1640,7 @@ app.get('/api/signals/messages/:id', optionalAuth, (req: AuthRequest, res: Respo
     return;
   }
 
-  const actor = resolveReactionActor(req, res, false);
+  const actor = resolveReactionActor(req, res, true);
   const hydrated = hydrateSignalMessages([row], actor?.actorKey)[0];
   res.json({ message: hydrated });
 });
@@ -1601,13 +1708,17 @@ app.post('/api/signals/messages', requireRole('admin'), async (req: AuthRequest,
     initialStatus === 'active'
       ? generateSeededReactions()
       : { love: 0, like: 0, fire: 0, hundred: 0 };
+  const views =
+    initialStatus === 'active'
+      ? generateSeededViews(seeds.love + seeds.like + seeds.fire + seeds.hundred)
+      : 0;
 
   db.prepare(
     `INSERT INTO signal_messages (
       id, author_id, author_name, content, image_url, image_name,
       media_url, media_type, media_name, message_type, priority, status, pinned,
-      seed_love, seed_like, seed_fire, seed_hundred, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      seed_love, seed_like, seed_fire, seed_hundred, seed_views, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     id,
     req.user!.id,
@@ -1626,6 +1737,7 @@ app.post('/api/signals/messages', requireRole('admin'), async (req: AuthRequest,
     seeds.like,
     seeds.fire,
     seeds.hundred,
+    views,
     now
   );
 
@@ -1765,6 +1877,12 @@ app.patch('/api/signals/messages/:id', requireRole('admin'), async (req: AuthReq
           fire: Number(existing.seed_fire || 0),
           hundred: Number(existing.seed_hundred || 0),
         };
+  const nextSeedViews =
+    Number(existing.seed_views || 0) > 0
+      ? Number(existing.seed_views)
+      : nextStatus === 'active'
+        ? generateSeededViews(nextSeeds.love + nextSeeds.like + nextSeeds.fire + nextSeeds.hundred)
+        : 0;
 
   db.prepare(
     `UPDATE signal_messages SET
@@ -1785,6 +1903,7 @@ app.patch('/api/signals/messages/:id', requireRole('admin'), async (req: AuthReq
       seed_like = ?,
       seed_fire = ?,
       seed_hundred = ?,
+      seed_views = ?,
       created_at = ?
      WHERE id = ?`
   ).run(
@@ -1805,6 +1924,7 @@ app.patch('/api/signals/messages/:id', requireRole('admin'), async (req: AuthReq
     nextSeeds.like,
     nextSeeds.fire,
     nextSeeds.hundred,
+    nextSeedViews,
     nextCreatedAt,
     req.params.id
   );
@@ -4036,7 +4156,14 @@ app.post('/api/push/subscribe', optionalAuth, rateLimit(30, 60_000), (req: AuthR
     .prepare('SELECT prefs_json, sound_enabled FROM push_subscriptions WHERE endpoint = ?')
     .get(parsed.data.endpoint) as { prefs_json?: string; sound_enabled?: number } | undefined;
 
+  const visitorPrefRow = visitorId
+    ? (db
+        .prepare('SELECT prefs_json FROM visitor_preferences WHERE visitor_id = ?')
+        .get(visitorId) as { prefs_json?: string } | undefined)
+    : undefined;
+
   const effectivePrefs = normalizeNotificationPrefs({
+    ...(visitorPrefRow?.prefs_json ? normalizeNotificationPrefs(visitorPrefRow.prefs_json) : {}),
     ...(existingSub?.prefs_json ? normalizeNotificationPrefs(existingSub.prefs_json) : {}),
     ...(req.user ? req.user.notification_prefs : {}),
     ...(parsed.data.prefs || {}),
@@ -4187,6 +4314,7 @@ app.post('/api/push/unsubscribe', (req: Request, res: Response) => {
 });
 
 app.get('/api/push/preferences', optionalAuth, (req: AuthRequest, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
   const endpoint = typeof req.query.endpoint === 'string' ? req.query.endpoint.trim() : '';
   const actor = resolveReactionActor(req, res, false);
 
@@ -4209,10 +4337,25 @@ app.get('/api/push/preferences', optionalAuth, (req: AuthRequest, res: Response)
       .get(actor.visitorId) as typeof row;
   }
 
-  const base = req.user ? req.user.notification_prefs : normalizeNotificationPrefs(row?.prefs_json);
+  let fallbackVisitorPrefs: { prefs_json?: string; sound_enabled?: number } | undefined;
+  if (!row && actor?.visitorId) {
+    fallbackVisitorPrefs = db
+      .prepare('SELECT prefs_json, sound_enabled FROM visitor_preferences WHERE visitor_id = ?')
+      .get(actor.visitorId) as typeof fallbackVisitorPrefs;
+  }
+
+  const base = req.user
+    ? req.user.notification_prefs
+    : normalizeNotificationPrefs(row?.prefs_json ?? fallbackVisitorPrefs?.prefs_json);
+  const soundFlag =
+    row?.sound_enabled !== undefined
+      ? Boolean(row.sound_enabled)
+      : fallbackVisitorPrefs?.sound_enabled !== undefined
+        ? Boolean(fallbackVisitorPrefs.sound_enabled)
+        : undefined;
   const prefs = normalizeNotificationPrefs({
     ...base,
-    ...(row?.sound_enabled !== undefined ? { sound_enabled: Boolean(row.sound_enabled) } : {}),
+    ...(soundFlag !== undefined ? { sound_enabled: soundFlag } : {}),
   });
   res.json({ prefs, subscribed: Boolean(row && row.active !== 0) });
 });
@@ -4228,7 +4371,7 @@ app.patch('/api/push/preferences', optionalAuth, (req: AuthRequest, res: Respons
     return;
   }
 
-  const actor = resolveReactionActor(req, res, false);
+  const actor = resolveReactionActor(req, res, true);
   const now = new Date().toISOString();
   let existingRaw: unknown = req.user?.notification_prefs;
 
@@ -4237,6 +4380,18 @@ app.patch('/api/push/preferences', optionalAuth, (req: AuthRequest, res: Respons
       .prepare('SELECT prefs_json FROM push_subscriptions WHERE endpoint = ?')
       .get(parsed.data.endpoint) as { prefs_json?: string } | undefined;
     existingRaw = sub?.prefs_json;
+  } else if (!existingRaw && actor?.visitorId) {
+    const sub = db
+      .prepare('SELECT prefs_json FROM push_subscriptions WHERE visitor_id = ? ORDER BY updated_at DESC LIMIT 1')
+      .get(actor.visitorId) as { prefs_json?: string } | undefined;
+    if (sub?.prefs_json) {
+      existingRaw = sub.prefs_json;
+    } else {
+      const vp = db
+        .prepare('SELECT prefs_json FROM visitor_preferences WHERE visitor_id = ?')
+        .get(actor.visitorId) as { prefs_json?: string } | undefined;
+      existingRaw = vp?.prefs_json;
+    }
   }
 
   const nextPrefs = normalizeNotificationPrefs({
@@ -4244,21 +4399,31 @@ app.patch('/api/push/preferences', optionalAuth, (req: AuthRequest, res: Respons
     ...parsed.data.prefs,
   });
   const prefsJson = JSON.stringify(nextPrefs);
+  const soundVal = nextPrefs.sound_enabled ? 1 : 0;
 
   if (parsed.data.endpoint) {
     db.prepare(
       'UPDATE push_subscriptions SET prefs_json = ?, sound_enabled = ?, updated_at = ? WHERE endpoint = ?'
-    ).run(prefsJson, nextPrefs.sound_enabled ? 1 : 0, now, parsed.data.endpoint);
+    ).run(prefsJson, soundVal, now, parsed.data.endpoint);
   }
   if (req.user) {
     db.prepare('UPDATE users SET notification_prefs = ? WHERE id = ?').run(prefsJson, req.user.id);
     db.prepare(
       'UPDATE push_subscriptions SET prefs_json = ?, sound_enabled = ?, updated_at = ? WHERE user_id = ?'
-    ).run(prefsJson, nextPrefs.sound_enabled ? 1 : 0, now, req.user.id);
-  } else if (!parsed.data.endpoint && actor?.visitorId) {
+    ).run(prefsJson, soundVal, now, req.user.id);
+  }
+  if (actor?.visitorId) {
     db.prepare(
       'UPDATE push_subscriptions SET prefs_json = ?, sound_enabled = ?, updated_at = ? WHERE visitor_id = ?'
-    ).run(prefsJson, nextPrefs.sound_enabled ? 1 : 0, now, actor.visitorId);
+    ).run(prefsJson, soundVal, now, actor.visitorId);
+    db.prepare(
+      `INSERT INTO visitor_preferences (visitor_id, prefs_json, sound_enabled, updated_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(visitor_id) DO UPDATE SET
+         prefs_json = excluded.prefs_json,
+         sound_enabled = excluded.sound_enabled,
+         updated_at = excluded.updated_at`
+    ).run(actor.visitorId, prefsJson, soundVal, now);
   }
 
   res.json({ ok: true, prefs: nextPrefs });

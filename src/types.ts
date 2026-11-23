@@ -65,6 +65,7 @@ export interface User {
   timezone?: string;
   notification_prefs: NotificationPreferences;
   watchlist: string[];
+  installed_at?: string | null;
   created_at: string;
   last_login_at?: string | null;
 }
@@ -156,6 +157,8 @@ export interface SignalChatMessage {
   completed_summary?: string | null;
   source_type?: string | null;
   source_id?: string | null;
+  is_welcome?: boolean;
+  views?: number;
   created_at: string;
   reactions: SignalReactionsMap;
   user_reaction: SignalReactionType | null;

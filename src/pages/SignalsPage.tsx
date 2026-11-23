@@ -5,12 +5,15 @@ import {
   ArrowLeft,
   BadgeCheck,
   Bell,
+  BellOff,
   BellRing,
   CheckCircle2,
+  Eye,
   Info,
   Loader2,
   MessageSquareText,
   Moon,
+  MoreVertical,
   Pin,
   Search,
   Sun,
@@ -18,7 +21,20 @@ import {
   Zap,
 } from 'lucide-react';
 import { usePlatform, type SignalChatWsEvent } from '../context/PlatformContext';
-import { apiFetch, formatLocalDateTime, getOrCreateVisitorId } from '../lib/api';
+import {
+  apiFetch,
+  formatLocalDateTime,
+  getOrCreateInstalledAt,
+  getOrCreateVisitorId,
+  syncInstalledAtFromServer,
+} from '../lib/api';
+import {
+  getDevicePushPreferences,
+  isSignalsMuted,
+  muteSignalChannelPush,
+  setSignalsMutedLocal,
+  unmuteSignalChannelPush,
+} from '../lib/pushClient';
 import type {
   SignalChatMessage,
   SignalChatMessageType,
@@ -27,6 +43,9 @@ import type {
 } from '../types';
 
 type ChannelView = 'chat' | 'completed';
+
+const ACTIVE_COUNTER_MIN = 35678;
+const ACTIVE_COUNTER_MAX = 98678;
 
 const REACTION_OPTIONS: Array<{
   key: SignalReactionType;
@@ -66,6 +85,7 @@ function formatChatTime(iso: string): string {
     return new Intl.DateTimeFormat(undefined, {
       hour: '2-digit',
       minute: '2-digit',
+      hour12: false,
     }).format(d);
   } catch {
     return iso;
@@ -108,7 +128,7 @@ function renderMessageText(text: string) {
           href={part}
           target="_blank"
           rel="noopener noreferrer"
-          className="underline text-[#881337] dark:text-rose-400 break-all hover:opacity-80"
+          className="underline text-[#0284C7] dark:text-sky-400 break-all hover:opacity-80"
         >
           {part}
         </a>
@@ -157,6 +177,7 @@ const ChatImageAttachment: React.FC<{
 export const SignalsPage: React.FC = () => {
   const {
     user,
+    authLoading,
     theme,
     toggleTheme,
     navigate,
@@ -166,11 +187,21 @@ export const SignalsPage: React.FC = () => {
     subscribeSignalChatEvents,
   } = usePlatform();
 
-  // Always default to live chat view when opening Signals
+  // Default live channel view
   const [view, setView] = useState<ChannelView>('chat');
 
-  // Channel Info Modal
+  // Header Menu & Channel Info Modal
+  const [showChannelMenu, setShowChannelMenu] = useState(false);
   const [showChannelInfo, setShowChannelInfo] = useState(false);
+
+  // Smoothly fluctuating Active Now counter between 35,678 and 98,678
+  const [activeNowCount, setActiveNowCount] = useState<number>(() => {
+    return 54200 + Math.floor(Math.random() * 18500);
+  });
+
+  // Channel Mute / Unmute state (Unmuted by default)
+  const [isMuted, setIsMuted] = useState<boolean>(() => isSignalsMuted());
+  const [mutingBusy, setMutingBusy] = useState(false);
 
   // Active chat state
   const [activeMessages, setActiveMessages] = useState<SignalChatMessage[]>([]);
@@ -196,10 +227,11 @@ export const SignalsPage: React.FC = () => {
   const [subscriberCount, setSubscriberCount] = useState<number>(0);
 
   const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
-  const [reactionNotice, setReactionNotice] = useState<string | null>(null);
+  const [channelNotice, setChannelNotice] = useState<string | null>(null);
   const [avatarFailed, setAvatarFailed] = useState(false);
 
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+  const menuContainerRef = useRef<HTMLDivElement | null>(null);
   const isNearBottomRef = useRef<boolean>(true);
   const latestCreatedAtRef = useRef<string | null>(null);
   const viewerKeyRef = useRef<string | null>(null);
@@ -211,9 +243,45 @@ export const SignalsPage: React.FC = () => {
     setRealOnlineCount(onlineCount);
   }, [onlineCount]);
 
+  // Fluctuate live Active Now counter smoothly between 35,678 and 98,678
   useEffect(() => {
-    if (activeMessages.length > 0) {
-      latestCreatedAtRef.current = activeMessages[activeMessages.length - 1].created_at;
+    const timer = window.setInterval(() => {
+      setActiveNowCount((prev) => {
+        const step = Math.floor((Math.random() - 0.48) * 1450);
+        const next = prev + (step === 0 ? 117 : step);
+        if (next < ACTIVE_COUNTER_MIN) return ACTIVE_COUNTER_MIN + Math.floor(Math.random() * 650);
+        if (next > ACTIVE_COUNTER_MAX) return ACTIVE_COUNTER_MAX - Math.floor(Math.random() * 650);
+        return next;
+      });
+    }, 3200);
+    return () => clearInterval(timer);
+  }, []);
+
+  // Close 3-dot header dropdown on outside click or Escape
+  useEffect(() => {
+    if (!showChannelMenu) return;
+    const handleOutside = (e: MouseEvent) => {
+      if (menuContainerRef.current && !menuContainerRef.current.contains(e.target as Node)) {
+        setShowChannelMenu(false);
+      }
+    };
+    const handleEscape = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setShowChannelMenu(false);
+    };
+    document.addEventListener('mousedown', handleOutside);
+    document.addEventListener('keydown', handleEscape);
+    return () => {
+      document.removeEventListener('mousedown', handleOutside);
+      document.removeEventListener('keydown', handleEscape);
+    };
+  }, [showChannelMenu]);
+
+  useEffect(() => {
+    const nonWelcome = activeMessages.filter((m) => !m.is_welcome);
+    if (nonWelcome.length > 0) {
+      latestCreatedAtRef.current = nonWelcome[nonWelcome.length - 1].created_at;
+    } else if (activeMessages.length > 0) {
+      latestCreatedAtRef.current = null;
     }
   }, [activeMessages]);
 
@@ -228,15 +296,38 @@ export const SignalsPage: React.FC = () => {
     setShowScrollBottomBtn(false);
   }, []);
 
-  // Ensure persistent anonymous visitor identifier is initialized on open
+  // Ensure persistent visitor ID, installed_at timestamp, and push mute status are initialized
   useEffect(() => {
     getOrCreateVisitorId();
+    getOrCreateInstalledAt();
+
+    let cancelled = false;
+    getDevicePushPreferences()
+      .then((res) => {
+        if (cancelled) return;
+        const mutedOnServer =
+          res.prefs && res.prefs.signal_chat === false && res.prefs.signals === false;
+        setSignalsMutedLocal(mutedOnServer);
+        setIsMuted(mutedOnServer);
+      })
+      .catch(() => {
+        // Keep local preference if offline
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // Load initial Active chat messages
   const fetchActiveMessages = useCallback(
     async (keepScrollPosition = false) => {
+      const installedAt = getOrCreateInstalledAt();
       try {
+        const qs = new URLSearchParams({
+          status: 'active',
+          limit: '40',
+          installed_at: installedAt,
+        });
         const res = await apiFetch<{
           messages: SignalChatMessage[];
           pinned: SignalChatMessage[];
@@ -245,8 +336,10 @@ export const SignalsPage: React.FC = () => {
           online_count: number;
           subscriber_count?: number;
           viewer_key?: string | null;
-        }>('/api/signals/messages?status=active&limit=40');
+          installed_at?: string | null;
+        }>(`/api/signals/messages?${qs.toString()}`, { cache: 'no-store' });
         if (res.viewer_key) viewerKeyRef.current = res.viewer_key;
+        if (res.installed_at) syncInstalledAtFromServer(res.installed_at);
         setActiveMessages(res.messages);
         setPinnedMessages(res.pinned);
         setActiveHasMore(res.has_more);
@@ -276,7 +369,14 @@ export const SignalsPage: React.FC = () => {
       await fetchActiveMessages(true);
       return;
     }
+    const installedAt = getOrCreateInstalledAt();
     try {
+      const qs = new URLSearchParams({
+        status: 'active',
+        after: afterIso,
+        limit: '60',
+        installed_at: installedAt,
+      });
       const res = await apiFetch<{
         messages: SignalChatMessage[];
         pinned: SignalChatMessage[];
@@ -284,9 +384,11 @@ export const SignalsPage: React.FC = () => {
         online_count: number;
         subscriber_count?: number;
         viewer_key?: string | null;
-      }>(`/api/signals/messages?status=active&after=${encodeURIComponent(afterIso)}&limit=60`);
+        installed_at?: string | null;
+      }>(`/api/signals/messages?${qs.toString()}`, { cache: 'no-store' });
 
       if (res.viewer_key) viewerKeyRef.current = res.viewer_key;
+      if (res.installed_at) syncInstalledAtFromServer(res.installed_at);
       setPinnedMessages(res.pinned);
       setCompletedCount(res.counts.completed);
       if (typeof res.online_count === 'number') setRealOnlineCount(res.online_count);
@@ -298,9 +400,12 @@ export const SignalsPage: React.FC = () => {
           for (const incoming of res.messages) {
             map.set(incoming.id, incoming);
           }
-          return Array.from(map.values()).sort((a, b) =>
-            a.created_at.localeCompare(b.created_at)
-          );
+          return Array.from(map.values()).sort((a, b) => {
+            if (Boolean(a.is_welcome) !== Boolean(b.is_welcome)) {
+              return a.is_welcome ? -1 : 1;
+            }
+            return a.created_at.localeCompare(b.created_at);
+          });
         });
         if (isNearBottomRef.current) {
           requestAnimationFrame(() => scrollToBottom(true));
@@ -316,15 +421,20 @@ export const SignalsPage: React.FC = () => {
   // Load Completed archive messages
   const fetchCompletedMessages = useCallback(async (searchTerm = '') => {
     setCompletedLoading(true);
+    const installedAt = getOrCreateInstalledAt();
     try {
-      const qs = new URLSearchParams({ status: 'completed', limit: '30' });
+      const qs = new URLSearchParams({
+        status: 'completed',
+        limit: '30',
+        installed_at: installedAt,
+      });
       if (searchTerm.trim()) qs.set('search', searchTerm.trim());
       const res = await apiFetch<{
         messages: SignalChatMessage[];
         has_more: boolean;
         counts: { active: number; completed: number };
         viewer_key?: string | null;
-      }>(`/api/signals/messages?${qs.toString()}`);
+      }>(`/api/signals/messages?${qs.toString()}`, { cache: 'no-store' });
       if (res.viewer_key) viewerKeyRef.current = res.viewer_key;
       setCompletedMessages(res.messages);
       setCompletedHasMore(res.has_more);
@@ -336,11 +446,14 @@ export const SignalsPage: React.FC = () => {
     }
   }, []);
 
+  // Wait until auth resolves before initial fetch so user_reaction always matches the exact actor
   useEffect(() => {
+    if (authLoading) return;
     fetchActiveMessages(false);
-  }, [fetchActiveMessages]);
+  }, [authLoading, fetchActiveMessages]);
 
   useEffect(() => {
+    if (authLoading) return;
     const curId = user?.id ?? null;
     if (prevUserIdRef.current === undefined) {
       prevUserIdRef.current = curId;
@@ -351,13 +464,14 @@ export const SignalsPage: React.FC = () => {
       fetchActiveMessages(true);
       if (view === 'completed') fetchCompletedMessages(completedSearch);
     }
-  }, [user?.id, view, completedSearch, fetchActiveMessages, fetchCompletedMessages]);
+  }, [authLoading, user?.id, view, completedSearch, fetchActiveMessages, fetchCompletedMessages]);
 
   useEffect(() => {
+    if (authLoading) return;
     if (view === 'completed') {
       fetchCompletedMessages(completedSearch);
     }
-  }, [view, completedSearch, fetchCompletedMessages]);
+  }, [authLoading, view, completedSearch, fetchCompletedMessages]);
 
   const applySignalChannelEvent = useCallback(
     (event: SignalChatWsEvent) => {
@@ -369,6 +483,10 @@ export const SignalsPage: React.FC = () => {
         }
         case 'created': {
           const incoming = event.message;
+          const installedAt = getOrCreateInstalledAt();
+          if (!incoming.is_welcome && incoming.created_at < installedAt) {
+            return;
+          }
           if (incoming.status === 'active') {
             setActiveMessages((prev) =>
               prev.some((m) => m.id === incoming.id) ? prev : [...prev, incoming]
@@ -388,14 +506,24 @@ export const SignalsPage: React.FC = () => {
         }
         case 'updated': {
           const updated = event.message;
+          const installedAt = getOrCreateInstalledAt();
+          if (!updated.is_welcome && updated.created_at < installedAt) {
+            return;
+          }
           if (updated.status === 'active') {
             setActiveMessages((prev) => {
               const exists = prev.some((m) => m.id === updated.id);
-              return exists
+              const next = exists
                 ? prev.map((m) =>
                     m.id === updated.id ? { ...updated, user_reaction: m.user_reaction } : m
                   )
-                : [...prev, updated].sort((a, b) => a.created_at.localeCompare(b.created_at));
+                : [...prev, updated];
+              return next.sort((a, b) => {
+                if (Boolean(a.is_welcome) !== Boolean(b.is_welcome)) {
+                  return a.is_welcome ? -1 : 1;
+                }
+                return a.created_at.localeCompare(b.created_at);
+              });
             });
             setCompletedMessages((prev) => prev.filter((m) => m.id !== updated.id));
             setPinnedMessages((prev) => {
@@ -421,7 +549,9 @@ export const SignalsPage: React.FC = () => {
           break;
         }
         case 'reacted': {
-          const isSelfActor = Boolean(viewerKeyRef.current && event.viewer_key === viewerKeyRef.current);
+          const isSelfActor = Boolean(
+            viewerKeyRef.current && event.viewer_key === viewerKeyRef.current
+          );
           const applyReaction = (m: SignalChatMessage): SignalChatMessage => {
             if (m.id !== event.message_id) return m;
             return {
@@ -445,8 +575,9 @@ export const SignalsPage: React.FC = () => {
     return subscribeSignalChatEvents(applySignalChannelEvent);
   }, [subscribeSignalChatEvents, applySignalChannelEvent]);
 
-  // Seamless Server-Sent Events (SSE) + silent background polling fallback (works on serverless/Vercel)
+  // Seamless Server-Sent Events (SSE) + silent background polling fallback
   useEffect(() => {
+    if (authLoading) return;
     let source: EventSource | null = null;
     if (typeof EventSource !== 'undefined') {
       try {
@@ -504,29 +635,34 @@ export const SignalsPage: React.FC = () => {
       if (source) source.close();
       clearInterval(pollTimer);
     };
-  }, [applySignalChannelEvent, fetchActiveMessages, view]);
+  }, [authLoading, applySignalChannelEvent, fetchActiveMessages, view]);
 
   const handleLoadOlderActive = useCallback(async () => {
-    if (loadingOlder || !activeHasMore || activeMessages.length === 0) return;
-    const oldest = activeMessages[0];
+    const firstNonWelcome = activeMessages.find((m) => !m.is_welcome);
+    if (loadingOlder || !activeHasMore || !firstNonWelcome) return;
     const el = scrollContainerRef.current;
     const prevHeight = el?.scrollHeight || 0;
     const prevTop = el?.scrollTop || 0;
+    const installedAt = getOrCreateInstalledAt();
 
     setLoadingOlder(true);
     try {
+      const qs = new URLSearchParams({
+        status: 'active',
+        limit: '40',
+        before: firstNonWelcome.created_at,
+        installed_at: installedAt,
+      });
       const res = await apiFetch<{
         messages: SignalChatMessage[];
         has_more: boolean;
-      }>(
-        `/api/signals/messages?status=active&limit=40&before=${encodeURIComponent(
-          oldest.created_at
-        )}`
-      );
+      }>(`/api/signals/messages?${qs.toString()}`, { cache: 'no-store' });
       setActiveMessages((prev) => {
+        const welcomeRows = prev.filter((m) => m.is_welcome);
+        const regularRows = prev.filter((m) => !m.is_welcome);
         const existingIds = new Set(prev.map((m) => m.id));
         const older = res.messages.filter((m) => !existingIds.has(m.id));
-        return [...older, ...prev];
+        return [...welcomeRows, ...older, ...regularRows];
       });
       setActiveHasMore(res.has_more);
 
@@ -554,7 +690,6 @@ export const SignalsPage: React.FC = () => {
       setHasUnseenBelow(false);
     }
 
-    // Automatically load older messages when scrolling upward near the top
     if (el.scrollTop < 80 && activeHasMore && !loadingOlder) {
       handleLoadOlderActive();
     }
@@ -564,18 +699,20 @@ export const SignalsPage: React.FC = () => {
     if (loadingMoreCompleted || completedMessages.length === 0) return;
     const oldest = completedMessages[completedMessages.length - 1];
     const cursor = oldest.completed_at || oldest.created_at;
+    const installedAt = getOrCreateInstalledAt();
     setLoadingMoreCompleted(true);
     try {
       const qs = new URLSearchParams({
         status: 'completed',
         limit: '30',
         before: cursor,
+        installed_at: installedAt,
       });
       if (completedSearch.trim()) qs.set('search', completedSearch.trim());
       const res = await apiFetch<{
         messages: SignalChatMessage[];
         has_more: boolean;
-      }>(`/api/signals/messages?${qs.toString()}`);
+      }>(`/api/signals/messages?${qs.toString()}`, { cache: 'no-store' });
       setCompletedMessages((prev) => {
         const existingIds = new Set(prev.map((m) => m.id));
         return [...prev, ...res.messages.filter((m) => !existingIds.has(m.id))];
@@ -588,11 +725,10 @@ export const SignalsPage: React.FC = () => {
     }
   };
 
-  // Reactions click handler uses persisted database ID directly
-
   const handleReact = async (msg: SignalChatMessage, reaction: SignalReactionType) => {
     const previousReaction = msg.user_reaction;
-    const nextReaction: SignalReactionType | null = previousReaction === reaction ? null : reaction;
+    const nextReaction: SignalReactionType | null =
+      previousReaction === reaction ? null : reaction;
 
     const applyOptimistic = (m: SignalChatMessage): SignalChatMessage => {
       if (m.id !== msg.id) return m;
@@ -618,6 +754,7 @@ export const SignalsPage: React.FC = () => {
         viewer_key?: string;
       }>(`/api/signals/messages/${msg.id}/react`, {
         method: 'POST',
+        cache: 'no-store',
         body: JSON.stringify({ reaction }),
       });
 
@@ -635,13 +772,31 @@ export const SignalsPage: React.FC = () => {
       setCompletedMessages((prev) => prev.map((m) => (m.id === msg.id ? msg : m)));
       setSelectedCompleted((cur) => (cur?.id === msg.id ? msg : cur));
       if (err instanceof Error && err.message) {
-        setReactionNotice(err.message);
-        setTimeout(() => setReactionNotice(null), 3000);
+        setChannelNotice(err.message);
+        setTimeout(() => setChannelNotice(null), 3500);
       }
     }
   };
 
-
+  const handleToggleMute = async () => {
+    if (mutingBusy) return;
+    setMutingBusy(true);
+    try {
+      if (isMuted) {
+        const res = await unmuteSignalChannelPush();
+        setIsMuted(false);
+        if (res.error) {
+          setChannelNotice(res.error);
+          setTimeout(() => setChannelNotice(null), 4500);
+        }
+      } else {
+        await muteSignalChannelPush();
+        setIsMuted(true);
+      }
+    } finally {
+      setMutingBusy(false);
+    }
+  };
 
   const jumpToMessage = useCallback((msgId: string) => {
     const node = messageRefs.current.get(msgId);
@@ -664,7 +819,8 @@ export const SignalsPage: React.FC = () => {
 
       try {
         const res = await apiFetch<{ message: SignalChatMessage }>(
-          `/api/signals/messages/${encodeURIComponent(msgId)}`
+          `/api/signals/messages/${encodeURIComponent(msgId)}`,
+          { cache: 'no-store' }
         );
         if (res.message.status === 'completed') {
           setView('completed');
@@ -674,7 +830,12 @@ export const SignalsPage: React.FC = () => {
           setActiveMessages((prev) =>
             prev.some((m) => m.id === res.message.id)
               ? prev
-              : [...prev, res.message].sort((a, b) => a.created_at.localeCompare(b.created_at))
+              : [...prev, res.message].sort((a, b) => {
+                  if (Boolean(a.is_welcome) !== Boolean(b.is_welcome)) {
+                    return a.is_welcome ? -1 : 1;
+                  }
+                  return a.created_at.localeCompare(b.created_at);
+                })
           );
           requestAnimationFrame(() => {
             setTimeout(() => jumpToMessage(msgId), 60);
@@ -724,7 +885,7 @@ export const SignalsPage: React.FC = () => {
     > = [];
     let lastDay = '';
     for (const msg of activeMessages) {
-      const dayLabel = formatDayHeading(msg.created_at);
+      const dayLabel = msg.is_welcome ? '' : formatDayHeading(msg.created_at);
       if (dayLabel && dayLabel !== lastDay) {
         items.push({ kind: 'day', key: `day-${msg.id}`, label: dayLabel });
         lastDay = dayLabel;
@@ -734,88 +895,172 @@ export const SignalsPage: React.FC = () => {
     return items;
   }, [activeMessages]);
 
-  const latestPinned = pinnedMessages[0] || null;
+  const latestPinned = pinnedMessages[0] || activeMessages.find((m) => m.pinned) || null;
 
   return (
-    <div className="flex-1 min-h-0 flex flex-col w-full h-full overflow-hidden bg-[#E9EEF3] dark:bg-[#0B111E]">
+    <div className="flex-1 min-h-0 flex flex-col w-full h-full overflow-hidden telegram-wallpaper">
       {/* LIVE CHAT CHANNEL VIEW (DEFAULT) */}
       {view === 'chat' && (
         <>
-          {/* Clean Telegram-Style Channel Header */}
-          <header className="px-3 sm:px-5 h-14 border-b border-slate-200 dark:border-slate-800/90 bg-white dark:bg-[#0F172A] flex items-center justify-between gap-2 shrink-0 z-20">
-            <div className="flex items-center gap-2.5 min-w-0">
-              <div className="w-9 h-9 rounded-full bg-[#881337] text-white flex items-center justify-center font-display font-bold text-xs shrink-0 overflow-hidden">
-                {!avatarFailed ? (
-                  <img
-                    src="/pwa-192x192.png"
-                    alt="MeridianFX"
-                    onError={() => setAvatarFailed(true)}
-                    className="w-full h-full object-cover"
-                  />
-                ) : (
-                  <span>MFX</span>
-                )}
-              </div>
+          {/* Telegram-Style Channel Top Header Bar */}
+          <header className="px-2 sm:px-4 h-15 border-b border-slate-200/90 dark:border-slate-800/90 bg-white dark:bg-[#0F172A] flex items-center justify-between gap-2 shrink-0 z-30">
+            <div className="flex items-center gap-1.5 sm:gap-2.5 min-w-0">
+              <button
+                type="button"
+                onClick={() => navigate(user ? '/dashboard' : '/')}
+                aria-label="Go back"
+                className="min-h-[44px] min-w-[44px] flex items-center justify-center rounded-full text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800 transition-colors shrink-0"
+              >
+                <ArrowLeft className="w-5 h-5" />
+              </button>
 
-              <div className="flex items-center gap-1.5 min-w-0">
-                <h1 className="text-sm sm:text-[15px] font-bold text-slate-900 dark:text-white truncate leading-tight">
-                  MeridianFX Signals
-                </h1>
-                <BadgeCheck
-                  className="w-4 h-4 text-[#15803D] dark:text-emerald-400 shrink-0"
-                  aria-label="Verified channel"
-                />
-              </div>
-            </div>
-
-            {/* Channel Info Action */}
-            <div className="flex items-center gap-1 shrink-0">
               <button
                 type="button"
                 onClick={() => setShowChannelInfo(true)}
-                aria-label="Channel info and settings"
-                title="Channel info & settings"
-                className="min-h-[38px] min-w-[38px] flex items-center justify-center rounded-lg text-slate-500 hover:text-[#881337] hover:bg-slate-100 dark:text-slate-400 dark:hover:text-white dark:hover:bg-slate-800 transition-colors"
+                className="flex items-center gap-2.5 min-w-0 text-left py-1 pr-2 rounded-xl hover:bg-slate-50 dark:hover:bg-slate-800/60 transition-colors"
               >
-                <Info className="w-4 h-4" />
+                <div className="w-10 h-10 rounded-full bg-[#881337] text-white flex items-center justify-center font-display font-bold text-xs shrink-0 overflow-hidden ring-1 ring-slate-200 dark:ring-slate-700">
+                  {!avatarFailed ? (
+                    <img
+                      src="/pwa-192x192.png"
+                      alt="MeridianFX"
+                      onError={() => setAvatarFailed(true)}
+                      className="w-full h-full object-cover"
+                    />
+                  ) : (
+                    <span>MFX</span>
+                  )}
+                </div>
+
+                <div className="min-w-0">
+                  <div className="flex items-center gap-1.5 min-w-0">
+                    <h1 className="text-[15px] sm:text-base font-bold text-slate-900 dark:text-white truncate leading-tight">
+                      MeridianFX Signals
+                    </h1>
+                    <BadgeCheck
+                      className="w-4 h-4 text-[#15803D] dark:text-emerald-400 shrink-0"
+                      aria-label="Verified channel"
+                    />
+                  </div>
+                  <p className="text-xs font-semibold text-[#15803D] dark:text-emerald-400 tabular-nums truncate leading-snug">
+                    {activeNowCount.toLocaleString('en-US')} Active Now
+                  </p>
+                </div>
               </button>
+            </div>
+
+            {/* Right Three-Dot Action Menu */}
+            <div ref={menuContainerRef} className="relative flex items-center shrink-0">
+              <button
+                type="button"
+                onClick={() => setShowChannelMenu((v) => !v)}
+                aria-label="Channel menu"
+                aria-expanded={showChannelMenu}
+                className="min-h-[44px] min-w-[44px] flex items-center justify-center rounded-full text-slate-600 hover:text-slate-900 hover:bg-slate-100 dark:text-slate-300 dark:hover:text-white dark:hover:bg-slate-800 transition-colors"
+              >
+                <MoreVertical className="w-5 h-5" />
+              </button>
+
+              {showChannelMenu && (
+                <div className="absolute right-0 top-12 w-56 rounded-2xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-[#111827] shadow-xl py-1.5 z-50 text-sm">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowChannelMenu(false);
+                      setShowChannelInfo(true);
+                    }}
+                    className="w-full px-4 py-2.5 text-left flex items-center gap-2.5 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800/80"
+                  >
+                    <Info className="w-4 h-4 text-[#0284C7] dark:text-sky-400 shrink-0" />
+                    <span>Channel Info</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowChannelMenu(false);
+                      setView('completed');
+                    }}
+                    className="w-full px-4 py-2.5 text-left flex items-center justify-between gap-2 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800/80"
+                  >
+                    <span className="flex items-center gap-2.5">
+                      <Archive className="w-4 h-4 text-[#881337] dark:text-rose-400 shrink-0" />
+                      <span>Completed Updates</span>
+                    </span>
+                    <span className="text-xs font-mono text-slate-400 tabular-nums">
+                      {completedCount}
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowChannelMenu(false);
+                      setShowNotifModal(true);
+                    }}
+                    className="w-full px-4 py-2.5 text-left flex items-center gap-2.5 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800/80"
+                  >
+                    <BellRing className="w-4 h-4 text-[#15803D] dark:text-emerald-400 shrink-0" />
+                    <span>Push Alert Preferences</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowChannelMenu(false);
+                      toggleTheme();
+                    }}
+                    className="w-full px-4 py-2.5 text-left flex items-center gap-2.5 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800/80"
+                  >
+                    {theme === 'dark' ? (
+                      <Sun className="w-4 h-4 text-amber-400 shrink-0" />
+                    ) : (
+                      <Moon className="w-4 h-4 text-slate-600 shrink-0" />
+                    )}
+                    <span>{theme === 'dark' ? 'Light Theme' : 'Dark Theme'}</span>
+                  </button>
+                </div>
+              )}
             </div>
           </header>
 
-          {/* Compact Pinned Announcement Strip */}
+          {/* Sleek Telegram-Style Pinned Message Banner */}
           {latestPinned && (
             <button
               type="button"
               onClick={() => jumpToMessage(latestPinned.id)}
-              className="w-full px-3.5 sm:px-5 py-2 border-b border-slate-200/80 dark:border-slate-800 bg-white/95 dark:bg-[#111A2B]/95 backdrop-blur-xs flex items-center justify-between gap-3 text-left hover:bg-rose-50/60 dark:hover:bg-rose-950/20 transition-colors shrink-0 z-10"
+              className="w-full px-3.5 sm:px-5 py-2 border-b border-slate-200/80 dark:border-slate-800 bg-white/95 dark:bg-[#111A2B]/95 backdrop-blur-xs flex items-center justify-between gap-3 text-left hover:bg-sky-50/60 dark:hover:bg-sky-950/20 transition-colors shrink-0 z-20"
             >
-              <div className="flex items-center gap-2 min-w-0">
-                <div className="w-0.5 h-5 rounded-full bg-[#881337] dark:bg-rose-400 shrink-0" />
-                <Pin className="w-3.5 h-3.5 text-[#881337] dark:text-rose-400 shrink-0" />
-                <div className="min-w-0 flex items-baseline gap-1.5">
-                  <span className="text-[11px] font-bold text-[#881337] dark:text-rose-400 shrink-0">
-                    Pinned Message
+              <div className="flex items-center gap-2.5 min-w-0">
+                <div className="w-0.5 h-7 rounded-full bg-[#0284C7] dark:bg-sky-400 shrink-0" />
+                <div className="min-w-0 flex flex-col">
+                  <span className="inline-flex items-center gap-1 text-[11px] font-bold text-[#0284C7] dark:text-sky-400 leading-tight">
+                    <Pin className="w-3 h-3 shrink-0" />
+                    <span>Pinned Message</span>
                   </span>
-                  <span className="text-xs text-slate-600 dark:text-slate-300 truncate">
-                    {latestPinned.content || latestPinned.media_name || latestPinned.image_name || 'Pinned broadcast'}
+                  <span className="text-xs text-slate-600 dark:text-slate-300 truncate leading-snug">
+                    {latestPinned.content ||
+                      latestPinned.media_name ||
+                      latestPinned.image_name ||
+                      'Pinned broadcast'}
                   </span>
                 </div>
               </div>
               {pinnedMessages.length > 1 && (
-                <span className="text-[11px] font-mono text-slate-400 shrink-0">
+                <span className="text-[11px] font-mono text-slate-400 tabular-nums shrink-0">
                   +{pinnedMessages.length - 1}
                 </span>
               )}
             </button>
           )}
 
-          {/* Rate limit / transient reaction notice */}
-          {reactionNotice && (
-            <div className="px-4 py-2 bg-amber-50 dark:bg-amber-950/40 border-b border-amber-200 dark:border-amber-900/40 flex items-center justify-between gap-3 text-xs text-amber-800 dark:text-amber-300 shrink-0">
-              <span>{reactionNotice}</span>
+          {/* Transient notice banner */}
+          {channelNotice && (
+            <div className="px-4 py-2 bg-amber-50 dark:bg-amber-950/40 border-b border-amber-200 dark:border-amber-900/40 flex items-center justify-between gap-3 text-xs text-amber-800 dark:text-amber-300 shrink-0 z-20">
+              <span>{channelNotice}</span>
               <button
                 type="button"
-                onClick={() => setReactionNotice(null)}
+                onClick={() => setChannelNotice(null)}
                 className="font-bold underline shrink-0"
               >
                 Dismiss
@@ -823,7 +1068,7 @@ export const SignalsPage: React.FC = () => {
             </div>
           )}
 
-          {/* Full-Screen Scrollable Conversation Area */}
+          {/* Scrollable Telegram Channel Message Feed */}
           <div className="relative flex-1 min-h-0 flex flex-col">
             <div
               ref={scrollContainerRef}
@@ -833,8 +1078,8 @@ export const SignalsPage: React.FC = () => {
               <div className="mx-auto max-w-3xl space-y-2.5">
                 {loadingOlder && (
                   <div className="flex justify-center py-2">
-                    <span className="inline-flex items-center gap-1.5 rounded-full bg-white/85 dark:bg-slate-800/90 px-3 py-1 text-[11px] font-medium text-slate-500 dark:text-slate-300 shadow-xs">
-                      <Loader2 className="w-3 h-3 animate-spin text-[#881337]" />
+                    <span className="inline-flex items-center gap-1.5 rounded-full bg-white/90 dark:bg-slate-800/90 px-3 py-1 text-[11px] font-medium text-slate-500 dark:text-slate-300 shadow-xs">
+                      <Loader2 className="w-3 h-3 animate-spin text-[#15803D]" />
                       Loading older messages...
                     </span>
                   </div>
@@ -845,18 +1090,18 @@ export const SignalsPage: React.FC = () => {
                     <button
                       type="button"
                       onClick={handleLoadOlderActive}
-                      className="rounded-full bg-white/80 dark:bg-slate-800/80 px-3 py-1 text-[11px] font-medium text-slate-600 dark:text-slate-300 hover:text-[#881337] shadow-xs transition-colors"
+                      className="rounded-full bg-white/85 dark:bg-slate-800/85 px-3 py-1 text-[11px] font-medium text-slate-600 dark:text-slate-300 hover:text-[#15803D] shadow-xs transition-colors"
                     >
                       Scroll up or tap for older messages
                     </button>
                   </div>
                 )}
 
-                {activeLoading ? (
+                {activeLoading || authLoading ? (
                   <div className="flex items-center justify-center py-20">
-                    <div className="flex items-center gap-2 rounded-full bg-white dark:bg-[#151E2E] px-4 py-2 text-xs text-slate-500 shadow-xs">
-                      <Loader2 className="w-4 h-4 animate-spin text-[#881337]" />
-                      <span>Connecting to channel...</span>
+                    <div className="flex items-center gap-2 rounded-full bg-white dark:bg-[#151E2E] px-4 py-2 text-xs text-slate-500 dark:text-slate-300 shadow-xs">
+                      <Loader2 className="w-4 h-4 animate-spin text-[#15803D]" />
+                      <span>Loading channel messages...</span>
                     </div>
                   </div>
                 ) : activeWithDividers.length === 0 ? (
@@ -864,7 +1109,7 @@ export const SignalsPage: React.FC = () => {
                     <div className="rounded-2xl bg-white/95 dark:bg-[#151E2E] px-6 py-6 max-w-sm shadow-xs space-y-2">
                       <MessageSquareText className="w-7 h-7 text-[#881337] dark:text-rose-400 mx-auto" />
                       <p className="text-sm font-bold text-slate-900 dark:text-white">
-                        MeridianFX Signal Channel
+                        MeridianFX Signals
                       </p>
                       <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
                         Live trading signals, chart analysis, and instant desk broadcasts appear here automatically.
@@ -875,8 +1120,11 @@ export const SignalsPage: React.FC = () => {
                   activeWithDividers.map((item) => {
                     if (item.kind === 'day') {
                       return (
-                        <div key={item.key} className="flex justify-center py-1.5 sticky top-1 z-10 pointer-events-none">
-                          <span className="rounded-full bg-slate-900/15 dark:bg-slate-800/90 backdrop-blur-xs px-3 py-0.5 text-[11px] font-semibold text-slate-700 dark:text-slate-300">
+                        <div
+                          key={item.key}
+                          className="flex justify-center py-1.5 sticky top-1 z-10 pointer-events-none"
+                        >
+                          <span className="rounded-full bg-slate-900/20 dark:bg-slate-800/90 backdrop-blur-xs px-3 py-0.5 text-[11px] font-semibold text-white dark:text-slate-200">
                             {item.label}
                           </span>
                         </div>
@@ -885,6 +1133,7 @@ export const SignalsPage: React.FC = () => {
 
                     const msg = item.msg;
                     const isHighlighted = highlightedMsgId === msg.id;
+                    const viewsCount = typeof msg.views === 'number' ? msg.views : 0;
 
                     return (
                       <div
@@ -896,22 +1145,22 @@ export const SignalsPage: React.FC = () => {
                         className="flex justify-start"
                       >
                         <div
-                          className={`w-full max-w-[94%] sm:max-w-[82%] lg:max-w-[660px] rounded-2xl rounded-tl-xs px-3.5 py-2.5 sm:px-4 sm:py-3 shadow-[0_1px_2px_rgba(15,23,42,0.06)] transition-all ${
+                          className={`w-full max-w-[94%] sm:max-w-[82%] lg:max-w-[660px] rounded-2xl rounded-tl-xs px-3.5 py-2.5 sm:px-4 sm:py-3 shadow-[0_1px_2px_rgba(15,23,42,0.08)] transition-all ${
                             isHighlighted
-                              ? 'bg-rose-50 dark:bg-rose-950/40 ring-2 ring-[#881337]'
+                              ? 'bg-sky-50 dark:bg-sky-950/40 ring-2 ring-[#0284C7]'
                               : msg.pinned
-                                ? 'bg-white dark:bg-[#151E2E] ring-1 ring-[#881337]/30 dark:ring-rose-500/35'
+                                ? 'bg-white dark:bg-[#151E2E] ring-1 ring-[#0284C7]/25 dark:ring-sky-500/30'
                                 : 'bg-white dark:bg-[#151E2E]'
                           }`}
                         >
-                          {/* Compact Sender Line */}
+                          {/* Telegram Channel Sender Header */}
                           <div className="flex items-center justify-between gap-2 mb-1.5">
                             <div className="flex flex-wrap items-center gap-1.5 min-w-0">
                               <span className="text-xs font-bold text-[#881337] dark:text-rose-400">
-                                {msg.author_name || 'MeridianFX'}
+                                {msg.author_name || 'MeridianFX Desk'}
                               </span>
                               <span className="text-[11px] font-medium text-[#15803D] dark:text-emerald-400">
-                                · {MESSAGE_TYPE_LABELS[msg.message_type] || 'Update'}
+                                · {msg.is_welcome ? 'Channel Welcome' : MESSAGE_TYPE_LABELS[msg.message_type] || 'Update'}
                               </span>
                               {msg.priority === 'urgent' && (
                                 <span className="inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wide bg-rose-100 text-[#881337] dark:bg-rose-950/60 dark:text-rose-300">
@@ -919,7 +1168,7 @@ export const SignalsPage: React.FC = () => {
                                 </span>
                               )}
                               {msg.pinned && (
-                                <span className="inline-flex items-center gap-0.5 text-[11px] font-semibold text-[#881337] dark:text-rose-400">
+                                <span className="inline-flex items-center gap-0.5 text-[11px] font-semibold text-[#0284C7] dark:text-sky-400">
                                   · <Pin className="w-3 h-3" /> Pinned
                                 </span>
                               )}
@@ -936,11 +1185,13 @@ export const SignalsPage: React.FC = () => {
                                 className="w-full max-h-80 rounded-xl bg-black"
                               />
                             </div>
-                          ) : (msg.media_url || msg.image_url) ? (
+                          ) : msg.media_url || msg.image_url ? (
                             <div className={msg.content ? 'mb-2.5' : 'mb-1'}>
                               <ChatImageAttachment
                                 src={msg.media_url || msg.image_url || ''}
-                                alt={msg.media_name || msg.image_name || 'Trading chart attachment'}
+                                alt={
+                                  msg.media_name || msg.image_name || 'Trading chart attachment'
+                                }
                                 onOpen={setLightboxUrl}
                               />
                             </div>
@@ -952,8 +1203,8 @@ export const SignalsPage: React.FC = () => {
                             </p>
                           )}
 
-                          {/* Telegram-Style 4-Emoji Reaction Row + Timestamp */}
-                          <div className="mt-2 flex flex-wrap items-center justify-between gap-2 pt-1">
+                          {/* Telegram-Style 4-Emoji Reaction Row + Views & Timestamp */}
+                          <div className="mt-2.5 flex flex-wrap items-center justify-between gap-2 pt-1">
                             <div className="flex flex-wrap items-center gap-1.5">
                               {REACTION_OPTIONS.map((opt) => {
                                 const count = msg.reactions?.[opt.key] ?? 0;
@@ -981,7 +1232,14 @@ export const SignalsPage: React.FC = () => {
                               })}
                             </div>
 
-                            <div className="flex items-center gap-1 text-[11px] font-mono text-slate-400 dark:text-slate-500 tabular-nums shrink-0 ml-auto">
+                            <div className="flex items-center gap-2 text-[11px] font-mono text-slate-400 dark:text-slate-500 tabular-nums shrink-0 ml-auto">
+                              <span
+                                className="inline-flex items-center gap-1"
+                                title={`${viewsCount.toLocaleString('en-US')} views`}
+                              >
+                                <Eye className="w-3.5 h-3.5" aria-hidden="true" />
+                                <span>{formatCompactCount(viewsCount)}</span>
+                              </span>
                               {msg.edited_at && <span className="font-sans">edited</span>}
                               <time dateTime={msg.created_at}>{formatChatTime(msg.created_at)}</time>
                             </div>
@@ -1000,12 +1258,41 @@ export const SignalsPage: React.FC = () => {
                 type="button"
                 onClick={() => scrollToBottom(true)}
                 aria-label="Scroll to latest messages"
-                className="absolute bottom-3 right-3 sm:right-5 z-10 inline-flex items-center gap-1.5 rounded-full bg-white dark:bg-[#151E2E] text-[#881337] dark:text-rose-400 border border-slate-200 dark:border-slate-700 px-3 py-2 text-xs font-semibold shadow-md hover:bg-slate-50 transition-transform active:scale-95"
+                className="absolute bottom-3 right-3 sm:right-5 z-10 inline-flex items-center gap-1.5 rounded-full bg-white dark:bg-[#151E2E] text-[#0284C7] dark:text-sky-400 border border-slate-200 dark:border-slate-700 px-3 py-2 text-xs font-semibold shadow-md hover:bg-slate-50 transition-transform active:scale-95"
               >
                 <ArrowDown className="w-4 h-4" />
                 {hasUnseenBelow && <span>New</span>}
               </button>
             )}
+          </div>
+
+          {/* Bottom Telegram-Style Mute / Unmute Channel Bar */}
+          <div className="shrink-0 border-t border-slate-200/90 dark:border-slate-800/90 bg-white dark:bg-[#0F172A] px-3 sm:px-5 py-2 z-20">
+            <div className="mx-auto max-w-3xl">
+              <button
+                type="button"
+                onClick={handleToggleMute}
+                disabled={mutingBusy}
+                aria-pressed={isMuted}
+                className={`w-full min-h-[44px] rounded-xl px-4 py-2 text-sm font-bold inline-flex items-center justify-center gap-2 transition-colors ${
+                  isMuted
+                    ? 'bg-[#0284C7]/10 text-[#0284C7] dark:bg-sky-500/15 dark:text-sky-400 hover:bg-[#0284C7]/15 dark:hover:bg-sky-500/25'
+                    : 'bg-slate-100 dark:bg-slate-800/90 text-slate-700 dark:text-slate-200 hover:bg-slate-200/80 dark:hover:bg-slate-700'
+                }`}
+              >
+                {isMuted ? (
+                  <>
+                    <Bell className="w-4 h-4" />
+                    <span>Unmute</span>
+                  </>
+                ) : (
+                  <>
+                    <BellOff className="w-4 h-4" />
+                    <span>Mute</span>
+                  </>
+                )}
+              </button>
+            </div>
           </div>
         </>
       )}
@@ -1018,10 +1305,10 @@ export const SignalsPage: React.FC = () => {
               <button
                 type="button"
                 onClick={() => setView('chat')}
-                className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-bold text-[#881337] dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/30 min-h-[38px]"
+                className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-bold text-[#881337] dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/30 min-h-[44px]"
               >
                 <ArrowLeft className="w-4 h-4" />
-                <span>Back to Chat</span>
+                <span>Back to Channel</span>
               </button>
               <span aria-hidden="true" className="text-slate-300 dark:text-slate-700">
                 |
@@ -1063,7 +1350,7 @@ export const SignalsPage: React.FC = () => {
                     No completed updates yet
                   </p>
                   <p className="mt-1 text-xs text-slate-500 dark:text-slate-400 max-w-sm mx-auto">
-                    Concluded trading setups archived by the administrator appear here chronologically.
+                    Concluded trading setups archived after your channel join date appear here chronologically.
                   </p>
                 </div>
               ) : (
@@ -1115,7 +1402,7 @@ export const SignalsPage: React.FC = () => {
                               className="w-full h-full object-cover"
                             />
                           </div>
-                        ) : (msg.media_url || msg.image_url) ? (
+                        ) : msg.media_url || msg.image_url ? (
                           <div className="rounded-xl overflow-hidden bg-slate-100 dark:bg-slate-900 h-36">
                             <img
                               src={msg.media_url || msg.image_url || ''}
@@ -1176,7 +1463,11 @@ export const SignalsPage: React.FC = () => {
               <div className="flex items-center gap-3">
                 <div className="w-11 h-11 rounded-full bg-[#881337] text-white flex items-center justify-center font-display font-bold text-sm overflow-hidden shrink-0">
                   {!avatarFailed ? (
-                    <img src="/pwa-192x192.png" alt="MeridianFX" className="w-full h-full object-cover" />
+                    <img
+                      src="/pwa-192x192.png"
+                      alt="MeridianFX"
+                      className="w-full h-full object-cover"
+                    />
                   ) : (
                     'MFX'
                   )}
@@ -1184,19 +1475,19 @@ export const SignalsPage: React.FC = () => {
                 <div>
                   <div className="flex items-center gap-1">
                     <h3 className="text-base font-bold text-slate-900 dark:text-white">
-                      MeridianFX Signal Channel
+                      MeridianFX Signals
                     </h3>
                     <BadgeCheck className="w-4 h-4 text-[#15803D] dark:text-emerald-400" />
                   </div>
-                  <p className="text-xs text-slate-500 dark:text-slate-400">
-                    Verified Broadcast Channel
+                  <p className="text-xs font-medium text-[#15803D] dark:text-emerald-400 tabular-nums">
+                    {activeNowCount.toLocaleString('en-US')} Active Now
                   </p>
                 </div>
               </div>
               <button
                 type="button"
                 onClick={() => setShowChannelInfo(false)}
-                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-800 dark:hover:text-white"
+                className="p-2 rounded-lg text-slate-400 hover:text-slate-800 dark:hover:text-white min-h-[40px] min-w-[40px] flex items-center justify-center"
                 aria-label="Close channel info"
               >
                 <X className="w-4 h-4" />
@@ -1205,21 +1496,27 @@ export const SignalsPage: React.FC = () => {
 
             <div className="rounded-xl bg-slate-50 dark:bg-slate-900/80 p-3.5 space-y-2 text-xs">
               <div className="flex items-center justify-between">
-                <span className="text-slate-500 dark:text-slate-400">Subscribed Push Devices</span>
+                <span className="text-slate-500 dark:text-slate-400">Active Subscribers Now</span>
                 <span className="font-mono font-semibold text-[#15803D] dark:text-emerald-400 tabular-nums">
+                  {activeNowCount.toLocaleString('en-US')}
+                </span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-slate-500 dark:text-slate-400">Subscribed Push Devices</span>
+                <span className="font-mono font-semibold text-slate-800 dark:text-slate-200 tabular-nums">
                   {subscriberCount} device{subscriberCount === 1 ? '' : 's'}
                 </span>
               </div>
               <div className="flex items-center justify-between">
-                <span className="text-slate-500 dark:text-slate-400">Live Connected Viewers</span>
+                <span className="text-slate-500 dark:text-slate-400">Connected Live Readers</span>
                 <span className="font-mono font-semibold text-[#15803D] dark:text-emerald-400 tabular-nums">
-                  {realOnlineCount} online · Live Sync
+                  {realOnlineCount} online
                 </span>
               </div>
               <div className="flex items-center justify-between">
-                <span className="text-slate-500 dark:text-slate-400">Completed Updates Archive</span>
-                <span className="font-mono font-semibold text-slate-800 dark:text-slate-200 tabular-nums">
-                  {completedCount} items
+                <span className="text-slate-500 dark:text-slate-400">Channel Notifications</span>
+                <span className="font-semibold text-slate-800 dark:text-slate-200">
+                  {isMuted ? 'Muted' : 'Active'}
                 </span>
               </div>
             </div>
@@ -1323,10 +1620,14 @@ export const SignalsPage: React.FC = () => {
                 preload="metadata"
                 className="w-full max-h-96 rounded-xl bg-black"
               />
-            ) : (selectedCompleted.media_url || selectedCompleted.image_url) ? (
+            ) : selectedCompleted.media_url || selectedCompleted.image_url ? (
               <ChatImageAttachment
                 src={selectedCompleted.media_url || selectedCompleted.image_url || ''}
-                alt={selectedCompleted.media_name || selectedCompleted.image_name || 'Archived signal chart'}
+                alt={
+                  selectedCompleted.media_name ||
+                  selectedCompleted.image_name ||
+                  'Archived signal chart'
+                }
                 onOpen={setLightboxUrl}
               />
             ) : null}
@@ -1363,6 +1664,11 @@ export const SignalsPage: React.FC = () => {
                   );
                 })}
               </div>
+
+              <span className="inline-flex items-center gap-1 text-xs font-mono text-slate-400 tabular-nums">
+                <Eye className="w-3.5 h-3.5" />
+                <span>{formatCompactCount(selectedCompleted.views ?? 0)}</span>
+              </span>
             </div>
           </div>
         </div>
