@@ -1,9 +1,8 @@
-import React, { useEffect, useState } from 'react';
+import React, { useState } from 'react';
 import {
   ArrowDownRight,
   ArrowRight,
   ArrowUpRight,
-  BellRing,
   BookOpen,
   CheckCircle2,
   Mail,
@@ -16,7 +15,6 @@ import {
 import { usePlatform } from '../context/PlatformContext';
 import { PWAInstallButton } from '../components/PWAInstallButton';
 import { apiFetch, formatLocalDateTime, formatRelativeTime } from '../lib/api';
-import { getCurrentPushSubscription } from '../lib/pushClient';
 
 export const HomePage: React.FC = () => {
   const {
@@ -27,17 +25,7 @@ export const HomePage: React.FC = () => {
     updates,
     courses,
     navigate,
-    showNotifModal,
-    setShowNotifModal,
   } = usePlatform();
-
-  const [pushSubscribed, setPushSubscribed] = useState(false);
-
-  useEffect(() => {
-    getCurrentPushSubscription()
-      .then((sub) => setPushSubscribed(Boolean(sub)))
-      .catch(() => setPushSubscribed(false));
-  }, [showNotifModal]);
 
   const [contactForm, setContactForm] = useState({
     name: '',
@@ -108,23 +96,6 @@ export const HomePage: React.FC = () => {
               )}
 
               <PWAInstallButton variant="primary" label="INSTALL APP" />
-
-              <button
-                type="button"
-                onClick={() => setShowNotifModal(true)}
-                className={`inline-flex items-center gap-2 rounded-lg border px-4 py-2.5 text-sm font-medium transition-colors min-h-[44px] ${
-                  pushSubscribed
-                    ? 'border-emerald-700/40 bg-emerald-50 dark:bg-emerald-950/40 text-emerald-800 dark:text-emerald-300'
-                    : 'border-emerald-700/30 bg-emerald-50/70 dark:bg-emerald-950/30 text-emerald-800 dark:text-emerald-300 hover:bg-emerald-100/80'
-                }`}
-              >
-                {pushSubscribed ? (
-                  <CheckCircle2 className="w-4 h-4 text-emerald-700 dark:text-emerald-400" />
-                ) : (
-                  <BellRing className="w-4 h-4 text-emerald-700 dark:text-emerald-400" />
-                )}
-                <span>{pushSubscribed ? 'Alerts Enabled' : 'Enable Notifications'}</span>
-              </button>
             </div>
 
             <p className="mt-6 text-xs text-slate-500 dark:text-slate-400">

@@ -282,6 +282,10 @@ export function initDatabase(): void {
       seed_like INTEGER NOT NULL DEFAULT 0,
       seed_fire INTEGER NOT NULL DEFAULT 0,
       seed_hundred INTEGER NOT NULL DEFAULT 0,
+      love_count INTEGER NOT NULL DEFAULT 0,
+      like_count INTEGER NOT NULL DEFAULT 0,
+      fire_count INTEGER NOT NULL DEFAULT 0,
+      hundred_count INTEGER NOT NULL DEFAULT 0,
       seed_views INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
       FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE CASCADE
@@ -759,6 +763,10 @@ export function initDatabase(): void {
   ensureColumn('signal_messages', 'seed_like', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('signal_messages', 'seed_fire', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('signal_messages', 'seed_hundred', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('signal_messages', 'love_count', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('signal_messages', 'like_count', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('signal_messages', 'fire_count', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('signal_messages', 'hundred_count', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('signal_messages', 'seed_views', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('signal_messages', 'media_url', 'TEXT');
   ensureColumn('signal_messages', 'media_type', 'TEXT');
@@ -889,7 +897,11 @@ export function initDatabase(): void {
 
   if (unseededMessages.length > 0) {
     const updateSeed = db.prepare(
-      'UPDATE signal_messages SET seed_love = ?, seed_like = ?, seed_fire = ?, seed_hundred = ?, seed_views = ? WHERE id = ?'
+      `UPDATE signal_messages
+       SET seed_love = ?, seed_like = ?, seed_fire = ?, seed_hundred = ?,
+           love_count = ?, like_count = ?, fire_count = ?, hundred_count = ?,
+           seed_views = ?
+       WHERE id = ?`
     );
     const backfillTx = db.transaction(() => {
       for (const row of unseededMessages) {
@@ -909,11 +921,34 @@ export function initDatabase(): void {
           : generateSeededReactions();
         const reactSum = s.love + s.like + s.fire + s.hundred;
         const views = Number(row.seed_views || 0) > 0 ? Number(row.seed_views) : generateSeededViews(reactSum);
-        updateSeed.run(s.love, s.like, s.fire, s.hundred, views, row.id);
+        updateSeed.run(s.love, s.like, s.fire, s.hundred, s.love, s.like, s.fire, s.hundred, views, row.id);
       }
     });
     backfillTx();
   }
+
+  // Ensure persisted reaction count columns stay synchronized with seed totals + stored actor reactions
+  db.exec(`
+    UPDATE signal_messages
+    SET
+      love_count = COALESCE(seed_love, 0) + (
+        SELECT COUNT(*) FROM signal_message_reactions r WHERE r.message_id = signal_messages.id AND r.reaction = 'love'
+      ),
+      like_count = COALESCE(seed_like, 0) + (
+        SELECT COUNT(*) FROM signal_message_reactions r WHERE r.message_id = signal_messages.id AND r.reaction = 'like'
+      ),
+      fire_count = COALESCE(seed_fire, 0) + (
+        SELECT COUNT(*) FROM signal_message_reactions r WHERE r.message_id = signal_messages.id AND r.reaction = 'fire'
+      ),
+      hundred_count = COALESCE(seed_hundred, 0) + (
+        SELECT COUNT(*) FROM signal_message_reactions r WHERE r.message_id = signal_messages.id AND r.reaction = 'hundred'
+      )
+    WHERE COALESCE(love_count, 0) + COALESCE(like_count, 0) + COALESCE(fire_count, 0) + COALESCE(hundred_count, 0) = 0
+      AND (
+        COALESCE(seed_love, 0) + COALESCE(seed_like, 0) + COALESCE(seed_fire, 0) + COALESCE(seed_hundred, 0) > 0
+        OR EXISTS (SELECT 1 FROM signal_message_reactions r WHERE r.message_id = signal_messages.id)
+      );
+  `);
 }
 
 export function generateSeededViews(minFloor = 0): number {
@@ -1295,14 +1330,19 @@ function seedInitialData(): void {
         id, author_id, author_name, content, image_url, image_name,
         media_url, media_type, media_name, message_type, priority,
         status, pinned, is_welcome, source_type, source_id,
-        seed_love, seed_like, seed_fire, seed_hundred, seed_views, created_at
-      ) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, 'announcement', 'normal', 'active', 1, 1, 'welcome', ?, ?, ?, ?, ?, ?, ?)`
+        seed_love, seed_like, seed_fire, seed_hundred,
+        love_count, like_count, fire_count, hundred_count, seed_views, created_at
+      ) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, 'announcement', 'normal', 'active', 1, 1, 'welcome', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       welcomeId,
       adminId,
       'MeridianFX Desk',
       welcomeText,
       welcomeId,
+      seeds.love,
+      seeds.like,
+      seeds.fire,
+      seeds.hundred,
       seeds.love,
       seeds.like,
       seeds.fire,

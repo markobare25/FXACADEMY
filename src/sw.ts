@@ -206,25 +206,39 @@ self.addEventListener('push', (event) => {
   const work = async () => {
     const ackPromise = ackPushEvent(payload.deliveryId, 'received');
 
-    // Only suppress duplicate OS banner when user is actively viewing /signals in a focused visible window
+    // Show OS top-of-phone notification whenever the user is not actively viewing that feed
     if (!payload.forceShow) {
+      const targetPath = (() => {
+        try {
+          return new URL(targetUrl, self.location.origin).pathname;
+        } catch {
+          return '/signals';
+        }
+      })();
       const allClients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
-      const activeSignalsClients = allClients.filter((client) => {
+      const activeViewingClients = allClients.filter((client) => {
         try {
           const u = new URL(client.url);
+          const samePath =
+            u.pathname === targetPath ||
+            u.pathname === `${targetPath}/` ||
+            (targetPath.startsWith('/signals') &&
+              (u.pathname === '/signals' || u.pathname === '/signals/')) ||
+            (targetPath.startsWith('/updates') &&
+              (u.pathname === '/updates' || u.pathname === '/updates/'));
           return (
             client.focused &&
             client.visibilityState === 'visible' &&
             u.origin === self.location.origin &&
-            (u.pathname === '/signals' || u.pathname === '/signals/')
+            samePath
           );
         } catch {
           return false;
         }
       });
 
-      if (activeSignalsClients.length > 0) {
-        for (const client of activeSignalsClients) {
+      if (activeViewingClients.length > 0) {
+        for (const client of activeViewingClients) {
           client.postMessage({
             type: 'mfx:push-received-foreground',
             messageId: payload.messageId || null,

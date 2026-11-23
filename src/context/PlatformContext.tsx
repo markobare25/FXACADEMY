@@ -11,8 +11,6 @@ import {
 } from '../lib/api';
 import {
   autoEnablePushNotifications,
-  isNotificationPromptDismissed,
-  isPushSupported,
   syncExistingPushSubscriptionIfGranted,
 } from '../lib/pushClient';
 import type {
@@ -58,8 +56,6 @@ interface PlatformContextValue {
   resumeState: AcademyResumeState | null;
   notifications: AppNotification[];
   unreadCount: number;
-  showNotifModal: boolean;
-  setShowNotifModal: (v: boolean) => void;
   login: (identifier: string, password: string, rememberMe?: boolean) => Promise<User>;
   logout: () => Promise<void>;
   logoutAllSessions: () => Promise<void>;
@@ -136,7 +132,6 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   const [resumeState, setResumeState] = useState<AcademyResumeState | null>(null);
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
   const [unreadCount, setUnreadCount] = useState(0);
-  const [showNotifModal, setShowNotifModal] = useState(false);
   const [onlineCount, setOnlineCount] = useState<number>(1);
   const [wsConnected, setWsConnected] = useState<boolean>(false);
 
@@ -439,23 +434,8 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     }
   }, [user?.id, authLoading]);
 
-  // Listen for Service Worker notification clicks, foreground push sync, & post-PWA install nudge
+  // Listen for Service Worker notification clicks and foreground push sync
   useEffect(() => {
-    const postInstallKey = 'mfx_post_install_notif_prompted_v1';
-
-    const maybeEncourageAfterInstall = () => {
-      try {
-        if (!isPushSupported()) return;
-        if (Notification.permission !== 'default') return;
-        if (isNotificationPromptDismissed()) return;
-        if (localStorage.getItem(postInstallKey) === '1') return;
-        localStorage.setItem(postInstallKey, '1');
-        setShowNotifModal(true);
-      } catch {
-        // ignore storage errors
-      }
-    };
-
     const onSwMessage = (evt: MessageEvent) => {
       const data = evt.data as { type?: string; url?: string; messageId?: string | null } | undefined;
       if (data?.type === 'mfx:open-notification-url' && data.url) {
@@ -475,13 +455,11 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       }
     };
 
-    window.addEventListener('mfx:pwa-installed', maybeEncourageAfterInstall);
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.addEventListener('message', onSwMessage);
     }
 
     return () => {
-      window.removeEventListener('mfx:pwa-installed', maybeEncourageAfterInstall);
       if ('serviceWorker' in navigator) {
         navigator.serviceWorker.removeEventListener('message', onSwMessage);
       }
@@ -873,8 +851,6 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         resumeState,
         notifications,
         unreadCount,
-        showNotifModal,
-        setShowNotifModal,
         login,
         logout,
         logoutAllSessions,

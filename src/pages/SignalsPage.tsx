@@ -6,7 +6,6 @@ import {
   BadgeCheck,
   Bell,
   BellOff,
-  BellRing,
   CheckCircle2,
   Eye,
   Info,
@@ -183,7 +182,6 @@ export const SignalsPage: React.FC = () => {
     navigate,
     onlineCount,
     unreadCount,
-    setShowNotifModal,
     subscribeSignalChatEvents,
   } = usePlatform();
 
@@ -306,7 +304,10 @@ export const SignalsPage: React.FC = () => {
       .then((res) => {
         if (cancelled) return;
         const mutedOnServer =
-          res.prefs && res.prefs.signal_chat === false && res.prefs.signals === false;
+          res.prefs &&
+          res.prefs.signal_chat === false &&
+          res.prefs.signals === false &&
+          res.prefs.market_updates === false;
         setSignalsMutedLocal(mutedOnServer);
         setIsMuted(mutedOnServer);
       })
@@ -752,7 +753,7 @@ export const SignalsPage: React.FC = () => {
         reactions: SignalReactionsMap;
         user_reaction: SignalReactionType | null;
         viewer_key?: string;
-      }>(`/api/signals/messages/${msg.id}/react`, {
+      }>(`/api/signals/messages/${encodeURIComponent(msg.id)}/react`, {
         method: 'POST',
         cache: 'no-store',
         body: JSON.stringify({ reaction }),
@@ -990,18 +991,6 @@ export const SignalsPage: React.FC = () => {
                     <span className="text-xs font-mono text-slate-400 tabular-nums">
                       {completedCount}
                     </span>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setShowChannelMenu(false);
-                      setShowNotifModal(true);
-                    }}
-                    className="w-full px-4 py-2.5 text-left flex items-center gap-2.5 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800/80"
-                  >
-                    <BellRing className="w-4 h-4 text-[#15803D] dark:text-emerald-400 shrink-0" />
-                    <span>Push Alert Preferences</span>
                   </button>
 
                   <button
@@ -1541,18 +1530,6 @@ export const SignalsPage: React.FC = () => {
               >
                 {theme === 'dark' ? <Sun className="w-3.5 h-3.5" /> : <Moon className="w-3.5 h-3.5" />}
                 <span>{theme === 'dark' ? 'Light Theme' : 'Dark Theme'}</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => {
-                  setShowChannelInfo(false);
-                  setShowNotifModal(true);
-                }}
-                className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-slate-200 dark:border-slate-700 py-2.5 font-semibold text-slate-700 dark:text-slate-200 hover:border-[#15803D]/50"
-              >
-                <BellRing className="w-3.5 h-3.5 text-[#15803D] dark:text-emerald-400" />
-                <span>Push Alerts Setup</span>
               </button>
 
               {user && (

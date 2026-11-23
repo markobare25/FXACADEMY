@@ -4,19 +4,13 @@ import {
   CalendarClock,
   CheckCheck,
   CheckCircle2,
-  Eye,
-  EyeOff,
   History,
   ImagePlus,
   KeyRound,
   Loader2,
   LogIn,
   LogOut,
-  Mail,
-  MapPin,
   MessageCircle,
-  MessageSquare,
-  Phone,
   Send,
   ShieldAlert,
   ShieldCheck,
@@ -83,16 +77,13 @@ export const ProfilePage: React.FC = () => {
     login,
     logout,
     logoutAllSessions,
-    showNotifModal,
   } = usePlatform();
 
   // =========================================================================
   // SECTION A STATE: PREMIUM MEMBER SIGN IN & SIGNED-IN ACCOUNT MANAGEMENT
   // =========================================================================
-  const [identifier, setIdentifier] = useState('');
+  const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [showPassword, setShowPassword] = useState(false);
-  const [rememberMe, setRememberMe] = useState(true);
   const [loginLoading, setLoginLoading] = useState(false);
   const [loginError, setLoginError] = useState<string | null>(null);
 
@@ -128,20 +119,8 @@ export const ProfilePage: React.FC = () => {
   const [appReceiptRef, setAppReceiptRef] = useState<string | null>(null);
 
   // =========================================================================
-  // SECTION C STATE: CONTACT US & TWO-WAY CUSTOMER CHAT
+  // SECTION C STATE: DIRECT SUPPORT CHAT
   // =========================================================================
-  const [contactForm, setContactForm] = useState({
-    name: '',
-    email: '',
-    phone: '',
-    subject: '',
-    message: '',
-  });
-  const [contactSubmitting, setContactSubmitting] = useState(false);
-  const [contactError, setContactError] = useState<string | null>(null);
-  const [contactRef, setContactRef] = useState<string | null>(null);
-
-  // Two-Way Customer Chat State
   const [supportSession, setSupportSession] = useState<StoredSupportSession | null>(() =>
     loadStoredSupportSession()
   );
@@ -149,16 +128,9 @@ export const ProfilePage: React.FC = () => {
   const [chatMessages, setChatMessages] = useState<SupportMessage[]>([]);
   const [chatLoading, setChatLoading] = useState(false);
   const [chatError, setChatError] = useState<string | null>(null);
-  const [startChatForm, setStartChatForm] = useState({
-    visitor_name: '',
-    visitor_email: '',
-    visitor_phone: '',
-    initial_message: '',
-  });
   const [startingChat, setStartingChat] = useState(false);
   const [replyText, setReplyText] = useState('');
   const [sendingReply, setSendingReply] = useState(false);
-  const [pendingUploadFile, setPendingUploadFile] = useState<File | null>(null);
   const [pendingUploadPreview, setPendingUploadPreview] = useState<string | null>(null);
   const [uploadedAttachment, setUploadedAttachment] = useState<{
     url: string;
@@ -176,7 +148,7 @@ export const ProfilePage: React.FC = () => {
     getCurrentPushSubscription()
       .then((s) => setPushSubscribed(Boolean(s)))
       .catch(() => setPushSubscribed(false));
-  }, [showNotifModal]);
+  }, [user]);
 
   useEffect(() => {
     if (!user) return;
@@ -368,7 +340,7 @@ export const ProfilePage: React.FC = () => {
     setLoginError(null);
     setLoginLoading(true);
     try {
-      await login(identifier, password, rememberMe);
+      await login(email.trim(), password, true);
       setPassword('');
     } catch (err) {
       setLoginError(
@@ -500,34 +472,8 @@ export const ProfilePage: React.FC = () => {
   };
 
   // =========================================================================
-  // HANDLERS: SECTION C (CONTACT FORM & TWO-WAY CUSTOMER CHAT)
+  // HANDLERS: SECTION C (DIRECT CUSTOMER CHAT)
   // =========================================================================
-  const handleContactSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (contactSubmitting) return;
-    setContactSubmitting(true);
-    setContactError(null);
-    setContactRef(null);
-    try {
-      const res = await apiFetch<{ reference_code: string }>('/api/contact', {
-        method: 'POST',
-        body: JSON.stringify({
-          name: contactForm.name.trim(),
-          email: contactForm.email.trim(),
-          phone: contactForm.phone.trim() || null,
-          subject: contactForm.subject.trim(),
-          message: contactForm.message.trim(),
-        }),
-      });
-      setContactRef(res.reference_code);
-      setContactForm({ name: '', email: '', phone: '', subject: '', message: '' });
-    } catch (err) {
-      setContactError(err instanceof Error ? err.message : 'Unable to send contact message.');
-    } finally {
-      setContactSubmitting(false);
-    }
-  };
-
   const uploadSupportImageForSession = async (
     session: StoredSupportSession,
     file: File
@@ -555,28 +501,20 @@ export const ProfilePage: React.FC = () => {
   };
 
   const handleSelectSupportImage = async (file: File | undefined) => {
-    if (!file) return;
+    if (!file || !supportSession) return;
     setChatError(null);
     if (pendingUploadPreview) URL.revokeObjectURL(pendingUploadPreview);
     const previewUrl = URL.createObjectURL(file);
     setPendingUploadPreview(previewUrl);
 
-    if (!supportSession) {
-      // Queue until conversation starts
-      setPendingUploadFile(file);
-      return;
-    }
-
     setUploadingImage(true);
     try {
       const uploaded = await uploadSupportImageForSession(supportSession, file);
       setUploadedAttachment({ url: uploaded.url, name: uploaded.original_name });
-      setPendingUploadFile(null);
     } catch (err) {
       setChatError(err instanceof Error ? err.message : 'Image upload failed.');
       URL.revokeObjectURL(previewUrl);
       setPendingUploadPreview(null);
-      setPendingUploadFile(null);
     } finally {
       setUploadingImage(false);
     }
@@ -585,29 +523,21 @@ export const ProfilePage: React.FC = () => {
   const clearPendingImage = () => {
     if (pendingUploadPreview) URL.revokeObjectURL(pendingUploadPreview);
     setPendingUploadPreview(null);
-    setPendingUploadFile(null);
     setUploadedAttachment(null);
   };
 
-  const handleStartConversation = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (startingChat || uploadingImage) return;
+  const handleStartConversation = async () => {
+    if (startingChat) return;
     setStartingChat(true);
     setChatError(null);
     try {
-      const hasQueuedFile = Boolean(pendingUploadFile);
       const res = await apiFetch<{
         conversation: SupportConversation;
         messages: SupportMessage[];
         visitor_token: string;
       }>('/api/support/conversations', {
         method: 'POST',
-        body: JSON.stringify({
-          visitor_name: startChatForm.visitor_name.trim(),
-          visitor_email: startChatForm.visitor_email.trim() || undefined,
-          visitor_phone: startChatForm.visitor_phone.trim() || undefined,
-          initial_message: hasQueuedFile ? '' : startChatForm.initial_message.trim(),
-        }),
+        body: JSON.stringify({}),
       });
 
       const nextSession: StoredSupportSession = {
@@ -619,44 +549,8 @@ export const ProfilePage: React.FC = () => {
       setSupportSession(nextSession);
       setConversation(res.conversation);
       setChatMessages(res.messages);
-
-      if (pendingUploadFile) {
-        const uploaded = await uploadSupportImageForSession(nextSession, pendingUploadFile);
-        const msgRes = await fetch(
-          `/api/support/conversations/${encodeURIComponent(nextSession.conversation_id)}/messages`,
-          {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'X-Requested-With': 'MeridianFX',
-              'X-Support-Token': nextSession.token,
-            },
-            body: JSON.stringify({
-              content: startChatForm.initial_message.trim(),
-              attachment_url: uploaded.url,
-              attachment_name: uploaded.original_name,
-            }),
-          }
-        );
-        if (msgRes.ok) {
-          const sent = (await msgRes.json()) as {
-            conversation: SupportConversation;
-            message: SupportMessage;
-          };
-          setConversation(sent.conversation);
-          setChatMessages((prev) => [...prev, sent.message]);
-        }
-        clearPendingImage();
-      }
-
-      setStartChatForm({
-        visitor_name: '',
-        visitor_email: '',
-        visitor_phone: '',
-        initial_message: '',
-      });
     } catch (err) {
-      setChatError(err instanceof Error ? err.message : 'Unable to start customer chat.');
+      setChatError(err instanceof Error ? err.message : 'Unable to start direct chat.');
     } finally {
       setStartingChat(false);
     }
@@ -717,25 +611,6 @@ export const ProfilePage: React.FC = () => {
     clearPendingImage();
   };
 
-  // =========================================================================
-  // VERIFIED OFFICIAL CONTACT HELPERS (NEVER INVENTED)
-  // =========================================================================
-  const officialEmail = (settings.contact_email || '').trim();
-  const officialWhatsapp = (settings.contact_whatsapp || '').trim();
-  const whatsappDigits = officialWhatsapp.replace(/\D/g, '');
-  const whatsappUrl = whatsappDigits
-    ? `https://wa.me/${whatsappDigits}?text=${encodeURIComponent(
-        `Hello ${settings.brand_name}, I have a membership or support enquiry.`
-      )}`
-    : null;
-  const officialPhone = (settings.contact_phone || '').trim();
-  const phoneDigits = officialPhone.replace(/[^\d+]/g, '');
-  const mailtoUrl = officialEmail
-    ? `mailto:${encodeURIComponent(officialEmail)}?subject=${encodeURIComponent(
-        `${settings.brand_name} Enquiry`
-      )}`
-    : null;
-
   const membershipExpiresLabel = user?.membership_expires_at
     ? formatLocalDateTime(user.membership_expires_at)
     : 'Ongoing';
@@ -754,88 +629,43 @@ export const ProfilePage: React.FC = () => {
           aria-labelledby="section-premium-signin"
           className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-6 sm:p-8 shadow-xs"
         >
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-            <div className="lg:col-span-5 space-y-3">
-              <div className="inline-flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-[#881337] dark:text-rose-400">
-                <ShieldCheck className="w-4 h-4" />
-                <span>Section A · Approved Members Only</span>
-              </div>
-              <h1
-                id="section-premium-signin"
-                className="text-2xl font-bold text-slate-900 dark:text-white tracking-tight"
-              >
-                Premium Member Sign In
-              </h1>
-              <p className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
-                Sign in with the private email or username credentials issued to you by the {settings.brand_name} administrator.
-              </p>
-              <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-900/50 p-3.5 text-xs text-slate-600 dark:text-slate-300 space-y-1">
-                <p className="font-semibold text-slate-900 dark:text-white">
-                  Not a Premium Member yet?
-                </p>
-                <p>
-                  Public channels, Academy courses, and live market updates require no account. Submit an application in Section B below to request approved access.
-                </p>
-              </div>
-            </div>
+          <div className="max-w-md space-y-5">
+            <h1
+              id="section-premium-signin"
+              className="text-2xl font-bold text-slate-900 dark:text-white tracking-tight"
+            >
+              Premium Member Sign In
+            </h1>
 
-            <form onSubmit={handleMemberLogin} className="lg:col-span-7 space-y-4">
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
-                <div>
-                  <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">
-                    Assigned Email or Username
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    autoComplete="username"
-                    value={identifier}
-                    onChange={(e) => setIdentifier(e.target.value)}
-                    placeholder="member@domain.com or username"
-                    className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3.5 py-2.5 text-base sm:text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-[#881337]"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">
-                    Password
-                  </label>
-                  <div className="relative">
-                    <input
-                      type={showPassword ? 'text' : 'password'}
-                      required
-                      autoComplete="current-password"
-                      value={password}
-                      onChange={(e) => setPassword(e.target.value)}
-                      placeholder="••••••••••••"
-                      className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 pl-3.5 pr-10 py-2.5 text-base sm:text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-[#881337]"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => setShowPassword((v) => !v)}
-                      aria-label={showPassword ? 'Hide password' : 'Show password'}
-                      className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
-                    >
-                      {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                    </button>
-                  </div>
-                </div>
-              </div>
-
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <label className="inline-flex items-center gap-2 text-xs text-slate-600 dark:text-slate-300 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={rememberMe}
-                    onChange={(e) => setRememberMe(e.target.checked)}
-                    className="w-4 h-4 accent-[#881337]"
-                  />
-                  <span>Keep me signed in on this device</span>
+            <form onSubmit={handleMemberLogin} className="space-y-4">
+              <div>
+                <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">
+                  Email
                 </label>
+                <input
+                  type="email"
+                  required
+                  autoComplete="email"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  placeholder="member@domain.com"
+                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3.5 py-2.5 text-base sm:text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-[#881337]"
+                />
+              </div>
 
-                <span className="text-[11px] text-slate-500 dark:text-slate-400">
-                  Forgot password? Contact desk in Section C.
-                </span>
+              <div>
+                <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">
+                  Password
+                </label>
+                <input
+                  type="password"
+                  required
+                  autoComplete="current-password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="••••••••••••"
+                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3.5 py-2.5 text-base sm:text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-[#881337]"
+                />
               </div>
 
               {loginError && (
@@ -855,7 +685,7 @@ export const ProfilePage: React.FC = () => {
                 ) : (
                   <LogIn className="w-4 h-4" />
                 )}
-                <span>{loginLoading ? 'Signing In...' : 'Sign In as Premium Member'}</span>
+                <span>{loginLoading ? 'Signing In...' : 'Sign In'}</span>
               </button>
             </form>
           </div>
@@ -1266,188 +1096,30 @@ export const ProfilePage: React.FC = () => {
       </section>
 
       {/* =================================================================== */}
-      {/* C. CONTACT US (OFFICIAL DETAILS, CONTACT FORM & TWO-WAY LIVE CHAT)  */}
+      {/* C. DIRECT CHAT                                                      */}
       {/* =================================================================== */}
-      <section
-        ref={contactSectionRef}
-        aria-labelledby="section-contact-us"
-        className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-6 sm:p-8 space-y-8 shadow-xs"
-      >
-        <div className="space-y-2">
-          <div className="inline-flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-[#15803D] dark:text-emerald-400">
-            <MessageSquare className="w-4 h-4" />
-            <span>Section C · Direct Desk &amp; Customer Support</span>
-          </div>
-          <h2
-            id="section-contact-us"
-            className="text-2xl font-bold text-slate-900 dark:text-white"
-          >
-            Contact Us
-          </h2>
-          <p className="text-sm text-slate-600 dark:text-slate-300 max-w-2xl">
-            Reach {settings.brand_name} directly via our official desk channels, submit an enquiry form, or start a real-time two-way customer conversation below without creating an account.
-          </p>
-        </div>
-
-        {/* Verified Official Contact Channels + Direct Action Buttons */}
-        <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-900/40 p-5 flex flex-col md:flex-row md:items-center justify-between gap-4">
-          <div className="space-y-2 text-xs">
-            <p className="font-bold text-slate-900 dark:text-white text-sm">
-              Official {settings.brand_name} Contact Information
-            </p>
-            <div className="flex flex-wrap items-center gap-x-6 gap-y-2 text-slate-600 dark:text-slate-300">
-              {officialEmail && (
-                <span className="inline-flex items-center gap-2">
-                  <Mail className="w-4 h-4 text-[#881337] dark:text-rose-400 shrink-0" />
-                  <span className="font-mono">{officialEmail}</span>
-                </span>
-              )}
-              {officialWhatsapp && (
-                <span className="inline-flex items-center gap-2">
-                  <MessageCircle className="w-4 h-4 text-[#15803D] dark:text-emerald-400 shrink-0" />
-                  <span className="font-mono">{officialWhatsapp}</span>
-                </span>
-              )}
-              {officialPhone && (
-                <span className="inline-flex items-center gap-2">
-                  <Phone className="w-4 h-4 text-[#881337] dark:text-rose-400 shrink-0" />
-                  <span className="font-mono">{officialPhone}</span>
-                </span>
-              )}
-              {settings.contact_address && (
-                <span className="inline-flex items-center gap-2">
-                  <MapPin className="w-4 h-4 text-slate-500 shrink-0" />
-                  <span>{settings.contact_address}</span>
-                </span>
-              )}
-            </div>
-          </div>
-
-          <div className="flex flex-wrap items-center gap-2.5 shrink-0">
-            {mailtoUrl && (
-              <a
-                href={mailtoUrl}
-                className="inline-flex items-center gap-2 rounded-lg bg-[#881337] px-4 py-2 text-xs font-semibold text-white hover:bg-[#6B0F2B] min-h-[40px]"
-              >
-                <Mail className="w-3.5 h-3.5" />
-                <span>Email Desk</span>
-              </a>
+      <section ref={contactSectionRef}>
+        {!supportSession ? (
+          <div className="space-y-3">
+            {chatError && (
+              <p className="text-xs font-medium text-red-600 dark:text-red-400">{chatError}</p>
             )}
-            {whatsappUrl && (
-              <a
-                href={whatsappUrl}
-                target="_blank"
-                rel="noreferrer"
-                className="inline-flex items-center gap-2 rounded-lg bg-[#15803D] px-4 py-2 text-xs font-semibold text-white hover:bg-[#166534] min-h-[40px]"
-              >
-                <MessageCircle className="w-3.5 h-3.5" />
-                <span>WhatsApp</span>
-              </a>
-            )}
-            {phoneDigits && (
-              <a
-                href={`tel:${phoneDigits}`}
-                className="inline-flex items-center gap-2 rounded-lg border border-slate-300 dark:border-slate-700 px-4 py-2 text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-white dark:hover:bg-slate-800 min-h-[40px]"
-              >
-                <Phone className="w-3.5 h-3.5" />
-                <span>Call Desk</span>
-              </a>
-            )}
-          </div>
-        </div>
-
-        {/* Two-Column Split: Contact Us Form & Two-Way Live Customer Chat */}
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-          {/* Contact Form */}
-          <form
-            onSubmit={handleContactSubmit}
-            className="lg:col-span-5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-900/30 p-5 space-y-3.5"
-          >
-            <div>
-              <h3 className="text-sm font-bold text-slate-900 dark:text-white">
-                Send a Contact Enquiry
-              </h3>
-              <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                Saved directly to the administrator dashboard with a tracking reference.
-              </p>
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <input
-                type="text"
-                required
-                minLength={2}
-                value={contactForm.name}
-                onChange={(e) => setContactForm({ ...contactForm, name: e.target.value })}
-                placeholder="Your Name *"
-                className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm text-slate-900 dark:text-white"
-              />
-              <input
-                type="email"
-                required
-                value={contactForm.email}
-                onChange={(e) => setContactForm({ ...contactForm, email: e.target.value })}
-                placeholder="Your Email *"
-                className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm text-slate-900 dark:text-white"
-              />
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <input
-                type="tel"
-                value={contactForm.phone}
-                onChange={(e) => setContactForm({ ...contactForm, phone: e.target.value })}
-                placeholder="Phone (optional)"
-                className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm font-mono text-slate-900 dark:text-white"
-              />
-              <input
-                type="text"
-                required
-                minLength={3}
-                value={contactForm.subject}
-                onChange={(e) => setContactForm({ ...contactForm, subject: e.target.value })}
-                placeholder="Subject *"
-                className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm text-slate-900 dark:text-white"
-              />
-            </div>
-
-            <textarea
-              rows={4}
-              required
-              minLength={10}
-              value={contactForm.message}
-              onChange={(e) => setContactForm({ ...contactForm, message: e.target.value })}
-              placeholder="How can our team assist you?"
-              className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm text-slate-900 dark:text-white"
-            />
-
-            {contactError && (
-              <div className="flex items-center gap-2 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-600 dark:text-red-400">
-                <ShieldAlert className="w-4 h-4 shrink-0" />
-                <span>{contactError}</span>
-              </div>
-            )}
-
-            {contactRef && (
-              <div className="flex items-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs font-medium text-[#15803D] dark:text-emerald-400">
-                <CheckCircle2 className="w-4 h-4 shrink-0" />
-                <span>
-                  Enquiry received! Reference: <span className="font-mono font-bold">{contactRef}</span>
-                </span>
-              </div>
-            )}
-
             <button
-              type="submit"
-              disabled={contactSubmitting}
-              className="w-full rounded-lg bg-[#881337] px-4 py-2.5 text-sm font-semibold text-white hover:bg-[#6B0F2B] disabled:opacity-60 min-h-[42px]"
+              type="button"
+              onClick={handleStartConversation}
+              disabled={startingChat}
+              className="inline-flex items-center justify-center gap-2 rounded-xl bg-[#15803D] px-6 py-3 text-sm font-semibold text-white hover:bg-[#166534] disabled:opacity-60 min-h-[46px] shadow-xs"
             >
-              {contactSubmitting ? 'Sending...' : 'Send Enquiry'}
+              {startingChat ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <Send className="w-4 h-4" />
+              )}
+              <span>{startingChat ? 'Starting...' : 'Start Direct Chat'}</span>
             </button>
-          </form>
-
-          {/* Two-Way Customer Chat */}
-          <div className="lg:col-span-7 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D1321] overflow-hidden flex flex-col">
+          </div>
+        ) : (
+          <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D1321] overflow-hidden flex flex-col">
             <div className="px-4 py-3 border-b border-slate-200 dark:border-slate-800 bg-slate-50/80 dark:bg-slate-900/60 flex flex-wrap items-center justify-between gap-2">
               <div className="flex items-center gap-2.5 min-w-0">
                 <div className="w-8 h-8 rounded-full bg-[#15803D]/15 text-[#15803D] dark:text-emerald-400 flex items-center justify-center shrink-0">
@@ -1455,13 +1127,13 @@ export const ProfilePage: React.FC = () => {
                 </div>
                 <div className="min-w-0">
                   <h3 className="text-sm font-bold text-slate-900 dark:text-white truncate">
-                    Live Two-Way Customer Chat
+                    Direct Chat
                   </h3>
-                  <p className="text-[11px] text-slate-500 dark:text-slate-400 truncate">
-                    {conversation
-                      ? `${conversation.reference_code} · ${conversation.status === 'resolved' ? 'Resolved (reply reopens)' : 'Connected with Desk'}`
-                      : 'Direct message with MeridianFX Administration — no account needed'}
-                  </p>
+                  {conversation && (
+                    <p className="text-[11px] text-slate-500 dark:text-slate-400 truncate">
+                      {conversation.reference_code}
+                    </p>
+                  )}
                 </div>
               </div>
 
@@ -1483,250 +1155,145 @@ export const ProfilePage: React.FC = () => {
               )}
             </div>
 
-            {!supportSession ? (
-              <form onSubmit={handleStartConversation} className="p-4 sm:p-5 space-y-3">
-                <p className="text-xs text-slate-600 dark:text-slate-300">
-                  Enter your name and message to start a private two-way conversation. Your chat history stays available on this device across reloads.
+            <div className="h-72 overflow-y-auto p-4 space-y-3 bg-slate-50/70 dark:bg-[#090D16]">
+              {chatLoading ? (
+                <div className="h-full flex items-center justify-center text-xs text-slate-500 gap-2">
+                  <Loader2 className="w-4 h-4 animate-spin text-[#881337]" />
+                  <span>Loading conversation...</span>
+                </div>
+              ) : chatMessages.length === 0 ? (
+                <p className="text-center text-xs text-slate-500 py-10">
+                  Conversation started ({supportSession.reference_code}). Send a message below.
                 </p>
-
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
-                  <input
-                    type="text"
-                    required
-                    minLength={2}
-                    value={startChatForm.visitor_name}
-                    onChange={(e) =>
-                      setStartChatForm({ ...startChatForm, visitor_name: e.target.value })
-                    }
-                    placeholder="Your Name *"
-                    className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs text-slate-900 dark:text-white"
-                  />
-                  <input
-                    type="email"
-                    value={startChatForm.visitor_email}
-                    onChange={(e) =>
-                      setStartChatForm({ ...startChatForm, visitor_email: e.target.value })
-                    }
-                    placeholder="Email (optional)"
-                    className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs text-slate-900 dark:text-white"
-                  />
-                  <input
-                    type="tel"
-                    value={startChatForm.visitor_phone}
-                    onChange={(e) =>
-                      setStartChatForm({ ...startChatForm, visitor_phone: e.target.value })
-                    }
-                    placeholder="Phone / WhatsApp (opt.)"
-                    className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs font-mono text-slate-900 dark:text-white"
-                  />
-                </div>
-
-                <textarea
-                  rows={3}
-                  required={!pendingUploadFile}
-                  value={startChatForm.initial_message}
-                  onChange={(e) =>
-                    setStartChatForm({ ...startChatForm, initial_message: e.target.value })
-                  }
-                  placeholder="Write your message or question to MeridianFX..."
-                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm text-slate-900 dark:text-white"
-                />
-
-                {pendingUploadPreview && (
-                  <div className="flex items-center justify-between gap-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 p-2 text-xs">
-                    <div className="flex items-center gap-2 min-w-0">
-                      <img
-                        src={pendingUploadPreview}
-                        alt="Attachment preview"
-                        className="w-10 h-10 rounded object-cover shrink-0"
-                      />
-                      <span className="truncate text-slate-700 dark:text-slate-300">
-                        {pendingUploadFile?.name || 'Image attached'}
-                      </span>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={clearPendingImage}
-                      className="p-1 text-slate-400 hover:text-red-500"
+              ) : (
+                chatMessages.map((m) => {
+                  const isVisitor = m.sender_type === 'visitor';
+                  return (
+                    <div
+                      key={m.id}
+                      className={`flex ${isVisitor ? 'justify-end' : 'justify-start'}`}
                     >
-                      <X className="w-4 h-4" />
-                    </button>
-                  </div>
-                )}
-
-                {chatError && (
-                  <p className="text-xs font-medium text-red-600 dark:text-red-400">{chatError}</p>
-                )}
-
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <label className="inline-flex items-center gap-1.5 cursor-pointer rounded-lg border border-slate-300 dark:border-slate-700 px-3 py-2 text-xs font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800">
-                    <ImagePlus className="w-3.5 h-3.5" />
-                    <span>Attach Image</span>
-                    <input
-                      type="file"
-                      accept="image/*"
-                      className="hidden"
-                      onChange={(e) => handleSelectSupportImage(e.target.files?.[0])}
-                    />
-                  </label>
-
-                  <button
-                    type="submit"
-                    disabled={startingChat}
-                    className="inline-flex items-center gap-1.5 rounded-lg bg-[#15803D] px-4 py-2 text-xs font-semibold text-white hover:bg-[#166534] disabled:opacity-60 min-h-[38px]"
-                  >
-                    {startingChat ? (
-                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                    ) : (
-                      <Send className="w-3.5 h-3.5" />
-                    )}
-                    <span>{startingChat ? 'Starting...' : 'Start Direct Chat'}</span>
-                  </button>
-                </div>
-              </form>
-            ) : (
-              <>
-                <div className="h-72 overflow-y-auto p-4 space-y-3 bg-slate-50/70 dark:bg-[#090D16]">
-                  {chatLoading ? (
-                    <div className="h-full flex items-center justify-center text-xs text-slate-500 gap-2">
-                      <Loader2 className="w-4 h-4 animate-spin text-[#881337]" />
-                      <span>Loading conversation...</span>
-                    </div>
-                  ) : chatMessages.length === 0 ? (
-                    <p className="text-center text-xs text-slate-500 py-10">
-                      Conversation started ({supportSession.reference_code}). Send a message below.
-                    </p>
-                  ) : (
-                    chatMessages.map((m) => {
-                      const isVisitor = m.sender_type === 'visitor';
-                      return (
-                        <div
-                          key={m.id}
-                          className={`flex ${isVisitor ? 'justify-end' : 'justify-start'}`}
-                        >
-                          <div
-                            className={`max-w-[85%] rounded-2xl px-3.5 py-2.5 text-xs space-y-1.5 shadow-2xs ${
-                              isVisitor
-                                ? 'bg-[#881337] text-white rounded-br-xs'
-                                : 'bg-white dark:bg-[#151E2E] border border-slate-200 dark:border-slate-800 text-slate-800 dark:text-slate-100 rounded-bl-xs'
-                            }`}
-                          >
-                            <div className="flex items-center justify-between gap-3 text-[10px] opacity-80">
-                              <span className="font-bold">
-                                {isVisitor ? m.sender_name : 'MeridianFX Desk'}
-                              </span>
-                              <span className="font-mono tabular-nums inline-flex items-center gap-1">
-                                {formatLocalDateTime(m.created_at)}
-                                {isVisitor && m.read_by_admin && (
-                                  <CheckCheck className="w-3 h-3 text-emerald-300" />
-                                )}
-                              </span>
-                            </div>
-
-                            {m.attachment_url && (
-                              <button
-                                type="button"
-                                onClick={() => setLightboxUrl(m.attachment_url!)}
-                                className="block overflow-hidden rounded-lg"
-                              >
-                                <img
-                                  src={m.attachment_url}
-                                  alt={m.attachment_name || 'Chat attachment'}
-                                  className="max-h-48 rounded-lg object-cover"
-                                />
-                              </button>
+                      <div
+                        className={`max-w-[85%] rounded-2xl px-3.5 py-2.5 text-xs space-y-1.5 shadow-2xs ${
+                          isVisitor
+                            ? 'bg-[#881337] text-white rounded-br-xs'
+                            : 'bg-white dark:bg-[#151E2E] border border-slate-200 dark:border-slate-800 text-slate-800 dark:text-slate-100 rounded-bl-xs'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-3 text-[10px] opacity-80">
+                          <span className="font-bold">
+                            {isVisitor ? m.sender_name : 'MeridianFX Desk'}
+                          </span>
+                          <span className="font-mono tabular-nums inline-flex items-center gap-1">
+                            {formatLocalDateTime(m.created_at)}
+                            {isVisitor && m.read_by_admin && (
+                              <CheckCheck className="w-3 h-3 text-emerald-300" />
                             )}
-
-                            {m.content && (
-                              <p className="text-xs sm:text-[13px] whitespace-pre-wrap break-words leading-relaxed">
-                                {m.content}
-                              </p>
-                            )}
-                          </div>
+                          </span>
                         </div>
-                      );
-                    })
-                  )}
-                  <div ref={chatEndRef} />
-                </div>
 
-                {pendingUploadPreview && (
-                  <div className="px-3 py-2 border-t border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900 flex items-center justify-between gap-2 text-xs">
-                    <div className="flex items-center gap-2 min-w-0">
-                      <img
-                        src={pendingUploadPreview}
-                        alt="Pending upload"
-                        className="w-9 h-9 rounded object-cover"
-                      />
-                      <span className="truncate text-slate-700 dark:text-slate-300">
-                        {uploadingImage
-                          ? 'Uploading image...'
-                          : uploadedAttachment?.name || 'Image ready'}
-                      </span>
+                        {m.attachment_url && (
+                          <button
+                            type="button"
+                            onClick={() => setLightboxUrl(m.attachment_url!)}
+                            className="block overflow-hidden rounded-lg"
+                          >
+                            <img
+                              src={m.attachment_url}
+                              alt={m.attachment_name || 'Chat attachment'}
+                              className="max-h-48 rounded-lg object-cover"
+                            />
+                          </button>
+                        )}
+
+                        {m.content && (
+                          <p className="text-xs sm:text-[13px] whitespace-pre-wrap break-words leading-relaxed">
+                            {m.content}
+                          </p>
+                        )}
+                      </div>
                     </div>
-                    <button
-                      type="button"
-                      onClick={clearPendingImage}
-                      className="p-1 text-slate-400 hover:text-red-500"
-                    >
-                      <X className="w-4 h-4" />
-                    </button>
-                  </div>
-                )}
+                  );
+                })
+              )}
+              <div ref={chatEndRef} />
+            </div>
 
-                {chatError && (
-                  <p className="px-3 pt-2 text-xs font-medium text-red-600 dark:text-red-400">
-                    {chatError}
-                  </p>
-                )}
-
-                <form
-                  onSubmit={handleSendChatReply}
-                  className="p-2.5 border-t border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D1321] flex items-center gap-2"
-                >
-                  <label
-                    title="Attach image"
-                    className="min-h-[38px] min-w-[38px] flex items-center justify-center rounded-lg bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:text-[#881337] cursor-pointer shrink-0"
-                  >
-                    {uploadingImage ? (
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                    ) : (
-                      <ImagePlus className="w-4 h-4" />
-                    )}
-                    <input
-                      type="file"
-                      accept="image/*"
-                      className="hidden"
-                      onChange={(e) => handleSelectSupportImage(e.target.files?.[0])}
-                    />
-                  </label>
-
-                  <input
-                    ref={chatInputRef}
-                    type="text"
-                    value={replyText}
-                    onChange={(e) => setReplyText(e.target.value)}
-                    placeholder="Write a message..."
-                    className="flex-1 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 px-3 py-2 text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-[#881337]"
+            {pendingUploadPreview && (
+              <div className="px-3 py-2 border-t border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900 flex items-center justify-between gap-2 text-xs">
+                <div className="flex items-center gap-2 min-w-0">
+                  <img
+                    src={pendingUploadPreview}
+                    alt="Pending upload"
+                    className="w-9 h-9 rounded object-cover"
                   />
-
-                  <button
-                    type="submit"
-                    disabled={sendingReply || uploadingImage || (!replyText.trim() && !uploadedAttachment)}
-                    className="min-h-[38px] px-3.5 rounded-lg bg-[#881337] text-white text-xs font-semibold inline-flex items-center gap-1.5 hover:bg-[#6B0F2B] disabled:opacity-50 shrink-0"
-                  >
-                    {sendingReply ? (
-                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                    ) : (
-                      <Send className="w-3.5 h-3.5" />
-                    )}
-                    <span>Send</span>
-                  </button>
-                </form>
-              </>
+                  <span className="truncate text-slate-700 dark:text-slate-300">
+                    {uploadingImage
+                      ? 'Uploading image...'
+                      : uploadedAttachment?.name || 'Image ready'}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={clearPendingImage}
+                  className="p-1 text-slate-400 hover:text-red-500"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
             )}
+
+            {chatError && (
+              <p className="px-3 pt-2 text-xs font-medium text-red-600 dark:text-red-400">
+                {chatError}
+              </p>
+            )}
+
+            <form
+              onSubmit={handleSendChatReply}
+              className="p-2.5 border-t border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D1321] flex items-center gap-2"
+            >
+              <label
+                title="Attach image"
+                className="min-h-[38px] min-w-[38px] flex items-center justify-center rounded-lg bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:text-[#881337] cursor-pointer shrink-0"
+              >
+                {uploadingImage ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <ImagePlus className="w-4 h-4" />
+                )}
+                <input
+                  type="file"
+                  accept="image/*"
+                  className="hidden"
+                  onChange={(e) => handleSelectSupportImage(e.target.files?.[0])}
+                />
+              </label>
+
+              <input
+                ref={chatInputRef}
+                type="text"
+                value={replyText}
+                onChange={(e) => setReplyText(e.target.value)}
+                placeholder="Write a message..."
+                className="flex-1 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 px-3 py-2 text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-[#881337]"
+              />
+
+              <button
+                type="submit"
+                disabled={sendingReply || uploadingImage || (!replyText.trim() && !uploadedAttachment)}
+                className="min-h-[38px] px-3.5 rounded-lg bg-[#881337] text-white text-xs font-semibold inline-flex items-center gap-1.5 hover:bg-[#6B0F2B] disabled:opacity-50 shrink-0"
+              >
+                {sendingReply ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Send className="w-3.5 h-3.5" />
+                )}
+                <span>Send</span>
+              </button>
+            </form>
           </div>
-        </div>
+        )}
       </section>
 
       {lightboxUrl && (

@@ -49,7 +49,6 @@ async function getReadyServiceWorkerRegistration(timeoutMs = 6000): Promise<Serv
   ]);
 }
 
-const PROMPT_DISMISSED_KEY = 'mfx_push_invite_dismissed_v1';
 const SIGNALS_MUTED_KEY = 'mfx_signals_muted_v1';
 
 export function isSignalsMuted(): boolean {
@@ -99,30 +98,6 @@ export function isStandalonePWA(): boolean {
     window.matchMedia('(display-mode: standalone)').matches ||
     (window.navigator as unknown as { standalone?: boolean }).standalone === true
   );
-}
-
-export function isNotificationPromptDismissed(): boolean {
-  try {
-    return localStorage.getItem(PROMPT_DISMISSED_KEY) === '1';
-  } catch {
-    return false;
-  }
-}
-
-export function dismissNotificationPrompt(): void {
-  try {
-    localStorage.setItem(PROMPT_DISMISSED_KEY, '1');
-  } catch {
-    // ignore storage errors
-  }
-}
-
-export function clearNotificationPromptDismissal(): void {
-  try {
-    localStorage.removeItem(PROMPT_DISMISSED_KEY);
-  } catch {
-    // ignore storage errors
-  }
 }
 
 export function isPushSupported(): boolean {
@@ -317,7 +292,6 @@ export async function subscribeToPushNotifications(
       }),
     });
 
-    clearNotificationPromptDismissal();
     return { ok: true, permission, prefs: res.prefs };
   } catch (err) {
     return {

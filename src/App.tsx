@@ -1,7 +1,6 @@
 import React from 'react';
 import { PlatformProvider, usePlatform } from './context/PlatformContext';
 import { Layout } from './components/Layout';
-import { NotificationPromptModal } from './components/NotificationPromptModal';
 import { PWAInstallBanner } from './components/PWAInstallBanner';
 import { HomePage } from './pages/HomePage';
 import {
@@ -64,7 +63,7 @@ const ProtectedRoute: React.FC<{
 };
 
 const RouteView: React.FC = () => {
-  const { route, user, authLoading, showNotifModal, setShowNotifModal } = usePlatform();
+  const { route, user, authLoading } = usePlatform();
 
   if (route === '/admin') {
     return <AdminPage />;
@@ -119,10 +118,6 @@ const RouteView: React.FC = () => {
     <>
       <Layout>{renderPage()}</Layout>
       <PWAInstallBanner />
-      <NotificationPromptModal
-        open={showNotifModal}
-        onClose={() => setShowNotifModal(false)}
-      />
     </>
   );
 };

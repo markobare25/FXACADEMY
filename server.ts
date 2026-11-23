@@ -69,6 +69,15 @@ import {
   type PushCategory,
   type PushTargetGroup,
 } from './server/push.ts';
+import {
+  deleteRemoteSignalMessage,
+  ensureRemoteHydrated,
+  fetchRemoteSignalMessageById,
+  syncMarketUpdateToRemote,
+  syncPushSubscriptionToRemote,
+  syncSignalMessageToRemote,
+  syncSignalReactionToRemote,
+} from './server/persistentStore.ts';
 import { getEconomicCalendar, getMarketCandles, getMarketQuotes } from './server/markets.ts';
 import type {
   NotificationPreferences,
@@ -257,6 +266,16 @@ setPushWsBroadcaster(broadcastWs);
 
 app.use(express.json({ limit: '4mb' }));
 app.use(express.urlencoded({ extended: true, limit: '4mb' }));
+
+// Ensure persistent remote store is hydrated before handling API requests on cold starts
+app.use('/api', async (_req: Request, _res: Response, next: NextFunction) => {
+  try {
+    await ensureRemoteHydrated();
+  } catch {
+    // Fall back cleanly to local SQLite if remote store is unavailable
+  }
+  next();
+});
 
 // Serve uploaded media/PDFs
 app.use('/uploads', express.static(UPLOAD_DIR));
@@ -1197,20 +1216,23 @@ function hydrateSignalMessages(rows: Array<Record<string, unknown>>, actorKey?: 
     .all(...messageIds) as Array<{ message_id: string; reaction: SignalReactionType; cnt: number }>;
 
   const reactMap = new Map<string, SignalReactionsMap>();
-  for (const row of rows) {
-    reactMap.set(String(row.id), {
-      love: Number(row.seed_love || 0),
-      like: Number(row.seed_like || 0),
-      fire: Number(row.seed_fire || 0),
-      hundred: Number(row.seed_hundred || 0),
-    });
-  }
+  const actorMap = new Map<string, SignalReactionsMap>();
   for (const r of reactRows) {
-    const cur = reactMap.get(r.message_id) || emptyReactions();
+    const cur = actorMap.get(r.message_id) || emptyReactions();
     if (REACTION_TYPES.includes(r.reaction)) {
       cur[r.reaction] += r.cnt;
     }
-    reactMap.set(r.message_id, cur);
+    actorMap.set(r.message_id, cur);
+  }
+  for (const row of rows) {
+    const id = String(row.id);
+    const actor = actorMap.get(id) || emptyReactions();
+    reactMap.set(id, {
+      love: Math.max(Number(row.love_count || 0), Number(row.seed_love || 0) + actor.love),
+      like: Math.max(Number(row.like_count || 0), Number(row.seed_like || 0) + actor.like),
+      fire: Math.max(Number(row.fire_count || 0), Number(row.seed_fire || 0) + actor.fire),
+      hundred: Math.max(Number(row.hundred_count || 0), Number(row.seed_hundred || 0) + actor.hundred),
+    });
   }
 
   const userReactMap = new Map<string, SignalReactionType>();
@@ -1318,8 +1340,9 @@ function publishMirrorToSignalChannel(params: {
     `INSERT OR IGNORE INTO signal_messages (
       id, author_id, author_name, content, image_url, image_name,
       media_url, media_type, media_name, message_type, priority, status, pinned,
-      source_type, source_id, seed_love, seed_like, seed_fire, seed_hundred, seed_views, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      source_type, source_id, seed_love, seed_like, seed_fire, seed_hundred,
+      love_count, like_count, fire_count, hundred_count, seed_views, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     id,
     authorId,
@@ -1339,6 +1362,10 @@ function publishMirrorToSignalChannel(params: {
     seeds.like,
     seeds.fire,
     seeds.hundred,
+    seeds.love,
+    seeds.like,
+    seeds.fire,
+    seeds.hundred,
     views,
     createdAt
   );
@@ -1350,6 +1377,7 @@ function publishMirrorToSignalChannel(params: {
 
   const hydrated = hydrateSignalMessages([row], null)[0];
   broadcastSignalChatEvent('signals_chat:created', hydrated);
+  void syncSignalMessageToRemote(String(row.id));
   return { message: hydrated, created: String(row.id) === id };
 }
 
@@ -1621,11 +1649,20 @@ function handleSignalsStream(req: Request, res: Response): void {
 app.get('/api/signals/stream', handleSignalsStream);
 app.get('/api/signals/messages/stream', handleSignalsStream);
 
-app.get('/api/signals/messages/:id', optionalAuth, (req: AuthRequest, res: Response) => {
+app.get('/api/signals/messages/:id', optionalAuth, async (req: AuthRequest, res: Response) => {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
-  const row = db
+  const lookupId = String(req.params.id || '').trim();
+  let row = db
     .prepare('SELECT * FROM signal_messages WHERE id = ? OR source_id = ? LIMIT 1')
-    .get(req.params.id, req.params.id) as Record<string, unknown> | undefined;
+    .get(lookupId, lookupId) as Record<string, unknown> | undefined;
+  if (!row) {
+    const recovered = await fetchRemoteSignalMessageById(lookupId);
+    if (recovered) {
+      row = db
+        .prepare('SELECT * FROM signal_messages WHERE id = ? OR source_id = ? LIMIT 1')
+        .get(lookupId, lookupId) as Record<string, unknown> | undefined;
+    }
+  }
   if (!row) {
     res.status(404).json({ error: 'Message not found.' });
     return;
@@ -1717,8 +1754,9 @@ app.post('/api/signals/messages', requireRole('admin'), async (req: AuthRequest,
     `INSERT INTO signal_messages (
       id, author_id, author_name, content, image_url, image_name,
       media_url, media_type, media_name, message_type, priority, status, pinned,
-      seed_love, seed_like, seed_fire, seed_hundred, seed_views, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      seed_love, seed_like, seed_fire, seed_hundred,
+      love_count, like_count, fire_count, hundred_count, seed_views, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     id,
     req.user!.id,
@@ -1737,9 +1775,15 @@ app.post('/api/signals/messages', requireRole('admin'), async (req: AuthRequest,
     seeds.like,
     seeds.fire,
     seeds.hundred,
+    seeds.love,
+    seeds.like,
+    seeds.fire,
+    seeds.hundred,
     views,
     now
   );
+
+  await syncSignalMessageToRemote(id);
 
   const row = db.prepare('SELECT * FROM signal_messages WHERE id = ?').get(id) as Record<string, unknown>;
   const hydrated = hydrateSignalMessages([row], `user:${req.user!.id}`)[0];
@@ -1884,6 +1928,26 @@ app.patch('/api/signals/messages/:id', requireRole('admin'), async (req: AuthReq
         ? generateSeededViews(nextSeeds.love + nextSeeds.like + nextSeeds.fire + nextSeeds.hundred)
         : 0;
 
+  const actorCountRows = db
+    .prepare(
+      `SELECT reaction, COUNT(*) as cnt
+       FROM signal_message_reactions
+       WHERE message_id = ?
+       GROUP BY reaction`
+    )
+    .all(req.params.id) as Array<{ reaction: SignalReactionType; cnt: number }>;
+  const actorTotals: SignalReactionsMap = {
+    love: nextSeeds.love,
+    like: nextSeeds.like,
+    fire: nextSeeds.fire,
+    hundred: nextSeeds.hundred,
+  };
+  for (const r of actorCountRows) {
+    if (REACTION_TYPES.includes(r.reaction)) {
+      actorTotals[r.reaction] += r.cnt;
+    }
+  }
+
   db.prepare(
     `UPDATE signal_messages SET
       content = ?,
@@ -1903,6 +1967,10 @@ app.patch('/api/signals/messages/:id', requireRole('admin'), async (req: AuthReq
       seed_like = ?,
       seed_fire = ?,
       seed_hundred = ?,
+      love_count = ?,
+      like_count = ?,
+      fire_count = ?,
+      hundred_count = ?,
       seed_views = ?,
       created_at = ?
      WHERE id = ?`
@@ -1924,10 +1992,16 @@ app.patch('/api/signals/messages/:id', requireRole('admin'), async (req: AuthReq
     nextSeeds.like,
     nextSeeds.fire,
     nextSeeds.hundred,
+    actorTotals.love,
+    actorTotals.like,
+    actorTotals.fire,
+    actorTotals.hundred,
     nextSeedViews,
     nextCreatedAt,
     req.params.id
   );
+
+  await syncSignalMessageToRemote(String(req.params.id));
 
   const updatedRow = db.prepare('SELECT * FROM signal_messages WHERE id = ?').get(req.params.id) as Record<
     string,
@@ -1966,7 +2040,7 @@ app.patch('/api/signals/messages/:id', requireRole('admin'), async (req: AuthReq
   res.json({ message: hydrated, push_job: pushJob });
 });
 
-app.delete('/api/signals/messages/:id', requireRole('admin'), (req: AuthRequest, res: Response) => {
+app.delete('/api/signals/messages/:id', requireRole('admin'), async (req: AuthRequest, res: Response) => {
   if (req.user!.email.toLowerCase() !== DESIGNATED_ADMIN_EMAIL) {
     res.status(403).json({ error: 'Only the designated administrator can delete signal channel messages.' });
     return;
@@ -1976,11 +2050,12 @@ app.delete('/api/signals/messages/:id', requireRole('admin'), (req: AuthRequest,
     res.status(404).json({ error: 'Message not found.' });
     return;
   }
+  await deleteRemoteSignalMessage(String(req.params.id));
   broadcastSignalChatEvent('signals_chat:deleted', { id: req.params.id });
   res.json({ ok: true });
 });
 
-function handleSignalMessageReaction(req: AuthRequest, res: Response): void {
+async function handleSignalMessageReaction(req: AuthRequest, res: Response): Promise<void> {
   const schema = z.object({
     reaction: z.enum(['love', 'like', 'fire', 'hundred']).nullable(),
   });
@@ -1991,7 +2066,7 @@ function handleSignalMessageReaction(req: AuthRequest, res: Response): void {
   }
 
   const targetId = String(req.params.id || '').trim();
-  const msg = db
+  let msg = db
     .prepare(
       `SELECT id, seed_love, seed_like, seed_fire, seed_hundred
        FROM signal_messages
@@ -2007,6 +2082,20 @@ function handleSignalMessageReaction(req: AuthRequest, res: Response): void {
         seed_hundred: number | null;
       }
     | undefined;
+
+  if (!msg && targetId) {
+    const recovered = await fetchRemoteSignalMessageById(targetId);
+    if (recovered) {
+      msg = db
+        .prepare(
+          `SELECT id, seed_love, seed_like, seed_fire, seed_hundred
+           FROM signal_messages
+           WHERE id = ? OR source_id = ?
+           LIMIT 1`
+        )
+        .get(targetId, targetId) as typeof msg;
+    }
+  }
 
   if (!msg) {
     res.status(404).json({ error: 'Message not found.' });
@@ -2024,57 +2113,78 @@ function handleSignalMessageReaction(req: AuthRequest, res: Response): void {
     return;
   }
 
-  const existing = db
-    .prepare('SELECT reaction FROM signal_message_reactions WHERE message_id = ? AND actor_key = ?')
-    .get(msg.id, actor.actorKey) as { reaction: SignalReactionType } | undefined;
+  const reactTx = db.transaction(() => {
+    const existing = db
+      .prepare('SELECT reaction FROM signal_message_reactions WHERE message_id = ? AND actor_key = ?')
+      .get(msg!.id, actor.actorKey) as { reaction: SignalReactionType } | undefined;
 
-  let nextUserReaction: SignalReactionType | null = null;
-  if (parsed.data.reaction === null || (existing && existing.reaction === parsed.data.reaction)) {
-    db.prepare('DELETE FROM signal_message_reactions WHERE message_id = ? AND actor_key = ?').run(
-      msg.id,
-      actor.actorKey
-    );
-    nextUserReaction = null;
-  } else {
-    db.prepare(
-      `INSERT INTO signal_message_reactions (message_id, actor_key, user_id, visitor_id, reaction, created_at)
-       VALUES (?, ?, ?, ?, ?, ?)
-       ON CONFLICT(message_id, actor_key) DO UPDATE SET
-         user_id = COALESCE(excluded.user_id, signal_message_reactions.user_id),
-         visitor_id = COALESCE(excluded.visitor_id, signal_message_reactions.visitor_id),
-         reaction = excluded.reaction,
-         created_at = excluded.created_at`
-    ).run(
-      msg.id,
-      actor.actorKey,
-      actor.userId,
-      actor.visitorId,
-      parsed.data.reaction,
-      new Date().toISOString()
-    );
-    nextUserReaction = parsed.data.reaction;
-  }
-
-  const counts = db
-    .prepare(
-      `SELECT reaction, COUNT(*) as cnt
-       FROM signal_message_reactions
-       WHERE message_id = ?
-       GROUP BY reaction`
-    )
-    .all(msg.id) as Array<{ reaction: SignalReactionType; cnt: number }>;
-
-  const reactions: SignalReactionsMap = {
-    love: Number(msg.seed_love || 0),
-    like: Number(msg.seed_like || 0),
-    fire: Number(msg.seed_fire || 0),
-    hundred: Number(msg.seed_hundred || 0),
-  };
-  for (const c of counts) {
-    if (REACTION_TYPES.includes(c.reaction)) {
-      reactions[c.reaction] += c.cnt;
+    let nextUserReaction: SignalReactionType | null = null;
+    let action: 'upsert' | 'delete' = 'upsert';
+    if (parsed.data.reaction === null || (existing && existing.reaction === parsed.data.reaction)) {
+      db.prepare('DELETE FROM signal_message_reactions WHERE message_id = ? AND actor_key = ?').run(
+        msg!.id,
+        actor.actorKey
+      );
+      nextUserReaction = null;
+      action = 'delete';
+    } else {
+      db.prepare(
+        `INSERT INTO signal_message_reactions (message_id, actor_key, user_id, visitor_id, reaction, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(message_id, actor_key) DO UPDATE SET
+           user_id = COALESCE(excluded.user_id, signal_message_reactions.user_id),
+           visitor_id = COALESCE(excluded.visitor_id, signal_message_reactions.visitor_id),
+           reaction = excluded.reaction,
+           created_at = excluded.created_at`
+      ).run(
+        msg!.id,
+        actor.actorKey,
+        actor.userId,
+        actor.visitorId,
+        parsed.data.reaction,
+        new Date().toISOString()
+      );
+      nextUserReaction = parsed.data.reaction;
+      action = 'upsert';
     }
-  }
+
+    const counts = db
+      .prepare(
+        `SELECT reaction, COUNT(*) as cnt
+         FROM signal_message_reactions
+         WHERE message_id = ?
+         GROUP BY reaction`
+      )
+      .all(msg!.id) as Array<{ reaction: SignalReactionType; cnt: number }>;
+
+    const reactions: SignalReactionsMap = {
+      love: Number(msg!.seed_love || 0),
+      like: Number(msg!.seed_like || 0),
+      fire: Number(msg!.seed_fire || 0),
+      hundred: Number(msg!.seed_hundred || 0),
+    };
+    for (const c of counts) {
+      if (REACTION_TYPES.includes(c.reaction)) {
+        reactions[c.reaction] += c.cnt;
+      }
+    }
+
+    // Permanently save updated reaction totals on the message row in the database
+    db.prepare(
+      `UPDATE signal_messages
+       SET love_count = ?, like_count = ?, fire_count = ?, hundred_count = ?
+       WHERE id = ?`
+    ).run(reactions.love, reactions.like, reactions.fire, reactions.hundred, msg!.id);
+
+    return { reactions, nextUserReaction, action };
+  });
+
+  const { reactions, nextUserReaction, action } = reactTx();
+
+  await Promise.all([
+    syncSignalReactionToRemote(msg.id, actor.actorKey, action),
+    syncSignalMessageToRemote(msg.id),
+  ]);
 
   const viewerKey = hashActorKey(actor.actorKey);
   broadcastSignalChatEvent('signals_chat:reacted', {
@@ -2596,6 +2706,8 @@ app.post('/api/updates', requireRole('admin'), async (req: AuthRequest, res: Res
   >;
   const hydrated = hydrateUpdates([row], req.user!.id)[0];
 
+  await syncMarketUpdateToRemote(id);
+
   let pushJob = null;
   let mirroredMsg = null;
 
@@ -2634,11 +2746,7 @@ app.post('/api/updates', requireRole('admin'), async (req: AuthRequest, res: Res
         title: `${isPremium ? '[Premium] ' : ''}${d.category}: ${d.title}`,
         body: d.content.slice(0, 140),
         category: isAnnouncement ? 'announcements' : 'market_updates',
-        linkUrl: isPremium
-          ? '/updates'
-          : mirrored
-            ? `/signals?message=${mirrored.message.id}`
-            : '/signals',
+        linkUrl: '/updates',
         signalMessageId: mirrored?.message.id || null,
         imageUrl: d.image_url || null,
         targetGroup: isPremium ? 'registered' : 'all',
@@ -2657,7 +2765,7 @@ app.post('/api/updates', requireRole('admin'), async (req: AuthRequest, res: Res
   });
 });
 
-app.patch('/api/updates/:id', requireRole('admin'), (req: AuthRequest, res: Response) => {
+app.patch('/api/updates/:id', requireRole('admin'), async (req: AuthRequest, res: Response) => {
   const existing = db.prepare('SELECT * FROM market_updates WHERE id = ?').get(req.params.id) as
     | Record<string, unknown>
     | undefined;
@@ -2674,11 +2782,19 @@ app.patch('/api/updates/:id', requireRole('admin'), (req: AuthRequest, res: Resp
   const d = parsed.data;
   const now = new Date().toISOString();
   const nextIsPremium = d.is_premium !== undefined ? Boolean(d.is_premium) : Boolean(existing.is_premium);
+  const wasPublished = Boolean(existing.published);
+  const nextScheduledAt =
+    d.scheduled_at !== undefined ? d.scheduled_at || null : (existing.scheduled_at as string | null);
+  const stillScheduledFuture = Boolean(
+    nextScheduledAt && new Date(nextScheduledAt).getTime() > Date.now()
+  );
+  const nextPublished = wasPublished ? 1 : stillScheduledFuture ? 0 : 1;
 
   db.prepare(
     `UPDATE market_updates SET
       title = ?, content = ?, category = ?, pinned = ?, is_premium = ?, image_url = ?,
-      video_url = ?, attachment_url = ?, attachment_name = ?, external_link = ?, updated_at = ?
+      video_url = ?, attachment_url = ?, attachment_name = ?, external_link = ?,
+      scheduled_at = ?, published = ?, updated_at = ?
      WHERE id = ?`
   ).run(
     d.title ?? existing.title,
@@ -2691,16 +2807,68 @@ app.patch('/api/updates/:id', requireRole('admin'), (req: AuthRequest, res: Resp
     d.attachment_url !== undefined ? d.attachment_url : existing.attachment_url,
     d.attachment_name !== undefined ? d.attachment_name : existing.attachment_name,
     d.external_link !== undefined ? d.external_link : existing.external_link,
+    nextScheduledAt,
+    nextPublished,
     now,
     req.params.id
   );
+
+  await syncMarketUpdateToRemote(String(req.params.id));
 
   const row = db.prepare('SELECT * FROM market_updates WHERE id = ?').get(req.params.id) as Record<
     string,
     unknown
   >;
   const hydrated = hydrateUpdates([row], req.user!.id)[0];
-  if (!nextIsPremium) {
+
+  if (!wasPublished && nextPublished === 1) {
+    if (!nextIsPremium) {
+      broadcastWs('update:created', hydrated);
+    }
+    const nextCategory = String(row.category || 'Forex Update');
+    const nextTitle = String(row.title || '');
+    const nextContent = String(row.content || '');
+    const nextExternalLink = row.external_link ? String(row.external_link) : null;
+    const nextImageUrl = row.image_url ? String(row.image_url) : null;
+    const isAnnouncement =
+      nextCategory === 'Platform Announcement' || nextCategory === 'Risk Warning';
+    const mirrorContent = [
+      `${nextCategory}: ${nextTitle}`,
+      nextContent,
+      nextExternalLink ? `Reference: ${nextExternalLink}` : '',
+    ]
+      .filter(Boolean)
+      .join('\n\n');
+    const mirrored = !nextIsPremium
+      ? publishMirrorToSignalChannel({
+          sourceType: 'market_update',
+          sourceId: String(req.params.id),
+          authorId: req.user!.id,
+          authorName: req.user!.name,
+          messageType: isAnnouncement ? 'announcement' : 'update',
+          content: mirrorContent,
+          imageUrl: nextImageUrl,
+          imageName: nextTitle,
+          pinned: Boolean(row.pinned),
+          createdAt: now,
+        })
+      : null;
+
+    if (d.send_push !== false) {
+      await dispatchNotification({
+        title: `${nextIsPremium ? '[Premium] ' : ''}${nextCategory}: ${nextTitle}`,
+        body: nextContent.slice(0, 140),
+        category: isAnnouncement ? 'announcements' : 'market_updates',
+        linkUrl: '/updates',
+        signalMessageId: mirrored?.message.id || null,
+        imageUrl: nextImageUrl,
+        targetGroup: nextIsPremium ? 'registered' : 'all',
+        publishedAt: now,
+        dedupKey: `market_update:${String(req.params.id)}`,
+        broadcastWs,
+      });
+    }
+  } else if (!nextIsPremium) {
     broadcastWs('update:updated', hydrated);
   }
   res.json({ update: hydrated });
@@ -4119,7 +4287,7 @@ function parseDeviceMetadata(ua: string, explicitPlatform?: string): {
   };
 }
 
-app.post('/api/push/subscribe', optionalAuth, rateLimit(30, 60_000), (req: AuthRequest, res: Response) => {
+app.post('/api/push/subscribe', optionalAuth, rateLimit(30, 60_000), async (req: AuthRequest, res: Response) => {
   const schema = z.object({
     endpoint: z.string().url().refine(isAllowedPushEndpointUrl, 'Invalid push endpoint protocol.'),
     keys: z.object({
@@ -4208,6 +4376,8 @@ app.post('/api/push/subscribe', optionalAuth, rateLimit(30, 60_000), (req: AuthR
     now,
     now
   );
+
+  await syncPushSubscriptionToRemote(parsed.data.endpoint);
 
   const subRow = db
     .prepare('SELECT id FROM push_subscriptions WHERE endpoint = ?')
@@ -4360,7 +4530,7 @@ app.get('/api/push/preferences', optionalAuth, (req: AuthRequest, res: Response)
   res.json({ prefs, subscribed: Boolean(row && row.active !== 0) });
 });
 
-app.patch('/api/push/preferences', optionalAuth, (req: AuthRequest, res: Response) => {
+app.patch('/api/push/preferences', optionalAuth, async (req: AuthRequest, res: Response) => {
   const schema = z.object({
     endpoint: z.string().url().optional(),
     prefs: pushPrefsSchema,
@@ -4405,6 +4575,7 @@ app.patch('/api/push/preferences', optionalAuth, (req: AuthRequest, res: Respons
     db.prepare(
       'UPDATE push_subscriptions SET prefs_json = ?, sound_enabled = ?, updated_at = ? WHERE endpoint = ?'
     ).run(prefsJson, soundVal, now, parsed.data.endpoint);
+    await syncPushSubscriptionToRemote(parsed.data.endpoint);
   }
   if (req.user) {
     db.prepare('UPDATE users SET notification_prefs = ? WHERE id = ?').run(prefsJson, req.user.id);
@@ -4947,22 +5118,24 @@ app.post(
   }
 );
 
-app.post('/api/support/conversations', rateLimit(10, 60_000), async (req: AuthRequest, res: Response) => {
+app.post('/api/support/conversations', optionalAuth, rateLimit(10, 60_000), async (req: AuthRequest, res: Response) => {
   const schema = z.object({
-    visitor_name: z.string().trim().min(2, 'Please enter your name.').max(100),
+    visitor_name: z.string().trim().max(100).optional(),
     visitor_email: z.union([z.string().trim().email().max(160), z.literal('')]).optional(),
     visitor_phone: z.string().trim().max(40).optional(),
     initial_message: z.string().trim().max(4000).optional(),
     attachment_url: z.string().max(500).optional().nullable(),
     attachment_name: z.string().max(200).optional().nullable(),
   });
-  const parsed = schema.safeParse(req.body);
+  const parsed = schema.safeParse(req.body || {});
   if (!parsed.success) {
     res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid chat enquiry details.' });
     return;
   }
 
   const d = parsed.data;
+  const resolvedVisitorName = (d.visitor_name || req.user?.name || 'Visitor').trim() || 'Visitor';
+  const resolvedVisitorEmail = d.visitor_email ? d.visitor_email.toLowerCase() : req.user?.email || null;
   const now = new Date().toISOString();
   const id = crypto.randomUUID();
   const referenceCode = generateUniqueRefCode('MFX-CHAT', 'support_conversations');
@@ -4986,8 +5159,8 @@ app.post('/api/support/conversations', rateLimit(10, 60_000), async (req: AuthRe
   ).run(
     id,
     referenceCode,
-    d.visitor_name,
-    d.visitor_email ? d.visitor_email.toLowerCase() : null,
+    resolvedVisitorName,
+    resolvedVisitorEmail,
     d.visitor_phone?.trim() || null,
     actor?.visitorId || null,
     tokenHash,
@@ -5009,7 +5182,7 @@ app.post('/api/support/conversations', rateLimit(10, 60_000), async (req: AuthRe
     ).run(
       msgId,
       id,
-      d.visitor_name,
+      resolvedVisitorName,
       initialMsg,
       d.attachment_url || null,
       d.attachment_name || null,
@@ -6317,15 +6490,13 @@ if (!process.env.VERCEL) {
             })
           : null;
 
+        await syncMarketUpdateToRemote(uid);
+
         await dispatchNotification({
           title: `${isPremium ? '[Premium] ' : ''}${category}: ${String(u.title)}`,
           body: String(u.content).slice(0, 140),
           category: isAnnouncement ? 'announcements' : 'market_updates',
-          linkUrl: isPremium
-            ? '/updates'
-            : mirrored
-              ? `/signals?message=${mirrored.message.id}`
-              : '/signals',
+          linkUrl: '/updates',
           signalMessageId: mirrored?.message.id || null,
           imageUrl: u.image_url ? String(u.image_url) : null,
           targetGroup: isPremium ? 'registered' : 'all',

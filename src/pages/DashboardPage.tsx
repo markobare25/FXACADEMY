@@ -3,27 +3,22 @@ import {
   ArrowDownRight,
   ArrowRight,
   ArrowUpRight,
-  BellRing,
   BookOpen,
   Bookmark,
   CandlestickChart,
-  CheckCircle2,
   ShieldCheck,
   TrendingUp,
 } from 'lucide-react';
 import { usePlatform } from '../context/PlatformContext';
 import { apiFetch, formatLocalDateTime, formatRelativeTime } from '../lib/api';
-import { getCurrentPushSubscription } from '../lib/pushClient';
 import { PWAInstallButton } from '../components/PWAInstallButton';
 import type { MarketInstrument } from '../types';
 
 export const DashboardPage: React.FC = () => {
-  const { user, authLoading, signals, updates, courses, navigate, setShowNotifModal } = usePlatform();
+  const { user, authLoading, signals, updates, courses, navigate } = usePlatform();
   const [watchlistQuotes, setWatchlistQuotes] = useState<MarketInstrument[]>([]);
-  const [pushActive, setPushActive] = useState(false);
 
   useEffect(() => {
-    getCurrentPushSubscription().then((sub) => setPushActive(Boolean(sub)));
     apiFetch<{ instruments: MarketInstrument[] }>('/api/markets')
       .then((res) => setWatchlistQuotes(res.instruments))
       .catch(() => undefined);
@@ -84,16 +79,6 @@ export const DashboardPage: React.FC = () => {
         </div>
         <div className="flex flex-wrap items-center gap-2.5">
           <PWAInstallButton variant="compact" label="INSTALL APP" />
-          {!pushActive && (
-            <button
-              type="button"
-              onClick={() => setShowNotifModal(true)}
-              className="inline-flex items-center gap-2 rounded-lg bg-[#15803D] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#166534] transition-colors min-h-[40px]"
-            >
-              <BellRing className="w-4 h-4" />
-              <span>Enable Push Alerts</span>
-            </button>
-          )}
         </div>
       </div>
 
@@ -329,12 +314,6 @@ export const DashboardPage: React.FC = () => {
                     <span className="text-slate-500">{formatRelativeTime(u.created_at)}</span>
                   </button>
                 ))}
-              </div>
-            )}
-            {pushActive && (
-              <div className="mt-4 pt-3 border-t border-slate-100 dark:border-slate-800 flex items-center gap-2 text-xs text-emerald-600 dark:text-emerald-400">
-                <CheckCircle2 className="w-4 h-4 shrink-0" />
-                <span>Background push notifications enabled on this device.</span>
               </div>
             )}
           </div>

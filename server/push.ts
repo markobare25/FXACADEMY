@@ -1309,7 +1309,15 @@ export async function processPendingPushDeliveries(options?: {
                 payloadJson,
                 {
                   TTL: 86400,
-                  urgency: priority === 'urgent' ? 'high' : 'normal',
+                  urgency:
+                    priority === 'urgent' ||
+                    item.job_category === 'signals' ||
+                    item.job_category === 'signal_updates' ||
+                    item.job_category === 'signal_chat' ||
+                    item.job_category === 'market_updates' ||
+                    item.job_category === 'announcements'
+                      ? 'high'
+                      : 'normal',
                 }
               );
             }
