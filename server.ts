@@ -47,10 +47,13 @@ import {
   cleanupInactivePushSubscriptions,
   dispatchNotification,
   ensureVapidKeys,
+  getPushInfrastructureStatus,
   getPushJobSummary,
   listPushSubscriptions,
+  listRecentPushDeliveries,
   listRecentPushJobs,
   processPendingPushDeliveries,
+  recordPushReceipt,
   sendDirectTestPush,
   setPushWsBroadcaster,
   type PushCategory,
@@ -87,10 +90,35 @@ httpServer.on('upgrade', (request, socket, head) => {
 });
 
 const wsClients = new Set<WebSocket>();
+const wsAliveMap = new WeakMap<WebSocket, boolean>();
+
 wss.on('connection', (ws) => {
   wsClients.add(ws);
-  ws.send(JSON.stringify({ event: 'connected', data: { timestamp: new Date().toISOString(), online_count: wsClients.size } }));
+  wsAliveMap.set(ws, true);
+  ws.send(
+    JSON.stringify({
+      event: 'connected',
+      data: { timestamp: new Date().toISOString(), online_count: wsClients.size },
+    })
+  );
   broadcastWs('presence:update', { online_count: wsClients.size });
+
+  ws.on('pong', () => {
+    wsAliveMap.set(ws, true);
+  });
+
+  ws.on('message', (raw) => {
+    wsAliveMap.set(ws, true);
+    try {
+      const parsed = JSON.parse(String(raw)) as { event?: string };
+      if (parsed?.event === 'ping' && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ event: 'pong', data: { timestamp: new Date().toISOString() } }));
+      }
+    } catch {
+      // ignore non-JSON frames
+    }
+  });
+
   ws.on('close', () => {
     wsClients.delete(ws);
     broadcastWs('presence:update', { online_count: wsClients.size });
@@ -100,6 +128,23 @@ wss.on('connection', (ws) => {
     broadcastWs('presence:update', { online_count: wsClients.size });
   });
 });
+
+if (!process.env.VERCEL) {
+  setInterval(() => {
+    for (const client of wsClients) {
+      if (wsAliveMap.get(client) === false) {
+        wsClients.delete(client);
+        client.terminate();
+        broadcastWs('presence:update', { online_count: wsClients.size });
+        continue;
+      }
+      wsAliveMap.set(client, false);
+      if (client.readyState === WebSocket.OPEN) {
+        client.ping();
+      }
+    }
+  }, 25_000);
+}
 
 function broadcastWs(event: string, data: unknown): void {
   const payload = JSON.stringify({ event, data });
@@ -810,25 +855,41 @@ function hydrateSignalMessages(rows: Array<Record<string, unknown>>, actorKey?: 
     }
   }
 
-  return rows.map((row) => ({
-    id: String(row.id),
-    author_id: String(row.author_id),
-    author_name: String(row.author_name),
-    content: String(row.content || ''),
-    image_url: row.image_url ? String(row.image_url) : null,
-    image_name: row.image_name ? String(row.image_name) : null,
-    message_type: String(row.message_type || 'update'),
-    status: String(row.status || 'active'),
-    pinned: Boolean(row.pinned),
-    edited_at: row.edited_at ? String(row.edited_at) : null,
-    completed_at: row.completed_at ? String(row.completed_at) : null,
-    completed_summary: row.completed_summary ? String(row.completed_summary) : null,
-    source_type: row.source_type ? String(row.source_type) : null,
-    source_id: row.source_id ? String(row.source_id) : null,
-    created_at: String(row.created_at),
-    reactions: reactMap.get(String(row.id)) || emptyReactions(),
-    user_reaction: userReactMap.get(String(row.id)) || null,
-  }));
+  return rows.map((row) => {
+    const imgUrl = row.image_url ? String(row.image_url) : null;
+    const imgName = row.image_name ? String(row.image_name) : null;
+    const mediaUrl = row.media_url ? String(row.media_url) : imgUrl;
+    const mediaType = row.media_type
+      ? (String(row.media_type) as 'image' | 'video')
+      : imgUrl
+        ? 'image'
+        : null;
+    const mediaName = row.media_name ? String(row.media_name) : imgName;
+
+    return {
+      id: String(row.id),
+      author_id: String(row.author_id),
+      author_name: String(row.author_name),
+      content: String(row.content || ''),
+      image_url: mediaType === 'video' ? null : imgUrl || mediaUrl,
+      image_name: mediaType === 'video' ? null : imgName || mediaName,
+      media_url: mediaUrl,
+      media_type: mediaType,
+      media_name: mediaName,
+      message_type: String(row.message_type || 'update'),
+      priority: row.priority === 'urgent' ? 'urgent' : 'normal',
+      status: String(row.status || 'active'),
+      pinned: Boolean(row.pinned),
+      edited_at: row.edited_at ? String(row.edited_at) : null,
+      completed_at: row.completed_at ? String(row.completed_at) : null,
+      completed_summary: row.completed_summary ? String(row.completed_summary) : null,
+      source_type: row.source_type ? String(row.source_type) : null,
+      source_id: row.source_id ? String(row.source_id) : null,
+      created_at: String(row.created_at),
+      reactions: reactMap.get(String(row.id)) || emptyReactions(),
+      user_reaction: userReactMap.get(String(row.id)) || null,
+    };
+  });
 }
 
 function getDesignatedAdminIdentity(): { id: string; name: string } | null {
@@ -843,10 +904,14 @@ function publishMirrorToSignalChannel(params: {
   sourceId: string;
   authorId?: string;
   authorName?: string;
-  messageType: 'signal' | 'update' | 'analysis' | 'announcement';
+  messageType: 'signal' | 'setup' | 'update' | 'analysis' | 'announcement' | 'news';
+  priority?: 'normal' | 'urgent';
   content: string;
   imageUrl?: string | null;
   imageName?: string | null;
+  mediaUrl?: string | null;
+  mediaType?: 'image' | 'video' | null;
+  mediaName?: string | null;
   pinned?: boolean;
   createdAt?: string;
 }) {
@@ -866,20 +931,28 @@ function publishMirrorToSignalChannel(params: {
 
   const id = crypto.randomUUID();
   const createdAt = params.createdAt || new Date().toISOString();
+  const resolvedMediaUrl = params.mediaUrl || params.imageUrl || null;
+  const resolvedMediaType = params.mediaType || (params.imageUrl ? 'image' : null);
+  const resolvedMediaName = params.mediaName || params.imageName || null;
 
   db.prepare(
     `INSERT OR IGNORE INTO signal_messages (
       id, author_id, author_name, content, image_url, image_name,
-      message_type, status, pinned, source_type, source_id, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)`
+      media_url, media_type, media_name, message_type, priority, status, pinned,
+      source_type, source_id, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)`
   ).run(
     id,
     authorId,
-    params.authorName || adminIdentity?.name || 'MeridianFX',
+    params.authorName || adminIdentity?.name || 'MeridianFX Desk',
     params.content.trim(),
-    params.imageUrl || null,
-    params.imageName || null,
+    resolvedMediaType === 'video' ? null : resolvedMediaUrl,
+    resolvedMediaType === 'video' ? null : resolvedMediaName,
+    resolvedMediaUrl,
+    resolvedMediaType,
+    resolvedMediaName,
     params.messageType,
+    params.priority === 'urgent' ? 'urgent' : 'normal',
     params.pinned ? 1 : 0,
     params.sourceType,
     params.sourceId,
@@ -896,33 +969,43 @@ function publishMirrorToSignalChannel(params: {
   return { message: hydrated, created: String(row.id) === id };
 }
 
-function mapMessageTypeToPushCategory(_messageType: string): PushCategory {
+function mapMessageTypeToPushCategory(messageType: string): PushCategory {
+  if (messageType === 'signal' || messageType === 'setup') return 'signals';
+  if (messageType === 'news') return 'market_updates';
+  if (messageType === 'announcement') return 'announcements';
   return 'signal_chat';
 }
 
 function buildSignalChannelPushPreview(
   messageType: string,
   content: string,
-  hasImage: boolean,
+  mediaType: 'image' | 'video' | null,
   authorName?: string
 ): string {
   const label =
     messageType === 'signal'
       ? 'Signal'
-      : messageType === 'analysis'
-        ? 'Analysis'
-        : messageType === 'announcement'
-          ? 'Announcement'
-          : 'Desk';
+      : messageType === 'setup'
+        ? 'Trade Setup'
+        : messageType === 'analysis'
+          ? 'Chart Analysis'
+          : messageType === 'news'
+            ? 'News Alert'
+            : messageType === 'announcement'
+              ? 'Announcement'
+              : 'Desk Update';
   const sender = (authorName || 'MeridianFX').trim();
   const snippet = content.replace(/\s+/g, ' ').trim();
   if (snippet) {
-    return `${sender} (${label}): ${snippet.slice(0, 160)}`;
+    return `${sender} (${label}): ${snippet.slice(0, 175)}`;
   }
-  if (hasImage) {
-    return `${sender} (${label}): Shared a new chart image in Signal Chat.`;
+  if (mediaType === 'video') {
+    return `${sender} (${label}): Shared a new video briefing in Signal Channel.`;
   }
-  return `${sender} (${label}): New message posted in Signal Chat.`;
+  if (mediaType === 'image') {
+    return `${sender} (${label}): Shared a new chart image in Signal Channel.`;
+  }
+  return `${sender} (${label}): New message posted in Signal Channel.`;
 }
 
 app.get('/api/signals/messages', optionalAuth, (req: AuthRequest, res: Response) => {
@@ -947,6 +1030,7 @@ app.get('/api/signals/messages', optionalAuth, (req: AuthRequest, res: Response)
   const limitRaw = Number(req.query.limit || 40);
   const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(Math.floor(limitRaw), 1), 100) : 40;
   const before = typeof req.query.before === 'string' && req.query.before.trim() ? req.query.before.trim() : null;
+  const after = typeof req.query.after === 'string' && req.query.after.trim() ? req.query.after.trim() : null;
   const search = typeof req.query.search === 'string' && req.query.search.trim() ? req.query.search.trim() : null;
 
   const orderCol = status === 'completed' ? 'COALESCE(completed_at, created_at)' : 'created_at';
@@ -956,6 +1040,10 @@ app.get('/api/signals/messages', optionalAuth, (req: AuthRequest, res: Response)
   if (before) {
     conditions.push(`${orderCol} < ?`);
     params.push(before);
+  }
+  if (after) {
+    conditions.push(`${orderCol} > ?`);
+    params.push(after);
   }
   if (search) {
     conditions.push('(LOWER(content) LIKE ? OR LOWER(COALESCE(completed_summary, \'\')) LIKE ?)');
@@ -967,14 +1055,14 @@ app.get('/api/signals/messages', optionalAuth, (req: AuthRequest, res: Response)
     .prepare(
       `SELECT * FROM signal_messages
        WHERE ${conditions.join(' AND ')}
-       ORDER BY ${orderCol} DESC
+       ORDER BY ${orderCol} ${after ? 'ASC' : 'DESC'}
        LIMIT ?`
     )
     .all(...params, limit + 1) as Array<Record<string, unknown>>;
 
   const hasMore = rows.length > limit;
   const sliced = hasMore ? rows.slice(0, limit) : rows;
-  const ordered = status === 'active' ? sliced.reverse() : sliced;
+  const ordered = after ? sliced : status === 'active' ? sliced.reverse() : sliced;
 
   const pinnedRows =
     status === 'active'
@@ -992,6 +1080,11 @@ app.get('/api/signals/messages', optionalAuth, (req: AuthRequest, res: Response)
   const draftCount = isAdmin
     ? (db.prepare("SELECT COUNT(*) as c FROM signal_messages WHERE status = 'draft'").get() as { c: number }).c
     : 0;
+  const subscriberCount = (
+    db
+      .prepare('SELECT COUNT(*) as c FROM push_subscriptions WHERE COALESCE(active, 1) = 1')
+      .get() as { c: number }
+  ).c;
 
   const actor = resolveReactionActor(req, res, false);
 
@@ -1005,7 +1098,9 @@ app.get('/api/signals/messages', optionalAuth, (req: AuthRequest, res: Response)
       draft: draftCount,
     },
     online_count: wsClients.size,
+    subscriber_count: subscriberCount,
     viewer_key: actor ? hashActorKey(actor.actorKey) : null,
+    server_time: new Date().toISOString(),
   });
 });
 
@@ -1037,15 +1132,24 @@ const signalMessageCreateSchema = z
     content: z.string().max(8000).optional().default(''),
     image_url: z.string().max(500).optional().nullable(),
     image_name: z.string().max(250).optional().nullable(),
-    message_type: z.enum(['signal', 'update', 'analysis', 'announcement']).default('update'),
+    media_url: z.string().max(500).optional().nullable(),
+    media_type: z.enum(['image', 'video']).optional().nullable(),
+    media_name: z.string().max(250).optional().nullable(),
+    message_type: z
+      .enum(['signal', 'setup', 'update', 'analysis', 'announcement', 'news'])
+      .default('update'),
+    priority: z.enum(['normal', 'urgent']).default('normal'),
     status: z.enum(['active', 'draft']).default('active'),
     pinned: z.boolean().default(false),
     send_push: z.boolean().default(true),
     client_request_id: z.string().max(80).optional(),
   })
-  .refine((d) => d.content.trim().length > 0 || Boolean(d.image_url), {
-    message: 'Enter a message or attach an image before sending.',
-  });
+  .refine(
+    (d) => d.content.trim().length > 0 || Boolean(d.media_url) || Boolean(d.image_url),
+    {
+      message: 'Enter a message or attach a media file before publishing.',
+    }
+  );
 
 app.post('/api/signals/messages', requireRole('admin'), async (req: AuthRequest, res: Response) => {
   if (req.user!.email.toLowerCase() !== DESIGNATED_ADMIN_EMAIL) {
@@ -1060,9 +1164,15 @@ app.post('/api/signals/messages', requireRole('admin'), async (req: AuthRequest,
 
   const d = parsed.data;
   const trimmedContent = d.content.trim();
+  const resolvedMediaUrl = d.media_url || d.image_url || null;
+  const resolvedMediaType: 'image' | 'video' | null = resolvedMediaUrl
+    ? d.media_type || (/\.(mp4|webm)(\?|$)/i.test(resolvedMediaUrl) ? 'video' : 'image')
+    : null;
+  const resolvedMediaName = d.media_name || d.image_name || null;
+
   const dedupKey = d.client_request_id
     ? `req:${req.user!.id}:${d.client_request_id}`
-    : `msg:${req.user!.id}:${d.status}:${trimmedContent}:${d.image_url || ''}`;
+    : `msg:${req.user!.id}:${d.status}:${trimmedContent}:${resolvedMediaUrl || ''}`;
   const lastSentAt = recentSignalChatDedup.get(dedupKey);
   if (lastSentAt && Date.now() - lastSentAt < 5000) {
     res.status(409).json({ error: 'Duplicate message submission ignored.' });
@@ -1080,16 +1190,20 @@ app.post('/api/signals/messages', requireRole('admin'), async (req: AuthRequest,
   db.prepare(
     `INSERT INTO signal_messages (
       id, author_id, author_name, content, image_url, image_name,
-      message_type, status, pinned, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      media_url, media_type, media_name, message_type, priority, status, pinned, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     id,
     req.user!.id,
     req.user!.name,
     trimmedContent,
-    d.image_url || null,
-    d.image_name || null,
+    resolvedMediaType === 'video' ? null : resolvedMediaUrl,
+    resolvedMediaType === 'video' ? null : resolvedMediaName,
+    resolvedMediaUrl,
+    resolvedMediaType,
+    resolvedMediaName,
     d.message_type,
+    d.priority,
     initialStatus,
     initialStatus === 'active' && d.pinned ? 1 : 0,
     now
@@ -1105,17 +1219,19 @@ app.post('/api/signals/messages', requireRole('admin'), async (req: AuthRequest,
     const preview = buildSignalChannelPushPreview(
       d.message_type,
       trimmedContent,
-      Boolean(d.image_url),
+      resolvedMediaType,
       req.user!.name
     );
     if (d.send_push !== false) {
+      const titlePrefix = d.priority === 'urgent' ? 'URGENT · ' : '';
       const dispatchRes = await dispatchNotification({
-        title: 'MeridianFX · Signal Chat',
+        title: `${titlePrefix}MeridianFX Signals`,
         body: preview,
         category: mapMessageTypeToPushCategory(d.message_type),
         linkUrl: `/signals?message=${id}`,
         signalMessageId: id,
-        imageUrl: d.image_url || null,
+        imageUrl: resolvedMediaType === 'image' ? resolvedMediaUrl : null,
+        priority: d.priority,
         publishedAt: now,
         dedupKey: `signal_message:${id}`,
         broadcastWs,
@@ -1131,7 +1247,13 @@ const signalMessagePatchSchema = z.object({
   content: z.string().max(8000).optional(),
   image_url: z.string().max(500).optional().nullable(),
   image_name: z.string().max(250).optional().nullable(),
-  message_type: z.enum(['signal', 'update', 'analysis', 'announcement']).optional(),
+  media_url: z.string().max(500).optional().nullable(),
+  media_type: z.enum(['image', 'video']).optional().nullable(),
+  media_name: z.string().max(250).optional().nullable(),
+  message_type: z
+    .enum(['signal', 'setup', 'update', 'analysis', 'announcement', 'news'])
+    .optional(),
+  priority: z.enum(['normal', 'urgent']).optional(),
   pinned: z.boolean().optional(),
   status: z.enum(['draft', 'active', 'completed']).optional(),
   completed_summary: z.string().max(1000).optional().nullable(),
@@ -1160,9 +1282,27 @@ app.patch('/api/signals/messages/:id', requireRole('admin'), async (req: AuthReq
   const d = parsed.data;
   const now = new Date().toISOString();
   const nextContent = d.content !== undefined ? d.content.trim() : String(existing.content || '');
-  const nextImageUrl = d.image_url !== undefined ? d.image_url : (existing.image_url as string | null);
-  if (!nextContent && !nextImageUrl) {
-    res.status(400).json({ error: 'Message cannot be empty without an image attachment.' });
+  const nextMediaUrl =
+    d.media_url !== undefined
+      ? d.media_url
+      : d.image_url !== undefined
+        ? d.image_url
+        : ((existing.media_url || existing.image_url) as string | null);
+  const nextMediaType: 'image' | 'video' | null = nextMediaUrl
+    ? d.media_type !== undefined
+      ? d.media_type
+      : ((existing.media_type as 'image' | 'video' | null) ||
+        (/\.(mp4|webm)(\?|$)/i.test(nextMediaUrl) ? 'video' : 'image'))
+    : null;
+  const nextMediaName =
+    d.media_name !== undefined
+      ? d.media_name
+      : d.image_name !== undefined
+        ? d.image_name
+        : ((existing.media_name || existing.image_name) as string | null);
+
+  if (!nextContent && !nextMediaUrl) {
+    res.status(400).json({ error: 'Message cannot be empty without a media attachment.' });
     return;
   }
 
@@ -1171,9 +1311,11 @@ app.patch('/api/signals/messages/:id', requireRole('admin'), async (req: AuthReq
   const publishingFromDraft = prevStatus === 'draft' && nextStatus === 'active';
 
   const contentEdited = d.content !== undefined && nextContent !== String(existing.content || '');
-  const imageEdited = d.image_url !== undefined && nextImageUrl !== existing.image_url;
+  const mediaEdited =
+    (d.media_url !== undefined || d.image_url !== undefined) &&
+    nextMediaUrl !== (existing.media_url || existing.image_url);
   const nextEditedAt =
-    !publishingFromDraft && (contentEdited || imageEdited) ? now : (existing.edited_at as string | null);
+    !publishingFromDraft && (contentEdited || mediaEdited) ? now : (existing.edited_at as string | null);
 
   let nextCompletedAt = existing.completed_at as string | null;
   let nextPinned = d.pinned !== undefined ? (d.pinned ? 1 : 0) : Number(existing.pinned || 0);
@@ -1188,13 +1330,18 @@ app.patch('/api/signals/messages/:id', requireRole('admin'), async (req: AuthReq
 
   const nextCreatedAt = publishingFromDraft ? now : String(existing.created_at);
   const nextType = d.message_type ?? String(existing.message_type || 'update');
+  const nextPriority = d.priority ?? (existing.priority === 'urgent' ? 'urgent' : 'normal');
 
   db.prepare(
     `UPDATE signal_messages SET
       content = ?,
       image_url = ?,
       image_name = ?,
+      media_url = ?,
+      media_type = ?,
+      media_name = ?,
       message_type = ?,
+      priority = ?,
       pinned = ?,
       status = ?,
       edited_at = ?,
@@ -1204,9 +1351,13 @@ app.patch('/api/signals/messages/:id', requireRole('admin'), async (req: AuthReq
      WHERE id = ?`
   ).run(
     nextContent,
-    nextImageUrl || null,
-    d.image_name !== undefined ? d.image_name : existing.image_name,
+    nextMediaType === 'video' ? null : nextMediaUrl || null,
+    nextMediaType === 'video' ? null : nextMediaName || null,
+    nextMediaUrl || null,
+    nextMediaType,
+    nextMediaName || null,
     nextType,
+    nextPriority,
     nextPinned,
     nextStatus,
     nextEditedAt,
@@ -1229,16 +1380,18 @@ app.patch('/api/signals/messages/:id', requireRole('admin'), async (req: AuthReq
       const preview = buildSignalChannelPushPreview(
         nextType,
         nextContent,
-        Boolean(nextImageUrl),
+        nextMediaType,
         String(existing.author_name || req.user!.name)
       );
+      const titlePrefix = nextPriority === 'urgent' ? 'URGENT · ' : '';
       const dispatchRes = await dispatchNotification({
-        title: 'MeridianFX · Signal Chat',
+        title: `${titlePrefix}MeridianFX Signals`,
         body: preview,
         category: mapMessageTypeToPushCategory(nextType),
         linkUrl: `/signals?message=${hydrated.id}`,
         signalMessageId: hydrated.id,
-        imageUrl: nextImageUrl || null,
+        imageUrl: nextMediaType === 'image' ? nextMediaUrl : null,
+        priority: nextPriority,
         publishedAt: nextCreatedAt,
         dedupKey: `signal_message:${hydrated.id}`,
         broadcastWs,
@@ -3342,6 +3495,40 @@ function isAllowedPushEndpointUrl(rawUrl: string): boolean {
   }
 }
 
+function parseDeviceMetadata(ua: string, explicitPlatform?: string): {
+  platform: 'android' | 'ios' | 'web';
+  browserName: string;
+  deviceLabel: string;
+} {
+  const lower = ua.toLowerCase();
+  const platform: 'android' | 'ios' | 'web' =
+    explicitPlatform === 'android' || explicitPlatform === 'ios' || explicitPlatform === 'web'
+      ? explicitPlatform
+      : explicitPlatform === 'desktop'
+        ? 'web'
+        : /android/.test(lower)
+          ? 'android'
+          : /iphone|ipad|ipod/.test(lower)
+            ? 'ios'
+            : 'web';
+
+  let browserName = 'Browser';
+  if (/edg\//i.test(ua)) browserName = 'Edge';
+  else if (/opr\//i.test(ua) || /opera/i.test(ua)) browserName = 'Opera';
+  else if (/samsungbrowser/i.test(ua)) browserName = 'Samsung Internet';
+  else if (/firefox|fxios/i.test(ua)) browserName = 'Firefox';
+  else if (/crios|chrome/i.test(ua)) browserName = 'Chrome';
+  else if (/safari/i.test(ua)) browserName = 'Safari';
+
+  const osLabel =
+    platform === 'android' ? 'Android' : platform === 'ios' ? 'iOS' : /mac/i.test(ua) ? 'macOS' : /win/i.test(ua) ? 'Windows' : /linux/i.test(ua) ? 'Linux' : 'Web';
+  return {
+    platform,
+    browserName,
+    deviceLabel: `${osLabel} · ${browserName}`,
+  };
+}
+
 app.post('/api/push/subscribe', optionalAuth, rateLimit(30, 60_000), (req: AuthRequest, res: Response) => {
   const schema = z.object({
     endpoint: z.string().url().refine(isAllowedPushEndpointUrl, 'Invalid push endpoint protocol.'),
@@ -3349,7 +3536,8 @@ app.post('/api/push/subscribe', optionalAuth, rateLimit(30, 60_000), (req: AuthR
       p256dh: z.string().min(10).max(512),
       auth: z.string().min(6).max(256),
     }),
-    platform: z.enum(['android', 'ios', 'desktop']).optional(),
+    platform: z.enum(['android', 'ios', 'web', 'desktop']).optional(),
+    browser_name: z.string().max(60).optional(),
     old_endpoint: z.string().url().optional(),
     prefs: pushPrefsSchema.optional(),
   });
@@ -3363,9 +3551,9 @@ app.post('/api/push/subscribe', optionalAuth, rateLimit(30, 60_000), (req: AuthR
   const visitorId = actor?.visitorId || null;
   const now = new Date().toISOString();
   const ua = String(req.headers['user-agent'] || '').slice(0, 250);
-  const platform =
-    parsed.data.platform ||
-    (/android/i.test(ua) ? 'android' : /iphone|ipad|ipod/i.test(ua) ? 'ios' : 'desktop');
+  const meta = parseDeviceMetadata(ua, parsed.data.platform);
+  const browserName = parsed.data.browser_name?.trim() || meta.browserName;
+  const deviceLabel = `${meta.platform === 'android' ? 'Android' : meta.platform === 'ios' ? 'iOS PWA' : 'Web'} · ${browserName}`;
 
   if (parsed.data.old_endpoint && parsed.data.old_endpoint !== parsed.data.endpoint) {
     db.prepare('UPDATE push_subscriptions SET active = 0, updated_at = ? WHERE endpoint = ?').run(
@@ -3388,8 +3576,9 @@ app.post('/api/push/subscribe', optionalAuth, rateLimit(30, 60_000), (req: AuthR
   db.prepare(
     `INSERT INTO push_subscriptions (
       id, user_id, visitor_id, endpoint, p256dh, auth, user_agent, platform,
+      transport, token, browser_name, device_label,
       prefs_json, sound_enabled, failure_count, active, last_error, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, NULL, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'web_push', NULL, ?, ?, ?, ?, 0, 1, NULL, ?, ?)
     ON CONFLICT(endpoint) DO UPDATE SET
       user_id = COALESCE(excluded.user_id, push_subscriptions.user_id),
       visitor_id = COALESCE(excluded.visitor_id, push_subscriptions.visitor_id),
@@ -3397,6 +3586,9 @@ app.post('/api/push/subscribe', optionalAuth, rateLimit(30, 60_000), (req: AuthR
       auth = excluded.auth,
       user_agent = excluded.user_agent,
       platform = COALESCE(excluded.platform, push_subscriptions.platform),
+      transport = 'web_push',
+      browser_name = excluded.browser_name,
+      device_label = excluded.device_label,
       prefs_json = excluded.prefs_json,
       sound_enabled = excluded.sound_enabled,
       failure_count = 0,
@@ -3411,7 +3603,9 @@ app.post('/api/push/subscribe', optionalAuth, rateLimit(30, 60_000), (req: AuthR
     parsed.data.keys.p256dh,
     parsed.data.keys.auth,
     ua,
-    platform,
+    meta.platform,
+    browserName,
+    deviceLabel,
     prefsJson,
     effectivePrefs.sound_enabled ? 1 : 0,
     now,
@@ -3426,8 +3620,89 @@ app.post('/api/push/subscribe', optionalAuth, rateLimit(30, 60_000), (req: AuthR
     ok: true,
     subscription_id: subRow?.id || null,
     active: true,
+    platform: meta.platform,
+    device_label: deviceLabel,
     prefs: effectivePrefs,
   });
+});
+
+app.post('/api/push/register-native', optionalAuth, rateLimit(30, 60_000), (req: AuthRequest, res: Response) => {
+  const schema = z.object({
+    transport: z.enum(['fcm', 'apns']),
+    token: z.string().trim().min(16).max(512),
+    platform: z.enum(['android', 'ios', 'web']),
+    device_label: z.string().max(120).optional(),
+    prefs: pushPrefsSchema.optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid native push token registration.' });
+    return;
+  }
+
+  const actor = resolveReactionActor(req, res, !req.user);
+  const now = new Date().toISOString();
+  const ua = String(req.headers['user-agent'] || '').slice(0, 250);
+  const syntheticEndpoint = `${parsed.data.transport}://${parsed.data.token}`;
+  const effectivePrefs = normalizeNotificationPrefs({
+    ...(req.user ? req.user.notification_prefs : {}),
+    ...(parsed.data.prefs || {}),
+  });
+  const prefsJson = JSON.stringify(effectivePrefs);
+  const label =
+    parsed.data.device_label?.trim() ||
+    `${parsed.data.platform.toUpperCase()} (${parsed.data.transport.toUpperCase()})`;
+
+  db.prepare(
+    `INSERT INTO push_subscriptions (
+      id, user_id, visitor_id, endpoint, p256dh, auth, user_agent, platform,
+      transport, token, browser_name, device_label,
+      prefs_json, sound_enabled, failure_count, active, last_error, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, 'native', 'native', ?, ?, ?, ?, 'Native', ?, ?, ?, 0, 1, NULL, ?, ?)
+    ON CONFLICT(endpoint) DO UPDATE SET
+      user_id = COALESCE(excluded.user_id, push_subscriptions.user_id),
+      visitor_id = COALESCE(excluded.visitor_id, push_subscriptions.visitor_id),
+      platform = excluded.platform,
+      transport = excluded.transport,
+      token = excluded.token,
+      device_label = excluded.device_label,
+      prefs_json = excluded.prefs_json,
+      sound_enabled = excluded.sound_enabled,
+      failure_count = 0,
+      active = 1,
+      last_error = NULL,
+      updated_at = excluded.updated_at`
+  ).run(
+    crypto.randomUUID(),
+    req.user?.id || null,
+    actor?.visitorId || null,
+    syntheticEndpoint,
+    ua,
+    parsed.data.platform,
+    parsed.data.transport,
+    parsed.data.token,
+    label,
+    prefsJson,
+    effectivePrefs.sound_enabled ? 1 : 0,
+    now,
+    now
+  );
+
+  res.status(201).json({
+    ok: true,
+    transport: parsed.data.transport,
+    platform: parsed.data.platform,
+    infrastructure: getPushInfrastructureStatus(),
+  });
+});
+
+app.post('/api/push/ack', rateLimit(120, 60_000), (req: Request, res: Response) => {
+  const deliveryId = typeof req.body?.deliveryId === 'string' ? req.body.deliveryId.trim() : '';
+  const event = req.body?.event === 'clicked' ? 'clicked' : 'received';
+  if (deliveryId && !deliveryId.startsWith('test-')) {
+    recordPushReceipt(deliveryId, event);
+  }
+  res.json({ ok: true });
 });
 
 app.post('/api/push/unsubscribe', (req: Request, res: Response) => {
@@ -3647,7 +3922,46 @@ app.get('/api/admin/push-jobs/:id', requireRole('admin'), (req: Request, res: Re
 });
 
 app.get('/api/admin/push-subscriptions', requireRole('admin'), (_req: Request, res: Response) => {
-  res.json(listPushSubscriptions(100));
+  res.json({
+    ...listPushSubscriptions(100),
+    infrastructure: getPushInfrastructureStatus(),
+  });
+});
+
+app.get('/api/admin/push-diagnostics', requireRole('admin'), (_req: Request, res: Response) => {
+  const subsData = listPushSubscriptions(100);
+  res.json({
+    infrastructure: getPushInfrastructureStatus(),
+    summary: subsData.summary,
+    subscriptions: subsData.subscriptions,
+    jobs: listRecentPushJobs(30),
+    deliveries: listRecentPushDeliveries(40),
+  });
+});
+
+app.post('/api/admin/push/test-all', requireRole('admin'), async (_req: Request, res: Response) => {
+  const now = new Date().toISOString();
+  const result = await dispatchNotification({
+    title: 'MeridianFX · Test Notification',
+    body: 'Administrator live push test — tapping opens the MeridianFX Signals Channel.',
+    category: 'announcements',
+    linkUrl: '/signals',
+    priority: 'urgent',
+    forceShow: true,
+    respectPrefs: false,
+    sound: true,
+    publishedAt: now,
+    dedupKey: `admin_test:${Date.now()}`,
+    broadcastWs,
+  });
+  res.status(201).json({
+    ok: true,
+    push_job: result.push_job,
+    targeted: result.targetedSubscriptions,
+    delivered: result.delivered,
+    confirmed: result.confirmed,
+    failed: result.failed,
+  });
 });
 
 app.post('/api/admin/push-subscriptions/prune', requireRole('admin'), (req: Request, res: Response) => {

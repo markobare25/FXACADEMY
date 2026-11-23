@@ -16,7 +16,10 @@ export interface PushSubscriptionSummary {
   user_id: string | null;
   user_name: string | null;
   user_email: string | null;
-  platform: 'android' | 'ios' | 'desktop' | string;
+  platform: 'android' | 'ios' | 'web' | 'desktop' | string;
+  transport: 'web_push' | 'fcm' | 'apns' | string;
+  browser_name: string | null;
+  device_label: string | null;
   active: boolean;
   sound_enabled: boolean;
   failure_count: number;
@@ -24,6 +27,25 @@ export interface PushSubscriptionSummary {
   last_success_at: string | null;
   created_at: string;
   updated_at: string | null;
+}
+
+export interface PushInfrastructureStatus {
+  web_push: {
+    ready: boolean;
+    source: 'env' | 'database';
+    public_key_prefix: string;
+    supports: string;
+  };
+  fcm: {
+    ready: boolean;
+    mode: 'service_account' | 'legacy_server_key' | 'unconfigured';
+    missing_env: string[];
+  };
+  apns: {
+    ready: boolean;
+    environment: 'production' | 'sandbox' | 'unconfigured';
+    missing_env: string[];
+  };
 }
 
 export interface User {
@@ -97,7 +119,14 @@ export interface TradingSignal {
   updates?: SignalUpdateEntry[];
 }
 
-export type SignalChatMessageType = 'signal' | 'update' | 'analysis' | 'announcement';
+export type SignalChatMessageType =
+  | 'signal'
+  | 'setup'
+  | 'update'
+  | 'analysis'
+  | 'announcement'
+  | 'news';
+export type SignalChatPriority = 'normal' | 'urgent';
 export type SignalChatStatus = 'draft' | 'active' | 'completed';
 export type SignalReactionType = 'love' | 'like' | 'fire' | 'hundred' | 'dislike';
 
@@ -116,7 +145,11 @@ export interface SignalChatMessage {
   content: string;
   image_url?: string | null;
   image_name?: string | null;
+  media_url?: string | null;
+  media_type?: 'image' | 'video' | null;
+  media_name?: string | null;
   message_type: SignalChatMessageType;
+  priority: SignalChatPriority;
   status: SignalChatStatus;
   pinned: boolean;
   edited_at?: string | null;
@@ -136,13 +169,32 @@ export interface PushJobSummary {
   title: string;
   category: string;
   link_url: string;
+  priority: SignalChatPriority;
   published_at: string;
   status: 'queued' | 'processing' | 'completed' | 'partial' | 'failed';
   total_targeted: number;
   queued_count: number;
   delivered_count: number;
+  confirmed_count: number;
   failed_count: number;
   created_at: string;
+  updated_at: string;
+}
+
+export interface PushDeliveryRecord {
+  id: string;
+  job_id: string;
+  subscription_id: string;
+  platform: string;
+  transport: string;
+  device_label: string | null;
+  status: 'queued' | 'retrying' | 'delivered' | 'failed';
+  attempts: number;
+  status_code: number | null;
+  last_error: string | null;
+  delivered_at: string | null;
+  device_received_at: string | null;
+  opened_at: string | null;
   updated_at: string;
 }
 

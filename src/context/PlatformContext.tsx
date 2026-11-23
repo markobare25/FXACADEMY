@@ -8,6 +8,7 @@ import {
   setAuthRefreshHandler,
 } from '../lib/api';
 import {
+  isNotificationPromptDismissed,
   isPushSupported,
   syncExistingPushSubscriptionIfGranted,
 } from '../lib/pushClient';
@@ -420,48 +421,22 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     }
   }, [user?.id, authLoading]);
 
-  // Listen for Service Worker notification clicks, first-visit push prompt, & PWA install prompt triggers
+  // Listen for Service Worker notification clicks, foreground push sync, & post-PWA install nudge
   useEffect(() => {
-    const promptKey = 'mfx_post_install_notif_prompted_v1';
-    const firstVisitPromptKey = 'mfx_first_visit_notif_prompt_v1';
+    const postInstallKey = 'mfx_post_install_notif_prompted_v1';
 
     const maybeEncourageAfterInstall = () => {
       try {
         if (!isPushSupported()) return;
         if (Notification.permission !== 'default') return;
-        if (localStorage.getItem(promptKey) === '1') return;
-        localStorage.setItem(promptKey, '1');
+        if (isNotificationPromptDismissed()) return;
+        if (localStorage.getItem(postInstallKey) === '1') return;
+        localStorage.setItem(postInstallKey, '1');
         setShowNotifModal(true);
       } catch {
         // ignore storage errors
       }
     };
-
-    const maybeEncourageFirstVisit = () => {
-      try {
-        if (!isPushSupported()) return;
-        if (Notification.permission !== 'default') return;
-        if (localStorage.getItem(firstVisitPromptKey) === '1') return;
-        const currentPath = window.location.pathname || '/';
-        if (currentPath === '/login' || currentPath === '/admin') return;
-        localStorage.setItem(firstVisitPromptKey, '1');
-        setShowNotifModal(true);
-      } catch {
-        // ignore storage errors
-      }
-    };
-
-    const isStandaloneNow =
-      window.matchMedia('(display-mode: standalone)').matches ||
-      (window.navigator as unknown as { standalone?: boolean }).standalone === true;
-
-    let standaloneTimer: number | undefined;
-    let firstVisitTimer: number | undefined;
-    if (isStandaloneNow) {
-      standaloneTimer = window.setTimeout(maybeEncourageAfterInstall, 1200);
-    } else {
-      firstVisitTimer = window.setTimeout(maybeEncourageFirstVisit, 2200);
-    }
 
     const onSwMessage = (evt: MessageEvent) => {
       const data = evt.data as { type?: string; url?: string; messageId?: string | null } | undefined;
@@ -472,6 +447,13 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
             new CustomEvent('mfx:highlight-signal-message', { detail: { messageId: data.messageId } })
           );
         }
+      } else if (data?.type === 'mfx:push-received-foreground') {
+        emitSignalChatEvent({ type: 'reconnected' });
+        window.dispatchEvent(
+          new CustomEvent('mfx:push-received-foreground', {
+            detail: { messageId: data.messageId || null },
+          })
+        );
       }
     };
 
@@ -481,14 +463,12 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     }
 
     return () => {
-      if (standaloneTimer) clearTimeout(standaloneTimer);
-      if (firstVisitTimer) clearTimeout(firstVisitTimer);
       window.removeEventListener('mfx:pwa-installed', maybeEncourageAfterInstall);
       if ('serviceWorker' in navigator) {
         navigator.serviceWorker.removeEventListener('message', onSwMessage);
       }
     };
-  }, [navigate]);
+  }, [navigate, emitSignalChatEvent]);
 
   // Cross-tab BroadcastChannel sync, tab visibility renewal, and expired-session cleanup
   useEffect(() => {
@@ -539,29 +519,64 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     };
   }, [clearLocalSessionState, performSessionRefresh]);
 
-  // Real-Time WebSocket Sync with auto-reconnect (never resets auth state)
+  // Real-Time WebSocket Sync with keepalive, exponential backoff, & PWA/mobile wake recovery
   useEffect(() => {
     let active = true;
+    let retryAttempt = 0;
+    let pingTimer: number | null = null;
+
+    const clearTimers = () => {
+      if (reconnectTimer.current) {
+        clearTimeout(reconnectTimer.current);
+        reconnectTimer.current = null;
+      }
+      if (pingTimer) {
+        clearInterval(pingTimer);
+        pingTimer = null;
+      }
+    };
 
     const connect = () => {
       if (!active) return;
+      if (
+        wsRef.current &&
+        (wsRef.current.readyState === WebSocket.OPEN ||
+          wsRef.current.readyState === WebSocket.CONNECTING)
+      ) {
+        return;
+      }
+
       const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsUrl = `${proto}//${window.location.host}/ws`;
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
       ws.onopen = () => {
+        retryAttempt = 0;
         setWsConnected(true);
         if (hasConnectedOnceRef.current) {
           emitSignalChatEvent({ type: 'reconnected' });
         }
         hasConnectedOnceRef.current = true;
+
+        if (pingTimer) clearInterval(pingTimer);
+        pingTimer = window.setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            try {
+              ws.send(JSON.stringify({ event: 'ping' }));
+            } catch {
+              // socket will close and trigger reconnect
+            }
+          }
+        }, 25_000);
       };
 
       ws.onmessage = (evt) => {
         try {
           const msg = JSON.parse(evt.data) as { event: string; data: unknown };
           switch (msg.event) {
+            case 'pong':
+              break;
             case 'connected': {
               const payload = msg.data as { online_count?: number };
               if (typeof payload?.online_count === 'number') {
@@ -679,19 +694,54 @@ export const PlatformProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
       ws.onclose = () => {
         setWsConnected(false);
+        if (pingTimer) {
+          clearInterval(pingTimer);
+          pingTimer = null;
+        }
+        if (wsRef.current === ws) {
+          wsRef.current = null;
+        }
         if (!active) return;
+        const delayMs = Math.min(15_000, 1000 * Math.pow(2, Math.min(retryAttempt, 4)));
+        retryAttempt += 1;
         reconnectTimer.current = window.setTimeout(() => {
           connect();
           refreshPublicData();
-        }, 3000);
+        }, delayMs);
       };
     };
+
+    const handleResumeOrOnline = () => {
+      if (!active || document.visibilityState === 'hidden') return;
+      const ws = wsRef.current;
+      if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+        if (reconnectTimer.current) {
+          clearTimeout(reconnectTimer.current);
+          reconnectTimer.current = null;
+        }
+        retryAttempt = 0;
+        connect();
+      } else if (ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(JSON.stringify({ event: 'ping' }));
+        } catch {
+          // ignore
+        }
+        emitSignalChatEvent({ type: 'reconnected' });
+      }
+    };
+
+    window.addEventListener('online', handleResumeOrOnline);
+    document.addEventListener('visibilitychange', handleResumeOrOnline);
 
     connect();
     return () => {
       active = false;
-      if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
+      clearTimers();
+      window.removeEventListener('online', handleResumeOrOnline);
+      document.removeEventListener('visibilitychange', handleResumeOrOnline);
       wsRef.current?.close();
+      wsRef.current = null;
     };
   }, [refreshPublicData, refreshNotifications, emitSignalChatEvent, emitPushJobEvent]);
 

@@ -29,6 +29,8 @@ import type {
   MarketUpdate,
   MarketUpdateCategory,
   PlatformSettings,
+  PushDeliveryRecord,
+  PushInfrastructureStatus,
   PushJobSummary,
   PushSubscriptionSummary,
   RegistrationAnalyticsPayload,
@@ -173,17 +175,34 @@ export const AdminPage: React.FC = () => {
     sound: true,
     scheduled_at: '',
   });
-  const [pushSubsInfo, setPushSubsInfo] = useState<{
+  const [pushDiagnostics, setPushDiagnostics] = useState<{
+    infrastructure: PushInfrastructureStatus;
     summary: {
       total_active: number;
       total_inactive: number;
       android: number;
       ios: number;
+      web: number;
       desktop: number;
+      by_transport: {
+        web_push: number;
+        fcm: number;
+        apns: number;
+      };
+      last_sent_at: string | null;
+      totals: {
+        queued: number;
+        delivered: number;
+        confirmed: number;
+        failed: number;
+      };
     };
     subscriptions: PushSubscriptionSummary[];
+    jobs: PushJobSummary[];
+    deliveries: PushDeliveryRecord[];
   } | null>(null);
   const [testingAdminPush, setTestingAdminPush] = useState(false);
+  const [testingAllPush, setTestingAllPush] = useState(false);
 
   // Platform Settings State
   const [settingsForm, setSettingsForm] = useState<PlatformSettings>(settings);
@@ -195,23 +214,14 @@ export const AdminPage: React.FC = () => {
   const loadAdminData = useCallback(async () => {
     if (user?.role !== 'admin') return;
     try {
-      const [ov, reg, upd, usr, rep, cnt, subs] = await Promise.all([
+      const [ov, reg, upd, usr, rep, cnt, diag] = await Promise.all([
         apiFetch<OverviewPayload>('/api/admin/overview'),
         apiFetch<RegistrationAnalyticsPayload>('/api/admin/registrations'),
         apiFetch<{ updates: MarketUpdate[] }>('/api/updates?includeAll=true'),
         apiFetch<{ users: User[] }>('/api/admin/users'),
         apiFetch<{ reports: typeof reports }>('/api/admin/reports'),
         apiFetch<{ messages: typeof contacts }>('/api/admin/contacts'),
-        apiFetch<{
-          summary: {
-            total_active: number;
-            total_inactive: number;
-            android: number;
-            ios: number;
-            desktop: number;
-          };
-          subscriptions: PushSubscriptionSummary[];
-        }>('/api/admin/push-subscriptions'),
+        apiFetch<NonNullable<typeof pushDiagnostics>>('/api/admin/push-diagnostics'),
       ]);
       setOverview(ov);
       setRegistrations(reg);
@@ -219,7 +229,7 @@ export const AdminPage: React.FC = () => {
       setUsersList(usr.users);
       setReports(rep.reports);
       setContacts(cnt.messages);
-      setPushSubsInfo(subs);
+      setPushDiagnostics(diag);
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Failed to load admin data.');
     }
@@ -544,6 +554,36 @@ export const AdminPage: React.FC = () => {
       setErrorMsg(err instanceof Error ? err.message : 'No active push subscription on this device.');
     } finally {
       setTestingAdminPush(false);
+    }
+  };
+
+  const handleSendTestNotificationAll = async () => {
+    setTestingAllPush(true);
+    setErrorMsg(null);
+    try {
+      const res = await apiFetch<{
+        ok: boolean;
+        targeted: number;
+        delivered: number;
+        confirmed: number;
+        failed: number;
+        push_job: PushJobSummary;
+      }>('/api/admin/push/test-all', { method: 'POST', body: '{}' });
+      setPublishReceipt({
+        title: 'Admin Test Notification dispatched to subscribed devices',
+        signalMessageId: null,
+        pushJob: res.push_job,
+      });
+      notifyOk(
+        res.targeted === 0
+          ? 'Test job recorded (0 subscribed devices active yet).'
+          : `Test notification sent: ${res.delivered}/${res.targeted} accepted by push gateway.`
+      );
+      await loadAdminData();
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Failed to send test notification.');
+    } finally {
+      setTestingAllPush(false);
     }
   };
 
@@ -1495,10 +1535,103 @@ export const AdminPage: React.FC = () => {
             </form>
 
             <div className="lg:col-span-6 space-y-5">
+              {/* Infrastructure Readiness Card */}
+              <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5 space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <h2 className="text-base font-bold text-slate-900 dark:text-white">
+                      Push Notification Infrastructure
+                    </h2>
+                    <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                      Last notification sent:{' '}
+                      {pushDiagnostics?.summary.last_sent_at
+                        ? formatLocalDateTime(pushDiagnostics.summary.last_sent_at)
+                        : 'No broadcasts dispatched yet'}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={testingAllPush}
+                    onClick={handleSendTestNotificationAll}
+                    className="rounded-lg bg-[#15803D] px-3.5 py-2 text-xs font-bold uppercase tracking-wide text-white hover:bg-[#166534] disabled:opacity-60"
+                  >
+                    {testingAllPush ? 'Sending...' : 'SEND TEST NOTIFICATION'}
+                  </button>
+                </div>
+
+                <div className="space-y-2 text-xs">
+                  <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-3 flex items-start justify-between gap-3">
+                    <div>
+                      <p className="font-semibold text-slate-900 dark:text-white">
+                        Web Push (VAPID · Desktop, Android & iOS 16.4+ PWA)
+                      </p>
+                      <p className="text-[11px] text-slate-500 mt-0.5">
+                        Key source: {pushDiagnostics?.infrastructure.web_push.source || 'database'} ·{' '}
+                        {pushDiagnostics?.infrastructure.web_push.public_key_prefix || 'configured'}
+                      </p>
+                    </div>
+                    <span
+                      className={`text-[10px] font-bold uppercase px-2 py-0.5 rounded shrink-0 ${
+                        pushDiagnostics?.infrastructure.web_push.ready
+                          ? 'bg-emerald-50 text-[#15803D] dark:bg-emerald-500/15 dark:text-emerald-400'
+                          : 'bg-rose-50 text-[#881337]'
+                      }`}
+                    >
+                      {pushDiagnostics?.infrastructure.web_push.ready ? 'Ready' : 'Missing'}
+                    </span>
+                  </div>
+
+                  <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-3 flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="font-semibold text-slate-900 dark:text-white">
+                        Native Android FCM Adapter
+                      </p>
+                      <p className="text-[11px] text-slate-500 mt-0.5">
+                        {pushDiagnostics?.infrastructure.fcm.ready
+                          ? `Configured via ${pushDiagnostics.infrastructure.fcm.mode}`
+                          : `Missing env: ${(pushDiagnostics?.infrastructure.fcm.missing_env || ['FIREBASE_SERVICE_ACCOUNT_JSON']).join(', ')} (Android browsers use Web Push)`}
+                      </p>
+                    </div>
+                    <span
+                      className={`text-[10px] font-bold uppercase px-2 py-0.5 rounded shrink-0 ${
+                        pushDiagnostics?.infrastructure.fcm.ready
+                          ? 'bg-emerald-50 text-[#15803D] dark:bg-emerald-500/15 dark:text-emerald-400'
+                          : 'bg-amber-50 text-amber-700 dark:bg-amber-950/40 dark:text-amber-300'
+                      }`}
+                    >
+                      {pushDiagnostics?.infrastructure.fcm.ready ? 'Ready' : 'Unconfigured'}
+                    </span>
+                  </div>
+
+                  <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-3 flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="font-semibold text-slate-900 dark:text-white">
+                        Native iOS APNs Adapter
+                      </p>
+                      <p className="text-[11px] text-slate-500 mt-0.5">
+                        {pushDiagnostics?.infrastructure.apns.ready
+                          ? `Configured (${pushDiagnostics.infrastructure.apns.environment})`
+                          : `Missing env: ${(pushDiagnostics?.infrastructure.apns.missing_env || ['APNS_KEY_ID', 'APNS_TEAM_ID', 'APNS_BUNDLE_ID', 'APNS_PRIVATE_KEY']).join(', ')} (iOS PWA uses Apple Web Push)`}
+                      </p>
+                    </div>
+                    <span
+                      className={`text-[10px] font-bold uppercase px-2 py-0.5 rounded shrink-0 ${
+                        pushDiagnostics?.infrastructure.apns.ready
+                          ? 'bg-emerald-50 text-[#15803D] dark:bg-emerald-500/15 dark:text-emerald-400'
+                          : 'bg-amber-50 text-amber-700 dark:bg-amber-950/40 dark:text-amber-300'
+                      }`}
+                    >
+                      {pushDiagnostics?.infrastructure.apns.ready ? 'Ready' : 'Unconfigured'}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Device Endpoints & Delivery Counters */}
               <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5 space-y-3">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <h2 className="text-base font-bold text-slate-900 dark:text-white">
-                    Device Endpoints & Delivery Health
+                    Subscribed Devices & Delivery Stats
                   </h2>
                   <div className="flex flex-wrap items-center gap-2">
                     <button
@@ -1514,58 +1647,91 @@ export const AdminPage: React.FC = () => {
                       onClick={handlePruneInactiveSubs}
                       className="rounded-lg border border-slate-300 dark:border-slate-700 px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800"
                     >
-                      Prune Inactive ({pushSubsInfo?.summary.total_inactive ?? 0})
+                      Prune Invalid ({pushDiagnostics?.summary.total_inactive ?? 0})
                     </button>
                   </div>
                 </div>
 
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-xs">
                   <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-3">
-                    <p className="text-[11px] text-slate-500">Active Total</p>
+                    <p className="text-[11px] text-slate-500">Subscribed Total</p>
                     <p className="mt-0.5 text-lg font-bold font-mono text-slate-900 dark:text-white">
-                      {pushSubsInfo?.summary.total_active ?? overview?.stats.push_subscribers ?? 0}
+                      {pushDiagnostics?.summary.total_active ?? overview?.stats.push_subscribers ?? 0}
                     </p>
                   </div>
                   <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-3">
                     <p className="text-[11px] text-slate-500">Android</p>
                     <p className="mt-0.5 text-lg font-bold font-mono text-emerald-600 dark:text-emerald-400">
-                      {pushSubsInfo?.summary.android ?? 0}
+                      {pushDiagnostics?.summary.android ?? 0}
                     </p>
                   </div>
                   <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-3">
-                    <p className="text-[11px] text-slate-500">iOS PWA</p>
+                    <p className="text-[11px] text-slate-500">iOS</p>
                     <p className="mt-0.5 text-lg font-bold font-mono text-[#881337] dark:text-rose-400">
-                      {pushSubsInfo?.summary.ios ?? 0}
+                      {pushDiagnostics?.summary.ios ?? 0}
                     </p>
                   </div>
                   <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-3">
-                    <p className="text-[11px] text-slate-500">Desktop</p>
+                    <p className="text-[11px] text-slate-500">Web Browsers</p>
                     <p className="mt-0.5 text-lg font-bold font-mono text-slate-700 dark:text-slate-300">
-                      {pushSubsInfo?.summary.desktop ?? 0}
+                      {pushDiagnostics?.summary.web ?? pushDiagnostics?.summary.desktop ?? 0}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 text-xs">
+                  <div className="rounded-lg bg-slate-50 dark:bg-slate-900/70 p-2.5">
+                    <p className="text-[10px] text-slate-500 uppercase">Queued</p>
+                    <p className="font-mono font-bold text-amber-600 dark:text-amber-400">
+                      {pushDiagnostics?.summary.totals.queued ?? 0}
+                    </p>
+                  </div>
+                  <div className="rounded-lg bg-slate-50 dark:bg-slate-900/70 p-2.5">
+                    <p className="text-[10px] text-slate-500 uppercase">Sent</p>
+                    <p className="font-mono font-bold text-emerald-600 dark:text-emerald-400">
+                      {pushDiagnostics?.summary.totals.delivered ?? 0}
+                    </p>
+                  </div>
+                  <div className="rounded-lg bg-slate-50 dark:bg-slate-900/70 p-2.5">
+                    <p className="text-[10px] text-slate-500 uppercase">Confirmed</p>
+                    <p className="font-mono font-bold text-[#15803D] dark:text-emerald-300">
+                      {pushDiagnostics?.summary.totals.confirmed ?? 0}
+                    </p>
+                  </div>
+                  <div className="rounded-lg bg-slate-50 dark:bg-slate-900/70 p-2.5">
+                    <p className="text-[10px] text-slate-500 uppercase">Failed</p>
+                    <p className="font-mono font-bold text-red-600 dark:text-red-400">
+                      {pushDiagnostics?.summary.totals.failed ?? 0}
+                    </p>
+                  </div>
+                  <div className="rounded-lg bg-slate-50 dark:bg-slate-900/70 p-2.5">
+                    <p className="text-[10px] text-slate-500 uppercase">Invalid</p>
+                    <p className="font-mono font-bold text-slate-600 dark:text-slate-300">
+                      {pushDiagnostics?.summary.total_inactive ?? 0}
                     </p>
                   </div>
                 </div>
 
                 <div className="divide-y divide-slate-100 dark:divide-slate-800 max-h-48 overflow-y-auto text-xs">
-                  {(pushSubsInfo?.subscriptions || []).slice(0, 20).map((sub) => (
+                  {(pushDiagnostics?.subscriptions || []).slice(0, 25).map((sub) => (
                     <div key={sub.id} className="py-2 flex items-center justify-between gap-2">
                       <div className="min-w-0">
                         <p className="font-medium text-slate-900 dark:text-white truncate">
-                          {sub.user_name ? `${sub.user_name} (${sub.user_email})` : 'Anonymous PWA Device'}{' '}
+                          {sub.user_name ? `${sub.user_name} (${sub.user_email})` : sub.device_label || 'Anonymous Device'}{' '}
                           <span className="uppercase text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300">
-                            {sub.platform}
+                            {sub.platform} · {sub.transport}
                           </span>
                         </p>
                         <p className="text-[11px] text-slate-500 truncate">
                           {sub.last_error
-                            ? `Last error: ${sub.last_error}`
+                            ? `Error: ${sub.last_error}`
                             : sub.last_success_at
                               ? `Last delivered: ${formatLocalDateTime(sub.last_success_at)}`
                               : `Registered: ${formatLocalDateTime(sub.created_at)}`}
                         </p>
                       </div>
                       <span
-                        className={`text-[10px] font-semibold px-2 py-0.5 rounded-full shrink-0 ${
+                        className={`text-[10px] font-semibold px-2 py-0.5 rounded shrink-0 ${
                           sub.active
                             ? 'bg-emerald-50 text-[#15803D] dark:bg-emerald-500/15 dark:text-emerald-400'
                             : 'bg-rose-50 text-[#881337] dark:bg-rose-500/15 dark:text-rose-400'
@@ -1575,61 +1741,80 @@ export const AdminPage: React.FC = () => {
                       </span>
                     </div>
                   ))}
-                  {(!pushSubsInfo || pushSubsInfo.subscriptions.length === 0) && (
+                  {(!pushDiagnostics || pushDiagnostics.subscriptions.length === 0) && (
                     <p className="py-3 text-xs text-slate-500">No device subscriptions registered yet.</p>
                   )}
                 </div>
               </div>
 
+              {/* Push Jobs & Per-Device Delivery Receipts */}
               <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5 space-y-3">
                 <h2 className="text-base font-bold text-slate-900 dark:text-white">
-                  Recent Push Delivery Logs
+                  Notification History & Delivery Logs
                 </h2>
                 <div className="divide-y divide-slate-100 dark:divide-slate-800 max-h-64 overflow-y-auto text-xs">
-                  {(overview?.push_jobs && overview.push_jobs.length > 0
-                    ? overview.push_jobs.map((job) => (
-                        <div key={job.id} className="py-2.5 flex items-center justify-between gap-3">
-                          <div className="min-w-0">
-                            <p className="font-semibold text-slate-900 dark:text-white truncate">
-                              {job.title}
-                            </p>
-                            <p className="text-slate-500">
-                              {job.category} · {job.status} · {formatLocalDateTime(job.created_at)}
-                            </p>
-                          </div>
-                          <div className="text-right font-mono tabular-nums shrink-0 text-[11px]">
-                            <span className="text-emerald-600 dark:text-emerald-400 font-semibold">
-                              {job.delivered_count} sent
-                            </span>
-                            {job.queued_count > 0 && (
-                              <span className="ml-2 text-amber-600 dark:text-amber-400">
-                                {job.queued_count} queued
-                              </span>
-                            )}
-                            {job.failed_count > 0 && (
-                              <span className="ml-2 text-red-600 dark:text-red-400">
-                                {job.failed_count} failed
-                              </span>
-                            )}
-                          </div>
-                        </div>
-                      ))
-                    : (overview?.dispatch_logs || []).map((log) => (
-                        <div key={log.id} className="py-2.5 flex items-center justify-between gap-3">
-                          <div className="min-w-0">
-                            <p className="font-semibold text-slate-900 dark:text-white truncate">
-                              {log.title}
-                            </p>
-                            <p className="text-slate-500">
-                              {log.category} · {formatLocalDateTime(log.created_at)}
-                            </p>
-                          </div>
-                          <span className="font-mono tabular-nums text-emerald-600 dark:text-emerald-400 shrink-0">
-                            {log.delivered_count}/{log.total_targeted} sent
+                  {((pushDiagnostics?.jobs && pushDiagnostics.jobs.length > 0
+                    ? pushDiagnostics.jobs
+                    : overview?.push_jobs) || []
+                  ).map((job) => (
+                    <div key={job.id} className="py-2.5 flex items-center justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className="font-semibold text-slate-900 dark:text-white truncate">
+                          {job.priority === 'urgent' ? '[URGENT] ' : ''}
+                          {job.title}
+                        </p>
+                        <p className="text-slate-500">
+                          {job.category} · {job.status} · {formatLocalDateTime(job.created_at)}
+                        </p>
+                      </div>
+                      <div className="text-right font-mono tabular-nums shrink-0 text-[11px]">
+                        <span className="text-emerald-600 dark:text-emerald-400 font-semibold">
+                          {job.delivered_count}/{job.total_targeted} sent
+                        </span>
+                        <span className="ml-2 text-[#15803D] dark:text-emerald-300">
+                          {job.confirmed_count ?? 0} ack
+                        </span>
+                        {job.queued_count > 0 && (
+                          <span className="ml-2 text-amber-600 dark:text-amber-400">
+                            {job.queued_count} queued
+                          </span>
+                        )}
+                        {job.failed_count > 0 && (
+                          <span className="ml-2 text-red-600 dark:text-red-400">
+                            {job.failed_count} fail
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                  {(!pushDiagnostics?.jobs || pushDiagnostics.jobs.length === 0) &&
+                    (!overview?.push_jobs || overview.push_jobs.length === 0) && (
+                      <p className="py-3 text-xs text-slate-500">No push notifications dispatched yet.</p>
+                    )}
+                </div>
+
+                {pushDiagnostics?.deliveries && pushDiagnostics.deliveries.length > 0 && (
+                  <div className="pt-3 border-t border-slate-100 dark:border-slate-800 space-y-2">
+                    <p className="text-[11px] font-bold uppercase tracking-wide text-slate-500">
+                      Recent Device Delivery Receipts
+                    </p>
+                    <div className="divide-y divide-slate-100 dark:divide-slate-800 max-h-44 overflow-y-auto text-[11px]">
+                      {pushDiagnostics.deliveries.slice(0, 20).map((d) => (
+                        <div key={d.id} className="py-1.5 flex items-center justify-between gap-2">
+                          <span className="text-slate-700 dark:text-slate-300 truncate">
+                            {d.device_label || d.platform} ({d.transport}) · {d.status}
+                            {d.device_received_at ? ' · Received' : ''}
+                            {d.opened_at ? ' · Opened' : ''}
+                            {d.last_error ? ` · ${d.last_error}` : ''}
+                          </span>
+                          <span className="font-mono text-slate-400 shrink-0">
+                            {d.status_code ?? '—'}
                           </span>
                         </div>
-                      )))}
-                </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
           </div>

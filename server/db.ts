@@ -174,7 +174,11 @@ export function initDatabase(): void {
       content TEXT NOT NULL DEFAULT '',
       image_url TEXT,
       image_name TEXT,
+      media_url TEXT,
+      media_type TEXT,
+      media_name TEXT,
       message_type TEXT NOT NULL DEFAULT 'update',
+      priority TEXT NOT NULL DEFAULT 'normal',
       status TEXT NOT NULL DEFAULT 'active',
       pinned INTEGER NOT NULL DEFAULT 0,
       edited_at TEXT,
@@ -445,6 +449,10 @@ export function initDatabase(): void {
       auth TEXT NOT NULL,
       user_agent TEXT,
       platform TEXT,
+      transport TEXT NOT NULL DEFAULT 'web_push',
+      token TEXT,
+      browser_name TEXT,
+      device_label TEXT,
       prefs_json TEXT NOT NULL DEFAULT '{"signals":true,"signal_updates":true,"signal_chat":true,"market_updates":true,"academy":true,"economic_calendar":true,"announcements":true,"sound_enabled":true}',
       sound_enabled INTEGER NOT NULL DEFAULT 1,
       failure_count INTEGER NOT NULL DEFAULT 0,
@@ -465,12 +473,14 @@ export function initDatabase(): void {
       category TEXT NOT NULL,
       link_url TEXT NOT NULL DEFAULT '/signals',
       image_url TEXT,
+      priority TEXT NOT NULL DEFAULT 'normal',
       published_at TEXT NOT NULL,
       sound INTEGER NOT NULL DEFAULT 1,
       status TEXT NOT NULL DEFAULT 'queued',
       total_targeted INTEGER NOT NULL DEFAULT 0,
       queued_count INTEGER NOT NULL DEFAULT 0,
       delivered_count INTEGER NOT NULL DEFAULT 0,
+      confirmed_count INTEGER NOT NULL DEFAULT 0,
       failed_count INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
@@ -481,6 +491,7 @@ export function initDatabase(): void {
       job_id TEXT NOT NULL,
       subscription_id TEXT NOT NULL,
       endpoint TEXT NOT NULL,
+      transport TEXT NOT NULL DEFAULT 'web_push',
       status TEXT NOT NULL DEFAULT 'queued',
       attempts INTEGER NOT NULL DEFAULT 0,
       max_attempts INTEGER NOT NULL DEFAULT 4,
@@ -488,6 +499,8 @@ export function initDatabase(): void {
       last_error TEXT,
       status_code INTEGER,
       delivered_at TEXT,
+      device_received_at TEXT,
+      opened_at TEXT,
       updated_at TEXT NOT NULL,
       UNIQUE(job_id, subscription_id),
       FOREIGN KEY (job_id) REFERENCES push_jobs(id) ON DELETE CASCADE,
@@ -584,9 +597,17 @@ export function initDatabase(): void {
   ensureColumn('users', 'needs_password_setup', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('signal_messages', 'source_type', 'TEXT');
   ensureColumn('signal_messages', 'source_id', 'TEXT');
+  ensureColumn('signal_messages', 'media_url', 'TEXT');
+  ensureColumn('signal_messages', 'media_type', 'TEXT');
+  ensureColumn('signal_messages', 'media_name', 'TEXT');
+  ensureColumn('signal_messages', 'priority', "TEXT NOT NULL DEFAULT 'normal'");
   ensureColumn('push_subscriptions', 'visitor_id', 'TEXT');
   ensureColumn('push_subscriptions', 'active', 'INTEGER NOT NULL DEFAULT 1');
   ensureColumn('push_subscriptions', 'platform', 'TEXT');
+  ensureColumn('push_subscriptions', 'transport', "TEXT NOT NULL DEFAULT 'web_push'");
+  ensureColumn('push_subscriptions', 'token', 'TEXT');
+  ensureColumn('push_subscriptions', 'browser_name', 'TEXT');
+  ensureColumn('push_subscriptions', 'device_label', 'TEXT');
   ensureColumn('push_subscriptions', 'prefs_json', 'TEXT');
   ensureColumn('push_subscriptions', 'sound_enabled', 'INTEGER NOT NULL DEFAULT 1');
   ensureColumn('push_subscriptions', 'failure_count', 'INTEGER NOT NULL DEFAULT 0');
@@ -607,6 +628,11 @@ export function initDatabase(): void {
   ensureColumn('user_sessions', 'prev_grace_until', 'TEXT');
   ensureColumn('user_sessions', 'remember_me', 'INTEGER NOT NULL DEFAULT 1');
   ensureColumn('push_jobs', 'sound', 'INTEGER NOT NULL DEFAULT 1');
+  ensureColumn('push_jobs', 'priority', "TEXT NOT NULL DEFAULT 'normal'");
+  ensureColumn('push_jobs', 'confirmed_count', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('push_job_deliveries', 'transport', "TEXT NOT NULL DEFAULT 'web_push'");
+  ensureColumn('push_job_deliveries', 'device_received_at', 'TEXT');
+  ensureColumn('push_job_deliveries', 'opened_at', 'TEXT');
 
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_user_sessions_refresh
@@ -1075,6 +1101,93 @@ function seedInitialData(): void {
       'Share your clean chart markups, ask questions on Academy lessons, and discuss macroeconomic setups respectfully. Spam, affiliate links, and guaranteed-profit claims are strictly prohibited and moderated.',
       now
     );
+  }
+
+  // Seed public Signal Channel messages if empty so visitors immediately see live channel history
+  const signalMsgCount = db.prepare('SELECT COUNT(*) as cnt FROM signal_messages').get() as { cnt: number };
+  if (signalMsgCount.cnt === 0) {
+    const insertSignalMsg = db.prepare(`
+      INSERT OR IGNORE INTO signal_messages (
+        id, author_id, author_name, content, image_url, image_name,
+        media_url, media_type, media_name, message_type, priority,
+        status, pinned, completed_at, completed_summary, source_type, source_id, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    const publicSignals = db
+      .prepare('SELECT * FROM signals WHERE COALESCE(is_premium, 0) = 0 ORDER BY created_at ASC')
+      .all() as Array<Record<string, unknown>>;
+
+    for (const sig of publicSignals) {
+      const tpList = [sig.tp1, sig.tp2, sig.tp3, sig.tp4].filter(Boolean).join(' · ');
+      const content = [
+        `${String(sig.direction)} ${String(sig.pair)} (${String(sig.timeframe)} · ${String(sig.classification)})`,
+        `Entry: ${String(sig.entry_price)} | SL: ${String(sig.stop_loss)} | TP: ${tpList} | R:R ${String(sig.risk_reward)}`,
+        String(sig.analysis || ''),
+        sig.admin_remarks ? `Note: ${String(sig.admin_remarks)}` : '',
+      ]
+        .filter(Boolean)
+        .join('\n\n');
+
+      const sigStatus = String(sig.status || 'Active');
+      const isCompleted = sigStatus === 'TP Hit' || sigStatus === 'SL Hit' || sigStatus === 'Closed';
+      const imgUrl = sig.chart_image_url ? String(sig.chart_image_url) : null;
+      const imgName = imgUrl ? `${String(sig.pair)} Chart` : null;
+
+      insertSignalMsg.run(
+        crypto.randomUUID(),
+        adminId,
+        'MeridianFX Desk',
+        content,
+        imgUrl,
+        imgName,
+        imgUrl,
+        imgUrl ? 'image' : null,
+        imgName,
+        'signal',
+        'normal',
+        isCompleted ? 'completed' : 'active',
+        0,
+        isCompleted ? String(sig.updated_at || sig.created_at) : null,
+        isCompleted ? String(sig.admin_remarks || sigStatus) : null,
+        'signal',
+        String(sig.id),
+        String(sig.created_at)
+      );
+    }
+
+    const publicUpdates = db
+      .prepare('SELECT * FROM market_updates WHERE published = 1 AND COALESCE(is_premium, 0) = 0 ORDER BY created_at ASC')
+      .all() as Array<Record<string, unknown>>;
+
+    for (const upd of publicUpdates) {
+      const cat = String(upd.category || 'Market Update');
+      const isAnnouncement = cat === 'Platform Announcement' || cat === 'Risk Warning';
+      const content = [`${cat}: ${String(upd.title)}`, String(upd.content || '')].join('\n\n');
+      const imgUrl = upd.image_url ? String(upd.image_url) : null;
+      const imgName = imgUrl ? String(upd.title) : null;
+
+      insertSignalMsg.run(
+        crypto.randomUUID(),
+        adminId,
+        'MeridianFX Desk',
+        content,
+        imgUrl,
+        imgName,
+        imgUrl,
+        imgUrl ? 'image' : null,
+        imgName,
+        isAnnouncement ? 'announcement' : 'update',
+        'normal',
+        'active',
+        Number(upd.pinned || 0) ? 1 : 0,
+        null,
+        null,
+        'market_update',
+        String(upd.id),
+        String(upd.created_at)
+      );
+    }
   }
 }
 

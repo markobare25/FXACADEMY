@@ -9,6 +9,7 @@ import {
   Check,
   CheckCircle2,
   Edit3,
+  Film,
   ImagePlus,
   Info,
   Loader2,
@@ -23,14 +24,24 @@ import {
   Sun,
   Trash2,
   X,
+  Zap,
 } from 'lucide-react';
 import { usePlatform, type SignalChatWsEvent } from '../context/PlatformContext';
 import { apiFetch, formatLocalDateTime, getOrCreateVisitorId, uploadMediaFile } from '../lib/api';
-import { getCurrentPushSubscription } from '../lib/pushClient';
+import {
+  detectPushPlatform,
+  dismissNotificationPrompt,
+  getCurrentPushSubscription,
+  isNotificationPromptDismissed,
+  isPushSupported,
+  isStandalonePWA,
+  subscribeToPushNotifications,
+} from '../lib/pushClient';
 import type {
   PushJobSummary,
   SignalChatMessage,
   SignalChatMessageType,
+  SignalChatPriority,
   SignalReactionType,
   SignalReactionsMap,
 } from '../types';
@@ -56,8 +67,10 @@ function emptyReactions(): SignalReactionsMap {
 
 const MESSAGE_TYPE_LABELS: Record<SignalChatMessageType, string> = {
   signal: 'Trading Signal',
-  update: 'Market Update',
+  setup: 'Buy / Sell Setup',
   analysis: 'Chart Analysis',
+  update: 'Market Update',
+  news: 'Economic News Alert',
   announcement: 'Announcement',
 };
 
@@ -198,16 +211,17 @@ export const SignalsPage: React.FC = () => {
   const [completedSearch, setCompletedSearch] = useState('');
   const [selectedCompleted, setSelectedCompleted] = useState<SignalChatMessage | null>(null);
 
-  // Fluctuating Estimated Community Membership figure (45,670 - 78,900)
-  const [estimatedMembers, setEstimatedMembers] = useState<number>(() => 53204);
-  const estimatedTargetRef = useRef<number>(53204);
+  // Real channel subscriber counter
+  const [subscriberCount, setSubscriberCount] = useState<number>(0);
 
   // Admin Composer state
   const [composerText, setComposerText] = useState('');
   const [composerType, setComposerType] = useState<SignalChatMessageType>('signal');
+  const [composerPriority, setComposerPriority] = useState<SignalChatPriority>('normal');
   const [composerPinned, setComposerPinned] = useState(false);
   const [composerPush, setComposerPush] = useState(true);
   const [attachmentUrl, setAttachmentUrl] = useState<string | null>(null);
+  const [attachmentMediaType, setAttachmentMediaType] = useState<'image' | 'video' | null>(null);
   const [attachmentName, setAttachmentName] = useState<string | null>(null);
   const [attachmentPreview, setAttachmentPreview] = useState<string | null>(null);
   const [uploadingImage, setUploadingImage] = useState(false);
@@ -225,11 +239,16 @@ export const SignalsPage: React.FC = () => {
     pushJob: PushJobSummary | null;
   } | null>(null);
   const [pushSubscribed, setPushSubscribed] = useState(false);
+  const [promptDismissed, setPromptDismissed] = useState<boolean>(() => isNotificationPromptDismissed());
+  const [enablingInlinePush, setEnablingInlinePush] = useState(false);
+  const [inlinePushStatus, setInlinePushStatus] = useState<string | null>(null);
+  const [inlinePushError, setInlinePushError] = useState<string | null>(null);
 
   // Message editing / archiving / deleting / lightbox state
   const [editingMsgId, setEditingMsgId] = useState<string | null>(null);
   const [editDraftText, setEditDraftText] = useState('');
   const [editDraftType, setEditDraftType] = useState<SignalChatMessageType>('update');
+  const [editDraftPriority, setEditDraftPriority] = useState<SignalChatPriority>('normal');
   const [editDraftImageUrl, setEditDraftImageUrl] = useState<string | null>(null);
   const [savingEdit, setSavingEdit] = useState(false);
 
@@ -246,6 +265,7 @@ export const SignalsPage: React.FC = () => {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
   const isNearBottomRef = useRef<boolean>(true);
+  const latestCreatedAtRef = useRef<string | null>(null);
   const viewerKeyRef = useRef<string | null>(null);
   const prevUserIdRef = useRef<string | null | undefined>(undefined);
   const messageRefs = useRef<Map<string, HTMLDivElement>>(new Map());
@@ -255,43 +275,11 @@ export const SignalsPage: React.FC = () => {
     setRealOnlineCount(onlineCount);
   }, [onlineCount]);
 
-  // Smooth periodic animation for Estimated Community Activity (45,670 - 78,900)
   useEffect(() => {
-    let rafId = 0;
-    let current = estimatedTargetRef.current;
-
-    const animateTo = (target: number) => {
-      const start = current;
-      const startTime = performance.now();
-      const duration = 1200;
-
-      const step = (now: number) => {
-        const progress = Math.min(1, (now - startTime) / duration);
-        const eased = 1 - Math.pow(1 - progress, 3);
-        const value = Math.round(start + (target - start) * eased);
-        current = value;
-        setEstimatedMembers(value);
-        if (progress < 1) {
-          rafId = requestAnimationFrame(step);
-        }
-      };
-
-      cancelAnimationFrame(rafId);
-      rafId = requestAnimationFrame(step);
-    };
-
-    const interval = window.setInterval(() => {
-      const delta = Math.round((Math.random() - 0.48) * 1450);
-      const next = Math.max(45670, Math.min(78900, estimatedTargetRef.current + delta));
-      estimatedTargetRef.current = next;
-      animateTo(next);
-    }, 5200);
-
-    return () => {
-      clearInterval(interval);
-      cancelAnimationFrame(rafId);
-    };
-  }, []);
+    if (activeMessages.length > 0) {
+      latestCreatedAtRef.current = activeMessages[activeMessages.length - 1].created_at;
+    }
+  }, [activeMessages]);
 
   const scrollToBottom = useCallback((smooth = true) => {
     const el = scrollContainerRef.current;
@@ -319,6 +307,7 @@ export const SignalsPage: React.FC = () => {
           has_more: boolean;
           counts: { active: number; completed: number };
           online_count: number;
+          subscriber_count?: number;
           viewer_key?: string | null;
         }>('/api/signals/messages?status=active&limit=40');
         if (res.viewer_key) viewerKeyRef.current = res.viewer_key;
@@ -328,6 +317,9 @@ export const SignalsPage: React.FC = () => {
         setCompletedCount(res.counts.completed);
         if (typeof res.online_count === 'number') {
           setRealOnlineCount(res.online_count);
+        }
+        if (typeof res.subscriber_count === 'number') {
+          setSubscriberCount(res.subscriber_count);
         }
         if (!keepScrollPosition) {
           requestAnimationFrame(() => scrollToBottom(false));
@@ -340,6 +332,50 @@ export const SignalsPage: React.FC = () => {
     },
     [scrollToBottom]
   );
+
+  // Delta sync missed messages after reconnection or app wake
+  const syncMissedMessages = useCallback(async () => {
+    const afterIso = latestCreatedAtRef.current;
+    if (!afterIso) {
+      await fetchActiveMessages(true);
+      return;
+    }
+    try {
+      const res = await apiFetch<{
+        messages: SignalChatMessage[];
+        pinned: SignalChatMessage[];
+        counts: { active: number; completed: number };
+        online_count: number;
+        subscriber_count?: number;
+        viewer_key?: string | null;
+      }>(`/api/signals/messages?status=active&after=${encodeURIComponent(afterIso)}&limit=60`);
+
+      if (res.viewer_key) viewerKeyRef.current = res.viewer_key;
+      setPinnedMessages(res.pinned);
+      setCompletedCount(res.counts.completed);
+      if (typeof res.online_count === 'number') setRealOnlineCount(res.online_count);
+      if (typeof res.subscriber_count === 'number') setSubscriberCount(res.subscriber_count);
+
+      if (res.messages.length > 0) {
+        setActiveMessages((prev) => {
+          const map = new Map(prev.map((m) => [m.id, m]));
+          for (const incoming of res.messages) {
+            map.set(incoming.id, incoming);
+          }
+          return Array.from(map.values()).sort((a, b) =>
+            a.created_at.localeCompare(b.created_at)
+          );
+        });
+        if (isNearBottomRef.current) {
+          requestAnimationFrame(() => scrollToBottom(true));
+        } else {
+          setHasUnseenBelow(true);
+        }
+      }
+    } catch {
+      // ignore transient error
+    }
+  }, [fetchActiveMessages, scrollToBottom]);
 
   // Load Completed archive messages
   const fetchCompletedMessages = useCallback(async (searchTerm = '') => {
@@ -447,7 +483,7 @@ export const SignalsPage: React.FC = () => {
     const unsubscribe = subscribeSignalChatEvents((event: SignalChatWsEvent) => {
       switch (event.type) {
         case 'reconnected': {
-          fetchActiveMessages(true);
+          syncMissedMessages();
           if (view === 'completed') fetchCompletedMessages(completedSearch);
           break;
         }
@@ -525,7 +561,7 @@ export const SignalsPage: React.FC = () => {
     return unsubscribe;
   }, [
     subscribeSignalChatEvents,
-    fetchActiveMessages,
+    syncMissedMessages,
     fetchCompletedMessages,
     completedSearch,
     view,
@@ -614,22 +650,26 @@ export const SignalsPage: React.FC = () => {
     }
   };
 
-  // Handle Image Selection & Upload in Composer
+  // Handle Media (Image or Video) Selection & Upload in Composer
   const handleSelectImage = async (file: File | undefined) => {
     if (!file) return;
     setComposerError(null);
+    const mediaType: 'image' | 'video' = file.type.startsWith('video/') ? 'video' : 'image';
     const localPreview = URL.createObjectURL(file);
     setAttachmentPreview(localPreview);
+    setAttachmentMediaType(mediaType);
     setAttachmentName(file.name);
     setUploadingImage(true);
     try {
       const uploaded = await uploadMediaFile(file);
       setAttachmentUrl(uploaded.url);
+      setAttachmentMediaType(uploaded.mimetype?.startsWith('video/') ? 'video' : mediaType);
       setAttachmentName(uploaded.original_name);
     } catch (err) {
-      setComposerError(err instanceof Error ? err.message : 'Image upload failed.');
+      setComposerError(err instanceof Error ? err.message : 'Media upload failed.');
       setAttachmentPreview(null);
       setAttachmentUrl(null);
+      setAttachmentMediaType(null);
       setAttachmentName(null);
     } finally {
       setUploadingImage(false);
@@ -641,15 +681,36 @@ export const SignalsPage: React.FC = () => {
     if (attachmentPreview) URL.revokeObjectURL(attachmentPreview);
     setAttachmentPreview(null);
     setAttachmentUrl(null);
+    setAttachmentMediaType(null);
     setAttachmentName(null);
     if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  const handleInlineEnablePush = async () => {
+    setEnablingInlinePush(true);
+    setInlinePushError(null);
+    const res = await subscribeToPushNotifications();
+    setEnablingInlinePush(false);
+    if (res.ok) {
+      setPushSubscribed(true);
+      setSubscriberCount((c) => c + 1);
+      setInlinePushStatus('Notifications Enabled — instant alerts active on this device.');
+      setTimeout(() => setInlinePushStatus(null), 5000);
+    } else {
+      setInlinePushError(res.error || 'Could not enable push notifications.');
+    }
+  };
+
+  const handleInlineMaybeLater = () => {
+    dismissNotificationPrompt();
+    setPromptDismissed(true);
   };
 
   const handleSendMessage = async (e?: React.FormEvent, asDraft = false) => {
     if (e) e.preventDefault();
     if (!isAdmin || sendingMessage || savingDraft || uploadingImage) return;
     if (!composerText.trim() && !attachmentUrl) {
-      setComposerError('Type a message or attach an image.');
+      setComposerError('Type a message or attach an image/video.');
       return;
     }
 
@@ -668,9 +729,13 @@ export const SignalsPage: React.FC = () => {
           method: 'POST',
           body: JSON.stringify({
             content: composerText.trim(),
-            image_url: attachmentUrl,
-            image_name: attachmentName,
+            image_url: attachmentMediaType === 'image' ? attachmentUrl : null,
+            image_name: attachmentMediaType === 'image' ? attachmentName : null,
+            media_url: attachmentUrl,
+            media_type: attachmentUrl ? attachmentMediaType : null,
+            media_name: attachmentName,
             message_type: composerType,
+            priority: composerPriority,
             status: asDraft ? 'draft' : 'active',
             pinned: !asDraft && composerPinned,
             send_push: asDraft ? false : composerPush,
@@ -693,13 +758,14 @@ export const SignalsPage: React.FC = () => {
         }
         setPublishConfirmation({
           messageId: res.message.id,
-          label: 'Published publicly to Signals Channel',
+          label: 'Published publicly to MeridianFX Signals Channel',
           pushJob: res.push_job || null,
         });
       }
 
       setComposerText('');
       setComposerPinned(false);
+      setComposerPriority('normal');
       handleCancelAttachment();
       if (!asDraft) {
         requestAnimationFrame(() => {
@@ -800,6 +866,7 @@ export const SignalsPage: React.FC = () => {
     setEditingMsgId(msg.id);
     setEditDraftText(msg.content);
     setEditDraftType(msg.message_type);
+    setEditDraftPriority(msg.priority || 'normal');
     setEditDraftImageUrl(msg.image_url || null);
     setConfirmDeleteId(null);
   };
@@ -813,6 +880,7 @@ export const SignalsPage: React.FC = () => {
         body: JSON.stringify({
           content: editDraftText.trim(),
           message_type: editDraftType,
+          priority: editDraftPriority,
           image_url: editDraftImageUrl,
         }),
       });
@@ -1014,15 +1082,28 @@ export const SignalsPage: React.FC = () => {
                   />
                 </div>
                 <p
-                  className="inline-flex items-center gap-1.5 text-[11px] sm:text-xs text-[#15803D] dark:text-emerald-400 font-semibold truncate leading-tight tabular-nums"
-                  title="Estimated community activity"
+                  className={`inline-flex items-center gap-1.5 text-[11px] sm:text-xs font-semibold truncate leading-tight tabular-nums ${
+                    wsConnected
+                      ? 'text-[#15803D] dark:text-emerald-400'
+                      : 'text-amber-600 dark:text-amber-400'
+                  }`}
                 >
                   <span className="relative flex h-2 w-2 shrink-0" aria-hidden="true">
-                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-80" />
-                    <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
+                    {wsConnected && (
+                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-80" />
+                    )}
+                    <span
+                      className={`relative inline-flex rounded-full h-2 w-2 ${
+                        wsConnected ? 'bg-emerald-500' : 'bg-amber-500'
+                      }`}
+                    />
                   </span>
                   <span>
-                    {estimatedMembers.toLocaleString()} active now
+                    {wsConnected
+                      ? `Live Channel · ${realOnlineCount} live${
+                          subscriberCount > 0 ? ` · ${subscriberCount} subscribed` : ''
+                        }`
+                      : 'Reconnecting live channel...'}
                   </span>
                 </p>
               </div>
@@ -1033,8 +1114,8 @@ export const SignalsPage: React.FC = () => {
               <button
                 type="button"
                 onClick={() => setShowNotifModal(true)}
-                aria-label={pushSubscribed ? 'Push notifications active' : 'Enable push notifications'}
-                title={pushSubscribed ? 'Push alerts enabled on this device' : 'Enable real-time push alerts'}
+                aria-label={pushSubscribed ? 'Notifications Enabled' : 'Enable Notifications'}
+                title={pushSubscribed ? 'Notifications enabled on this device' : 'Enable real-time push notifications'}
                 className={`relative min-h-[38px] px-2.5 flex items-center justify-center gap-1.5 rounded-lg text-xs font-semibold whitespace-nowrap shrink-0 transition-colors ${
                   pushSubscribed
                     ? 'text-[#15803D] dark:text-emerald-400 bg-emerald-50/80 dark:bg-emerald-950/30 hover:bg-emerald-100/80'
@@ -1043,7 +1124,7 @@ export const SignalsPage: React.FC = () => {
               >
                 {pushSubscribed ? <BellRing className="w-4 h-4" /> : <Bell className="w-4 h-4" />}
                 <span>
-                  {pushSubscribed ? 'Alerts On' : 'Get Alerts'}
+                  {pushSubscribed ? 'Notifications On' : 'Get Alerts'}
                 </span>
               </button>
 
@@ -1074,7 +1155,7 @@ export const SignalsPage: React.FC = () => {
                     Pinned Message
                   </span>
                   <span className="text-xs text-slate-600 dark:text-slate-300 truncate">
-                    {latestPinned.content || latestPinned.image_name || 'Pinned chart update'}
+                    {latestPinned.content || latestPinned.media_name || latestPinned.image_name || 'Pinned broadcast'}
                   </span>
                 </div>
               </div>
@@ -1084,6 +1165,63 @@ export const SignalsPage: React.FC = () => {
                 </span>
               )}
             </button>
+          )}
+
+          {/* Non-Intrusive First-Visit Notification Invitation Banner */}
+          {!pushSubscribed &&
+            !promptDismissed &&
+            (typeof Notification === 'undefined' || Notification.permission !== 'denied') && (
+              <div className="border-b border-rose-200/80 dark:border-rose-900/40 bg-white dark:bg-[#111827] px-3.5 sm:px-5 py-3 shrink-0 z-10">
+                <div className="mx-auto max-w-3xl flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div className="flex items-start gap-2.5 min-w-0">
+                    <div className="w-8 h-8 rounded-lg bg-[#881337]/10 text-[#881337] dark:text-rose-400 flex items-center justify-center shrink-0 mt-0.5">
+                      <BellRing className="w-4 h-4" />
+                    </div>
+                    <div className="min-w-0">
+                      <p className="text-xs font-bold tracking-wide text-slate-900 dark:text-white">
+                        NEVER MISS A TRADING UPDATE
+                      </p>
+                      <p className="text-xs text-slate-600 dark:text-slate-300 leading-snug mt-0.5">
+                        Get instant notifications whenever MeridianFX publishes new Forex signals, market analysis and important announcements.
+                      </p>
+                      {detectPushPlatform() === 'ios' && !isStandalonePWA() && (
+                        <p className="text-[11px] text-amber-700 dark:text-amber-400 mt-1 font-medium">
+                          iPhone/iPad: Tap Safari Share → Add to Home Screen first, then open the installed app to enable notifications.
+                        </p>
+                      )}
+                      {inlinePushError && (
+                        <p className="text-[11px] text-red-600 dark:text-red-400 mt-1 font-medium">
+                          {inlinePushError}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0 sm:pl-2">
+                    <button
+                      type="button"
+                      disabled={enablingInlinePush || !isPushSupported()}
+                      onClick={handleInlineEnablePush}
+                      className="rounded-lg bg-[#881337] px-3.5 py-2 text-[11px] font-bold uppercase tracking-wide text-white hover:bg-[#6B0F2B] disabled:opacity-60 transition-colors min-h-[36px]"
+                    >
+                      {enablingInlinePush ? 'Enabling...' : 'ENABLE NOTIFICATIONS'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleInlineMaybeLater}
+                      className="rounded-lg border border-slate-300 dark:border-slate-700 px-3 py-2 text-[11px] font-bold uppercase tracking-wide text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors min-h-[36px]"
+                    >
+                      MAYBE LATER
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+          {inlinePushStatus && (
+            <div className="px-4 py-2 bg-emerald-50 dark:bg-emerald-950/30 border-b border-emerald-200 dark:border-emerald-900/40 flex items-center justify-center gap-2 text-xs font-medium text-[#15803D] dark:text-emerald-400 shrink-0">
+              <CheckCircle2 className="w-4 h-4 shrink-0" />
+              <span>{inlinePushStatus}</span>
+            </div>
           )}
 
           {/* Rate limit / transient reaction notice */}
@@ -1194,6 +1332,11 @@ export const SignalsPage: React.FC = () => {
                               <span className="text-[11px] font-medium text-[#15803D] dark:text-emerald-400">
                                 · {MESSAGE_TYPE_LABELS[msg.message_type] || 'Update'}
                               </span>
+                              {msg.priority === 'urgent' && (
+                                <span className="inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wide bg-rose-100 text-[#881337] dark:bg-rose-950/60 dark:text-rose-300">
+                                  <Zap className="w-2.5 h-2.5" /> Urgent
+                                </span>
+                              )}
                               {isAdmin && (
                                 <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-500">
                                   · Published
@@ -1285,18 +1428,32 @@ export const SignalsPage: React.FC = () => {
                           {/* Edit Mode vs Message Content */}
                           {isEditing ? (
                             <div className="space-y-2 py-1">
-                              <select
-                                value={editDraftType}
-                                onChange={(e) =>
-                                  setEditDraftType(e.target.value as SignalChatMessageType)
-                                }
-                                className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2.5 py-1.5 text-xs text-slate-900 dark:text-white"
-                              >
-                                <option value="signal">Trading Signal</option>
-                                <option value="update">Market Update</option>
-                                <option value="analysis">Chart Analysis</option>
-                                <option value="announcement">Announcement</option>
-                              </select>
+                              <div className="flex flex-wrap items-center gap-2">
+                                <select
+                                  value={editDraftType}
+                                  onChange={(e) =>
+                                    setEditDraftType(e.target.value as SignalChatMessageType)
+                                  }
+                                  className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2.5 py-1.5 text-xs text-slate-900 dark:text-white"
+                                >
+                                  <option value="signal">Trading Signal</option>
+                                  <option value="setup">Buy / Sell Setup</option>
+                                  <option value="analysis">Chart Analysis</option>
+                                  <option value="update">Market Update</option>
+                                  <option value="news">Economic News Alert</option>
+                                  <option value="announcement">Announcement</option>
+                                </select>
+                                <select
+                                  value={editDraftPriority}
+                                  onChange={(e) =>
+                                    setEditDraftPriority(e.target.value as SignalChatPriority)
+                                  }
+                                  className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2.5 py-1.5 text-xs text-slate-900 dark:text-white"
+                                >
+                                  <option value="normal">Normal Priority</option>
+                                  <option value="urgent">Urgent Alert</option>
+                                </select>
+                              </div>
 
                               <textarea
                                 rows={3}
@@ -1341,15 +1498,25 @@ export const SignalsPage: React.FC = () => {
                             </div>
                           ) : (
                             <>
-                              {msg.image_url && (
+                              {msg.media_type === 'video' && msg.media_url ? (
+                                <div className={msg.content ? 'mb-2.5' : 'mb-1'}>
+                                  <video
+                                    src={msg.media_url}
+                                    controls
+                                    playsInline
+                                    preload="metadata"
+                                    className="w-full max-h-80 rounded-xl bg-black"
+                                  />
+                                </div>
+                              ) : (msg.media_url || msg.image_url) ? (
                                 <div className={msg.content ? 'mb-2.5' : 'mb-1'}>
                                   <ChatImageAttachment
-                                    src={msg.image_url}
-                                    alt={msg.image_name || 'Trading chart attachment'}
+                                    src={msg.media_url || msg.image_url || ''}
+                                    alt={msg.media_name || msg.image_name || 'Trading chart attachment'}
                                     onOpen={setLightboxUrl}
                                   />
                                 </div>
-                              )}
+                              ) : null}
 
                               {msg.content && (
                                 <p className="text-[15px] text-slate-800 dark:text-slate-100 leading-relaxed whitespace-pre-wrap break-words">
@@ -1430,7 +1597,7 @@ export const SignalsPage: React.FC = () => {
                       </p>
                       <p className="text-[11px] text-slate-600 dark:text-slate-300 font-mono tabular-nums">
                         {publishConfirmation.pushJob
-                          ? `Push queued: ${publishConfirmation.pushJob.queued_count} · Delivered: ${publishConfirmation.pushJob.delivered_count} · Failures: ${publishConfirmation.pushJob.failed_count} (Targeted: ${publishConfirmation.pushJob.total_targeted})`
+                          ? `Targeted: ${publishConfirmation.pushJob.total_targeted} · Sent: ${publishConfirmation.pushJob.delivered_count} · Confirmed: ${publishConfirmation.pushJob.confirmed_count} · Queued: ${publishConfirmation.pushJob.queued_count} · Failed: ${publishConfirmation.pushJob.failed_count}`
                           : 'Push notification skipped for this post.'}
                       </p>
                     </div>
@@ -1468,7 +1635,7 @@ export const SignalsPage: React.FC = () => {
                             [Draft · {MESSAGE_TYPE_LABELS[draft.message_type]}]
                           </span>
                           <span className="text-slate-700 dark:text-slate-200 truncate block">
-                            {draft.content || draft.image_name || 'Image attachment'}
+                            {draft.content || draft.media_name || draft.image_name || 'Media attachment'}
                           </span>
                         </div>
                         <div className="flex items-center gap-1.5 shrink-0">
@@ -1496,7 +1663,7 @@ export const SignalsPage: React.FC = () => {
 
                 {/* Compact Composer Controls Strip */}
                 <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
-                  <div className="flex items-center gap-1.5">
+                  <div className="flex flex-wrap items-center gap-1.5">
                     <select
                       value={composerType}
                       onChange={(e) => setComposerType(e.target.value as SignalChatMessageType)}
@@ -1504,10 +1671,27 @@ export const SignalsPage: React.FC = () => {
                       className="rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 px-2.5 py-1 text-[11px] font-semibold text-slate-700 dark:text-slate-200"
                     >
                       <option value="signal">Trading Signal</option>
-                      <option value="update">Market Update</option>
+                      <option value="setup">Buy / Sell Setup</option>
                       <option value="analysis">Chart Analysis</option>
+                      <option value="update">Market Update</option>
+                      <option value="news">Economic News Alert</option>
                       <option value="announcement">Announcement</option>
                     </select>
+
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setComposerPriority((p) => (p === 'urgent' ? 'normal' : 'urgent'))
+                      }
+                      className={`inline-flex items-center gap-1 rounded-lg border px-2 py-1 text-[11px] font-semibold transition-colors ${
+                        composerPriority === 'urgent'
+                          ? 'border-rose-500 bg-rose-50 text-[#881337] dark:bg-rose-950/40 dark:text-rose-300'
+                          : 'border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300'
+                      }`}
+                    >
+                      <Zap className="w-3 h-3" />
+                      <span>{composerPriority === 'urgent' ? 'Urgent' : 'Normal'}</span>
+                    </button>
 
                     <button
                       type="button"
@@ -1540,25 +1724,31 @@ export const SignalsPage: React.FC = () => {
                       onChange={(e) => setComposerPush(e.target.checked)}
                       className="accent-[#881337] w-3.5 h-3.5"
                     />
-                    <span>Auto Push Alert</span>
+                    <span>Send Push Notification</span>
                   </label>
                 </div>
 
-                {/* Image Preview Strip */}
+                {/* Media Preview Strip */}
                 {(attachmentPreview || attachmentUrl) && (
                   <div className="flex items-center justify-between gap-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 p-2">
                     <div className="flex items-center gap-2.5 min-w-0">
-                      <img
-                        src={attachmentPreview || attachmentUrl || ''}
-                        alt="Attachment preview"
-                        className="w-11 h-11 rounded-lg object-cover border border-slate-200 dark:border-slate-700 shrink-0"
-                      />
+                      {attachmentMediaType === 'video' ? (
+                        <div className="w-11 h-11 rounded-lg bg-slate-900 text-white flex items-center justify-center border border-slate-700 shrink-0">
+                          <Film className="w-5 h-5" />
+                        </div>
+                      ) : (
+                        <img
+                          src={attachmentPreview || attachmentUrl || ''}
+                          alt="Attachment preview"
+                          className="w-11 h-11 rounded-lg object-cover border border-slate-200 dark:border-slate-700 shrink-0"
+                        />
+                      )}
                       <div className="min-w-0">
                         <p className="text-xs font-medium text-slate-800 dark:text-slate-200 truncate">
-                          {attachmentName || 'Chart screenshot'}
+                          {attachmentName || (attachmentMediaType === 'video' ? 'Video attachment' : 'Chart screenshot')}
                         </p>
                         <p className="text-[11px] text-slate-500">
-                          {uploadingImage ? 'Uploading...' : 'Ready to send'}
+                          {uploadingImage ? 'Uploading...' : 'Ready to publish'}
                         </p>
                       </div>
                     </div>
@@ -1584,7 +1774,7 @@ export const SignalsPage: React.FC = () => {
                   <input
                     ref={fileInputRef}
                     type="file"
-                    accept="image/*"
+                    accept="image/*,video/mp4,video/webm"
                     className="hidden"
                     onChange={(e) => handleSelectImage(e.target.files?.[0])}
                   />
@@ -1593,8 +1783,8 @@ export const SignalsPage: React.FC = () => {
                     type="button"
                     onClick={() => fileInputRef.current?.click()}
                     disabled={uploadingImage || sendingMessage || savingDraft}
-                    title="Attach image or chart screenshot"
-                    aria-label="Attach image"
+                    title="Attach chart image, screenshot, or video (MP4/WebM)"
+                    aria-label="Attach image or video"
                     className="min-h-[44px] min-w-[44px] flex items-center justify-center rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-200 hover:text-[#881337] disabled:opacity-50 shrink-0 transition-colors"
                   >
                     {uploadingImage ? (
@@ -1748,17 +1938,27 @@ export const SignalsPage: React.FC = () => {
                           </p>
                         )}
 
-                        {msg.image_url && (
+                        {msg.media_type === 'video' && msg.media_url ? (
+                          <div className="rounded-xl overflow-hidden bg-black h-36">
+                            <video
+                              src={msg.media_url}
+                              preload="metadata"
+                              muted
+                              playsInline
+                              className="w-full h-full object-cover"
+                            />
+                          </div>
+                        ) : (msg.media_url || msg.image_url) ? (
                           <div className="rounded-xl overflow-hidden bg-slate-100 dark:bg-slate-900 h-36">
                             <img
-                              src={msg.image_url}
-                              alt={msg.image_name || 'Archived chart'}
+                              src={msg.media_url || msg.image_url || ''}
+                              alt={msg.media_name || msg.image_name || 'Archived chart'}
                               referrerPolicy="no-referrer"
                               loading="lazy"
                               className="w-full h-full object-cover"
                             />
                           </div>
-                        )}
+                        ) : null}
                       </div>
 
                       <div className="pt-2 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between gap-2 text-xs text-slate-500">
@@ -1838,13 +2038,13 @@ export const SignalsPage: React.FC = () => {
 
             <div className="rounded-xl bg-slate-50 dark:bg-slate-900/80 p-3.5 space-y-2 text-xs">
               <div className="flex items-center justify-between">
-                <span className="text-slate-500 dark:text-slate-400">Estimated Activity</span>
+                <span className="text-slate-500 dark:text-slate-400">Subscribed Push Devices</span>
                 <span className="font-mono font-semibold text-[#15803D] dark:text-emerald-400 tabular-nums">
-                  {estimatedMembers.toLocaleString()} active now
+                  {subscriberCount} device{subscriberCount === 1 ? '' : 's'}
                 </span>
               </div>
               <div className="flex items-center justify-between">
-                <span className="text-slate-500 dark:text-slate-400">Live Connected Devices</span>
+                <span className="text-slate-500 dark:text-slate-400">Live Connected Viewers</span>
                 <span className="font-mono font-semibold text-[#15803D] dark:text-emerald-400 tabular-nums">
                   {realOnlineCount} online · {wsConnected ? 'Live Sync' : 'Reconnecting'}
                 </span>
@@ -1962,13 +2162,21 @@ export const SignalsPage: React.FC = () => {
               </div>
             )}
 
-            {selectedCompleted.image_url && (
+            {selectedCompleted.media_type === 'video' && selectedCompleted.media_url ? (
+              <video
+                src={selectedCompleted.media_url}
+                controls
+                playsInline
+                preload="metadata"
+                className="w-full max-h-96 rounded-xl bg-black"
+              />
+            ) : (selectedCompleted.media_url || selectedCompleted.image_url) ? (
               <ChatImageAttachment
-                src={selectedCompleted.image_url}
-                alt={selectedCompleted.image_name || 'Archived signal chart'}
+                src={selectedCompleted.media_url || selectedCompleted.image_url || ''}
+                alt={selectedCompleted.media_name || selectedCompleted.image_name || 'Archived signal chart'}
                 onOpen={setLightboxUrl}
               />
-            )}
+            ) : null}
 
             {selectedCompleted.content && (
               <p className="text-sm sm:text-[15px] text-slate-800 dark:text-slate-100 leading-relaxed whitespace-pre-wrap break-words">

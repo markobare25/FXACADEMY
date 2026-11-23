@@ -3,7 +3,7 @@ import { clientsClaim } from 'workbox-core';
 import { ExpirationPlugin } from 'workbox-expiration';
 import { cleanupOutdatedCaches, precacheAndRoute } from 'workbox-precaching';
 import { registerRoute } from 'workbox-routing';
-import { CacheFirst, NetworkFirst } from 'workbox-strategies';
+import { CacheFirst, NetworkFirst, NetworkOnly } from 'workbox-strategies';
 
 declare const self: ServiceWorkerGlobalScope & {
   __WB_MANIFEST: Array<{ url: string; revision: string | null }>;
@@ -34,6 +34,15 @@ clientsClaim();
 cleanupOutdatedCaches();
 precacheAndRoute(self.__WB_MANIFEST || []);
 
+// Never cache auth, push registration/ack, or real-time delta sync calls
+registerRoute(
+  ({ url }) =>
+    url.pathname.startsWith('/api/push/') ||
+    url.pathname.startsWith('/api/auth/') ||
+    (url.pathname === '/api/signals/messages' && url.searchParams.has('after')),
+  new NetworkOnly()
+);
+
 // Cache previously loaded educational materials, signals, and updates for offline reading
 registerRoute(
   ({ url }) =>
@@ -43,7 +52,7 @@ registerRoute(
     url.pathname.startsWith('/api/settings'),
   new NetworkFirst({
     cacheName: 'meridianfx-content-cache',
-    networkTimeoutSeconds: 4,
+    networkTimeoutSeconds: 2,
     plugins: [
       new ExpirationPlugin({
         maxEntries: 80,
@@ -108,6 +117,20 @@ function urlBase64ToUint8Array(base64String: string): Uint8Array {
   return outputArray;
 }
 
+async function ackPushEvent(deliveryId: string | undefined, eventName: 'received' | 'clicked') {
+  if (!deliveryId || deliveryId.startsWith('test-')) return;
+  try {
+    await fetch('/api/push/ack', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deliveryId, event: eventName }),
+      keepalive: true,
+    });
+  } catch {
+    // Ignore transient offline ack errors
+  }
+}
+
 // Web Push Notification listener (works when app/website is closed, backgrounded, or phone screen is locked)
 self.addEventListener('push', (event) => {
   if (!event.data) return;
@@ -118,6 +141,10 @@ self.addEventListener('push', (event) => {
     subtitle?: string;
     url?: string;
     messageId?: string | null;
+    jobId?: string | null;
+    deliveryId?: string;
+    priority?: 'normal' | 'urgent';
+    forceShow?: boolean;
     publishedAt?: string;
     category?: string;
     tag?: string;
@@ -146,6 +173,7 @@ self.addEventListener('push', (event) => {
   const targetUrl =
     payload.url || (payload.messageId ? `/signals?message=${payload.messageId}` : '/signals');
   const silent = Boolean(payload.silent);
+  const isUrgent = payload.priority === 'urgent';
 
   const options: ExtendedNotificationOptions = {
     body,
@@ -158,18 +186,53 @@ self.addEventListener('push', (event) => {
         : `mfx-${payload.category || 'alert'}-${Date.now()}`),
     renotify: !silent,
     silent,
-    ...(silent ? {} : { vibrate: [220, 90, 220] }),
+    ...(silent
+      ? {}
+      : { vibrate: isUrgent ? [260, 90, 260, 90, 260] : [220, 90, 220] }),
     timestamp: Number.isFinite(publishedMs) ? publishedMs : Date.now(),
-    actions: [{ action: 'open', title: 'Open in MeridianFX' }],
+    actions: [{ action: 'open', title: 'Open Message' }],
     data: {
       url: targetUrl,
       messageId: payload.messageId || null,
+      deliveryId: payload.deliveryId || null,
       category: payload.category || 'general',
     },
     ...(payload.image ? { image: payload.image } : {}),
   };
 
   const work = async () => {
+    const ackPromise = ackPushEvent(payload.deliveryId, 'received');
+
+    // Only suppress duplicate OS banner when user is actively viewing /signals in a focused visible window
+    if (!payload.forceShow) {
+      const allClients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+      const activeSignalsClients = allClients.filter((client) => {
+        try {
+          const u = new URL(client.url);
+          return (
+            client.focused &&
+            client.visibilityState === 'visible' &&
+            u.origin === self.location.origin &&
+            (u.pathname === '/signals' || u.pathname === '/signals/')
+          );
+        } catch {
+          return false;
+        }
+      });
+
+      if (activeSignalsClients.length > 0) {
+        for (const client of activeSignalsClients) {
+          client.postMessage({
+            type: 'mfx:push-received-foreground',
+            messageId: payload.messageId || null,
+            url: targetUrl,
+          });
+        }
+        await ackPromise;
+        return;
+      }
+    }
+
     await self.registration.showNotification(title, options);
     const nav = self.navigator as Navigator & {
       setAppBadge?: (contents?: number) => Promise<void>;
@@ -186,6 +249,7 @@ self.addEventListener('push', (event) => {
         // Badging API unsupported in this browser context
       }
     }
+    await ackPromise;
   };
 
   event.waitUntil(work());
@@ -193,12 +257,17 @@ self.addEventListener('push', (event) => {
 
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
-  const data = (event.notification.data || {}) as { url?: string; messageId?: string | null };
+  const data = (event.notification.data || {}) as {
+    url?: string;
+    messageId?: string | null;
+    deliveryId?: string | null;
+  };
   const targetUrl =
     data.url || (data.messageId ? `/signals?message=${data.messageId}` : '/signals');
   const absoluteTarget = new URL(targetUrl, self.location.origin).href;
 
   const work = async () => {
+    const ackPromise = ackPushEvent(data.deliveryId || undefined, 'clicked');
     const nav = self.navigator as Navigator & {
       clearAppBadge?: () => Promise<void>;
     };
@@ -222,9 +291,11 @@ self.addEventListener('notificationclick', (event) => {
           url: targetUrl,
           messageId: data.messageId || null,
         });
+        await ackPromise;
         return client;
       }
     }
+    await ackPromise;
     if (self.clients.openWindow) {
       return self.clients.openWindow(absoluteTarget);
     }

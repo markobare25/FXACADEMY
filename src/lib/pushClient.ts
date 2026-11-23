@@ -49,8 +49,10 @@ async function getReadyServiceWorkerRegistration(timeoutMs = 6000): Promise<Serv
   ]);
 }
 
-export function detectPushPlatform(): 'android' | 'ios' | 'desktop' {
-  if (typeof navigator === 'undefined') return 'desktop';
+const PROMPT_DISMISSED_KEY = 'mfx_push_invite_dismissed_v1';
+
+export function detectPushPlatform(): 'android' | 'ios' | 'web' {
+  if (typeof navigator === 'undefined') return 'web';
   const ua = navigator.userAgent.toLowerCase();
   if (/android/.test(ua)) return 'android';
   if (
@@ -59,7 +61,51 @@ export function detectPushPlatform(): 'android' | 'ios' | 'desktop' {
   ) {
     return 'ios';
   }
-  return 'desktop';
+  return 'web';
+}
+
+export function detectBrowserName(): string {
+  if (typeof navigator === 'undefined') return 'Browser';
+  const ua = navigator.userAgent;
+  if (/edg\//i.test(ua)) return 'Edge';
+  if (/opr\//i.test(ua) || /opera/i.test(ua)) return 'Opera';
+  if (/samsungbrowser/i.test(ua)) return 'Samsung Internet';
+  if (/firefox|fxios/i.test(ua)) return 'Firefox';
+  if (/crios|chrome/i.test(ua)) return 'Chrome';
+  if (/safari/i.test(ua)) return 'Safari';
+  return 'Browser';
+}
+
+export function isStandalonePWA(): boolean {
+  if (typeof window === 'undefined') return false;
+  return (
+    window.matchMedia('(display-mode: standalone)').matches ||
+    (window.navigator as unknown as { standalone?: boolean }).standalone === true
+  );
+}
+
+export function isNotificationPromptDismissed(): boolean {
+  try {
+    return localStorage.getItem(PROMPT_DISMISSED_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+export function dismissNotificationPrompt(): void {
+  try {
+    localStorage.setItem(PROMPT_DISMISSED_KEY, '1');
+  } catch {
+    // ignore storage errors
+  }
+}
+
+export function clearNotificationPromptDismissal(): void {
+  try {
+    localStorage.removeItem(PROMPT_DISMISSED_KEY);
+  } catch {
+    // ignore storage errors
+  }
 }
 
 export function isPushSupported(): boolean {
@@ -122,6 +168,7 @@ export async function syncExistingPushSubscriptionIfGranted(): Promise<boolean> 
             auth: json.keys.auth,
           },
           platform: detectPushPlatform(),
+          browser_name: detectBrowserName(),
           ...(oldEndpoint ? { old_endpoint: oldEndpoint } : {}),
         }),
       });
@@ -141,10 +188,13 @@ export async function subscribeToPushNotifications(
   error?: string;
 }> {
   if (!isPushSupported()) {
+    const iosNotStandalone = detectPushPlatform() === 'ios' && !isStandalonePWA();
     return {
       ok: false,
       permission: 'denied',
-      error: 'Push notifications require a modern browser or installed iOS 16.4+ Home Screen Web App.',
+      error: iosNotStandalone
+        ? 'On iPhone/iPad, tap Safari Share → Add to Home Screen first, then open the installed MeridianFX app to enable push notifications.'
+        : 'Push notifications require a modern browser or installed iOS 16.4+ Home Screen Web App.',
     };
   }
 
@@ -198,11 +248,13 @@ export async function subscribeToPushNotifications(
           auth: json.keys.auth,
         },
         platform: detectPushPlatform(),
+        browser_name: detectBrowserName(),
         ...(oldEndpoint ? { old_endpoint: oldEndpoint } : {}),
         ...(prefs ? { prefs } : {}),
       }),
     });
 
+    clearNotificationPromptDismissal();
     return { ok: true, permission, prefs: res.prefs };
   } catch (err) {
     return {
