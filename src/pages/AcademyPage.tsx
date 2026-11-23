@@ -88,13 +88,8 @@ export const AcademyPage: React.FC = () => {
     openCourse(course);
   };
 
-  const handleSelectFooterPath = (path: PathFilter) => {
+  const handleSelectPath = (path: PathFilter) => {
     setPathFilter(path);
-    if (coursesTopRef.current) {
-      coursesTopRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    } else {
-      window.scrollTo({ top: 0, behavior: 'smooth' });
-    }
   };
 
   if (selectedCourse) {
@@ -118,15 +113,41 @@ export const AcademyPage: React.FC = () => {
   }
 
   return (
-    <div ref={coursesTopRef} className="space-y-6 pb-20">
-      <div className="flex items-center justify-between gap-3">
-        <h1 className="text-2xl font-bold text-slate-900 dark:text-white tracking-tight">
-          Academy
-        </h1>
-        <span className="text-xs font-semibold text-[#881337] dark:text-rose-400">
-          {FOOTER_PATH_BUTTONS.find((b) => b.id === pathFilter)?.label} ({filteredCourses.length})
-        </span>
-      </div>
+    <div ref={coursesTopRef} className="space-y-5">
+      {/* Academy Header + Course Level Tabs at Top of Topics */}
+      <header className="space-y-3">
+        <div className="flex items-center justify-between gap-3">
+          <h1 className="text-2xl font-bold text-slate-900 dark:text-white tracking-tight">
+            Academy
+          </h1>
+          <span className="text-xs font-semibold text-[#881337] dark:text-rose-400">
+            {FOOTER_PATH_BUTTONS.find((b) => b.id === pathFilter)?.label} ({filteredCourses.length})
+          </span>
+        </div>
+
+        <nav
+          aria-label="Academy course levels"
+          className="flex items-center gap-1.5 overflow-x-auto pb-1"
+        >
+          {FOOTER_PATH_BUTTONS.map((btn) => {
+            const active = pathFilter === btn.id;
+            return (
+              <button
+                key={btn.id}
+                type="button"
+                onClick={() => handleSelectPath(btn.id)}
+                className={`px-3.5 py-2.5 rounded-xl text-xs font-semibold whitespace-nowrap shrink-0 min-h-[44px] transition-colors ${
+                  active
+                    ? 'bg-[#881337] text-white shadow-xs'
+                    : 'bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800'
+                }`}
+              >
+                {btn.label}
+              </button>
+            );
+          })}
+        </nav>
+      </header>
 
       {/* Courses Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
@@ -204,32 +225,6 @@ export const AcademyPage: React.FC = () => {
           );
         })}
       </div>
-
-      {/* Footer Navigation Buttons: Only All 15 Courses, Beginner, Intermediate, Advanced */}
-      <footer
-        aria-label="Academy course levels"
-        className="sticky bottom-16 lg:bottom-0 z-20 -mx-4 sm:mx-0 border-t border-slate-200 dark:border-slate-800 bg-white/95 dark:bg-[#0B101B]/95 backdrop-blur-md px-3 py-2.5 sm:rounded-2xl sm:border"
-      >
-        <div className="grid grid-cols-4 gap-1.5 sm:gap-2">
-          {FOOTER_PATH_BUTTONS.map((btn) => {
-            const active = pathFilter === btn.id;
-            return (
-              <button
-                key={btn.id}
-                type="button"
-                onClick={() => handleSelectFooterPath(btn.id)}
-                className={`px-2 py-2.5 rounded-xl text-[11px] sm:text-xs font-semibold whitespace-nowrap truncate min-h-[44px] transition-colors ${
-                  active
-                    ? 'bg-[#881337] text-white shadow-xs'
-                    : 'bg-slate-100 dark:bg-slate-800/80 text-slate-700 dark:text-slate-200 hover:bg-slate-200 dark:hover:bg-slate-700'
-                }`}
-              >
-                {btn.label}
-              </button>
-            );
-          })}
-        </div>
-      </footer>
     </div>
   );
 };
