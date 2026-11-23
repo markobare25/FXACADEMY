@@ -25,6 +25,7 @@ import {
   cleanupExpiredAuthRecords,
   createAuthSession,
   extractAuthContext,
+  extractBearerContext,
   isActivePremiumUser,
   isUserMembershipExpired,
   logUserActivity,
@@ -91,10 +92,24 @@ httpServer.on('upgrade', (request, socket, head) => {
 
 const wsClients = new Set<WebSocket>();
 const wsAliveMap = new WeakMap<WebSocket, boolean>();
+const wsMetaMap = new WeakMap<WebSocket, { isAdmin: boolean; conversationIds: Set<string> }>();
+
+function hashSupportToken(rawToken: string): string {
+  return crypto.createHash('sha256').update(rawToken).digest('hex');
+}
+
+function verifySupportToken(rawToken: string, expectedHash: string): boolean {
+  if (!rawToken || !expectedHash) return false;
+  const actualBuf = Buffer.from(hashSupportToken(rawToken), 'hex');
+  const expectedBuf = Buffer.from(expectedHash, 'hex');
+  if (actualBuf.length === 0 || actualBuf.length !== expectedBuf.length) return false;
+  return crypto.timingSafeEqual(actualBuf, expectedBuf);
+}
 
 wss.on('connection', (ws) => {
   wsClients.add(ws);
   wsAliveMap.set(ws, true);
+  wsMetaMap.set(ws, { isAdmin: false, conversationIds: new Set() });
   ws.send(
     JSON.stringify({
       event: 'connected',
@@ -110,9 +125,49 @@ wss.on('connection', (ws) => {
   ws.on('message', (raw) => {
     wsAliveMap.set(ws, true);
     try {
-      const parsed = JSON.parse(String(raw)) as { event?: string };
+      const parsed = JSON.parse(String(raw)) as {
+        event?: string;
+        token?: string;
+        conversation_id?: string;
+      };
       if (parsed?.event === 'ping' && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ event: 'pong', data: { timestamp: new Date().toISOString() } }));
+        return;
+      }
+      if (parsed?.event === 'admin:subscribe' && parsed.token) {
+        const ctx = extractBearerContext(parsed.token);
+        const meta = wsMetaMap.get(ws);
+        if (
+          meta &&
+          ctx.user &&
+          ctx.user.role === 'admin' &&
+          ctx.user.email.toLowerCase() === DESIGNATED_ADMIN_EMAIL
+        ) {
+          meta.isAdmin = true;
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ event: 'admin:subscribed', data: { ok: true } }));
+          }
+        }
+        return;
+      }
+      if (parsed?.event === 'support:subscribe' && parsed.conversation_id && parsed.token) {
+        const conv = db
+          .prepare('SELECT id, access_token_hash FROM support_conversations WHERE id = ?')
+          .get(String(parsed.conversation_id)) as
+          | { id: string; access_token_hash: string }
+          | undefined;
+        const meta = wsMetaMap.get(ws);
+        if (conv && meta && verifySupportToken(String(parsed.token), conv.access_token_hash)) {
+          meta.conversationIds.add(conv.id);
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(
+              JSON.stringify({
+                event: 'support:subscribed',
+                data: { conversation_id: conv.id },
+              })
+            );
+          }
+        }
       }
     } catch {
       // ignore non-JSON frames
@@ -150,6 +205,26 @@ function broadcastWs(event: string, data: unknown): void {
   const payload = JSON.stringify({ event, data });
   for (const client of wsClients) {
     if (client.readyState === WebSocket.OPEN) {
+      client.send(payload);
+    }
+  }
+}
+
+function emitAdminWs(event: string, data: unknown): void {
+  const payload = JSON.stringify({ event, data });
+  for (const client of wsClients) {
+    if (client.readyState === WebSocket.OPEN && wsMetaMap.get(client)?.isAdmin) {
+      client.send(payload);
+    }
+  }
+}
+
+function emitSupportWs(conversationId: string, event: string, data: unknown): void {
+  const payload = JSON.stringify({ event, data });
+  for (const client of wsClients) {
+    if (client.readyState !== WebSocket.OPEN) continue;
+    const meta = wsMetaMap.get(client);
+    if (meta && (meta.isAdmin || meta.conversationIds.has(conversationId))) {
       client.send(payload);
     }
   }
@@ -200,6 +275,19 @@ const upload = multer({
   },
 });
 
+const supportImageUpload = multer({
+  storage,
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const allowedImages = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+    if (allowedImages.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Customer chat accepts image files only (JPG, PNG, WebP, GIF up to 5MB).'));
+    }
+  },
+});
+
 function isHttpsRequest(req: Request): boolean {
   const proto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
   return Boolean(req.secure || proto === 'https');
@@ -243,6 +331,42 @@ function clearRefreshCookie(req: Request, res: Response): void {
   }
 }
 
+function setAdminRefreshCookie(
+  req: Request,
+  res: Response,
+  refreshToken: string,
+  rememberMe: boolean
+): void {
+  const isHttps = isHttpsRequest(req);
+  res.cookie('mfx_admin_refresh', refreshToken, {
+    httpOnly: true,
+    sameSite: isHttps ? 'none' : 'lax',
+    secure: isHttps,
+    ...(isHttps ? { partitioned: true } : {}),
+    ...(rememberMe ? { maxAge: REFRESH_REMEMBER_TTL_SEC * 1000 } : {}),
+    path: '/api/admin',
+  });
+}
+
+function clearAdminRefreshCookie(req: Request, res: Response): void {
+  const isHttps = isHttpsRequest(req);
+  res.clearCookie('mfx_admin_refresh', {
+    httpOnly: true,
+    sameSite: isHttps ? 'none' : 'lax',
+    secure: isHttps,
+    ...(isHttps ? { partitioned: true } : {}),
+    path: '/api/admin',
+  });
+  if (isHttps) {
+    res.clearCookie('mfx_admin_refresh', {
+      httpOnly: true,
+      sameSite: 'none',
+      secure: true,
+      path: '/api/admin',
+    });
+  }
+}
+
 // Verify Origin/Host or X-Requested-With on cookie-authenticated state-changing API requests
 app.use('/api', (req: Request, res: Response, next: NextFunction) => {
   const method = req.method.toUpperCase();
@@ -257,7 +381,7 @@ app.use('/api', (req: Request, res: Response, next: NextFunction) => {
     return;
   }
   const cookies = parseCookies(req.headers.cookie);
-  if (!cookies['mfx_refresh']) {
+  if (!cookies['mfx_refresh'] && !cookies['mfx_admin_refresh']) {
     next();
     return;
   }
@@ -414,35 +538,29 @@ app.post('/api/auth/login', rateLimit(40, 60_000), (req: Request, res: Response)
   }
 
   const resolvedEmail = String(row.email).toLowerCase();
-  const isDesignatedAdmin = resolvedEmail === DESIGNATED_ADMIN_EMAIL;
+  const isDesignatedAdmin = resolvedEmail === DESIGNATED_ADMIN_EMAIL || row.role === 'admin';
 
-  if (row.status === 'suspended' && !isDesignatedAdmin) {
+  // Strictly block administrator sign-in via the public/member login endpoint
+  if (isDesignatedAdmin) {
+    res.status(403).json({
+      error: 'Administrator authentication is isolated to the dedicated /admin website.',
+    });
+    return;
+  }
+
+  if (row.status === 'suspended') {
     res.status(403).json({ error: 'Your membership has been suspended. Please contact the MeridianFX administrator.' });
     return;
   }
 
-  if (isUserMembershipExpired(row) && !isDesignatedAdmin) {
+  if (isUserMembershipExpired(row)) {
     res.status(403).json({ error: 'Your premium membership has expired. Contact the MeridianFX administrator to renew.' });
     return;
   }
 
   const now = new Date().toISOString();
-  if (isDesignatedAdmin) {
-    db.prepare(
-      "UPDATE users SET role = 'admin', status = 'active', email_verified = 1, needs_password_setup = 0, last_login_at = ? WHERE id = ?"
-    ).run(now, String(row.id));
-    row.role = 'admin';
-    row.status = 'active';
-    row.email_verified = 1;
-  } else {
-    if (row.role === 'admin') {
-      db.prepare("UPDATE users SET role = 'user', last_login_at = ? WHERE id = ?").run(now, String(row.id));
-      row.role = 'user';
-    } else {
-      db.prepare('UPDATE users SET last_login_at = ? WHERE id = ?').run(now, String(row.id));
-    }
-  }
-  logUserActivity(String(row.id), 'Sign In', 'Authenticated session started.', req.ip);
+  db.prepare('UPDATE users SET last_login_at = ? WHERE id = ?').run(now, String(row.id));
+  logUserActivity(String(row.id), 'Sign In', 'Premium member session started.', req.ip);
 
   const user = mapDbUser({ ...row, last_login_at: now });
   const rememberMe = parsed.data.remember_me !== false;
@@ -473,6 +591,7 @@ app.post('/api/auth/refresh', (req: Request, res: Response) => {
   const rotated = rotateRefreshSession(rawRefresh, {
     userAgent: String(req.headers['user-agent'] || ''),
     ip: req.ip,
+    blockAdmin: true,
   });
 
   if (!rotated) {
@@ -491,6 +610,139 @@ app.post('/api/auth/refresh', (req: Request, res: Response) => {
     expires_in: rotated.expiresIn,
     remember_me: rotated.rememberMe,
   });
+});
+
+// ---------- Isolated Administrator Portal Authentication (/api/admin/auth/*) ----------
+app.use('/api/admin/auth', (_req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  next();
+});
+
+app.post('/api/admin/auth/login', rateLimit(25, 60_000), (req: Request, res: Response) => {
+  const parsed = loginSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.issues[0]?.message || 'Administrator credentials are required.' });
+    return;
+  }
+
+  const identifier = (parsed.data.identifier || parsed.data.email || '').trim().toLowerCase();
+  const row = db
+    .prepare(
+      `SELECT * FROM users
+       WHERE LOWER(email) = ?
+          OR (username IS NOT NULL AND username != '' AND LOWER(username) = ?)
+       LIMIT 1`
+    )
+    .get(identifier, identifier) as Record<string, unknown> | undefined;
+
+  if (!row || !verifyPassword(parsed.data.password, String(row.password_hash))) {
+    res.status(401).json({ error: 'Invalid administrator credentials.' });
+    return;
+  }
+
+  const resolvedEmail = String(row.email).toLowerCase();
+  if (resolvedEmail !== DESIGNATED_ADMIN_EMAIL) {
+    res.status(403).json({ error: 'Only authorised MeridianFX administrators can access /admin.' });
+    return;
+  }
+
+  const now = new Date().toISOString();
+  db.prepare(
+    "UPDATE users SET role = 'admin', status = 'active', email_verified = 1, needs_password_setup = 0, last_login_at = ? WHERE id = ?"
+  ).run(now, String(row.id));
+
+  const user = mapDbUser({
+    ...row,
+    role: 'admin',
+    status: 'active',
+    email_verified: 1,
+    needs_password_setup: 0,
+    last_login_at: now,
+  });
+  logUserActivity(user.id, 'Admin Sign In', 'Dedicated /admin portal session started.', req.ip);
+
+  const rememberMe = parsed.data.remember_me !== false;
+  const session = createAuthSession(user.id, 'admin', {
+    rememberMe,
+    userAgent: String(req.headers['user-agent'] || ''),
+    ip: req.ip,
+  });
+  setAdminRefreshCookie(req, res, session.refreshToken, session.rememberMe);
+
+  res.json({
+    user,
+    access_token: session.accessToken,
+    expires_in: session.expiresIn,
+    remember_me: session.rememberMe,
+  });
+});
+
+app.post('/api/admin/auth/refresh', (req: Request, res: Response) => {
+  const cookies = parseCookies(req.headers.cookie);
+  const rawRefresh = cookies['mfx_admin_refresh'] || '';
+  if (!rawRefresh) {
+    clearAdminRefreshCookie(req, res);
+    res.status(401).json({ error: 'No active administrator session found.' });
+    return;
+  }
+
+  const rotated = rotateRefreshSession(rawRefresh, {
+    userAgent: String(req.headers['user-agent'] || ''),
+    ip: req.ip,
+    requireAdmin: true,
+  });
+
+  if (!rotated) {
+    clearAdminRefreshCookie(req, res);
+    res.status(401).json({ error: 'Administrator session expired. Please sign in again.' });
+    return;
+  }
+
+  if (rotated.rotated) {
+    setAdminRefreshCookie(req, res, rotated.refreshToken, rotated.rememberMe);
+  }
+
+  res.json({
+    user: rotated.user,
+    access_token: rotated.accessToken,
+    expires_in: rotated.expiresIn,
+    remember_me: rotated.rememberMe,
+  });
+});
+
+app.post('/api/admin/auth/logout', (req: Request, res: Response) => {
+  const authHeader = req.headers.authorization;
+  const bearerToken =
+    authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+  const cookies = parseCookies(req.headers.cookie);
+  const refreshToken = cookies['mfx_admin_refresh'] || '';
+  const ctx = extractBearerContext(bearerToken);
+
+  if (bearerToken) {
+    revokeAccessToken(bearerToken);
+  }
+  const revokedUserId = revokeRefreshToken(refreshToken);
+  const actorId = ctx.user?.id || revokedUserId;
+
+  if (actorId) {
+    logUserActivity(actorId, 'Admin Sign Out', 'Dedicated /admin session terminated.', req.ip);
+  }
+
+  clearAdminRefreshCookie(req, res);
+  res.json({ ok: true });
+});
+
+app.get('/api/admin/auth/me', (req: Request, res: Response) => {
+  const ctx = extractAuthContext(req);
+  if (
+    !ctx.user ||
+    ctx.user.role !== 'admin' ||
+    ctx.user.email.toLowerCase() !== DESIGNATED_ADMIN_EMAIL
+  ) {
+    res.status(401).json({ user: null, error: 'Administrator authentication required.' });
+    return;
+  }
+  res.json({ user: ctx.user });
 });
 
 app.post('/api/auth/logout', optionalAuth, (req: AuthRequest, res: Response) => {
@@ -3830,11 +4082,324 @@ app.post('/api/push/test', optionalAuth, rateLimit(8, 60_000), async (req: AuthR
   res.json({ ok: true, statusCode: result.statusCode });
 });
 
+function generateUniqueRefCode(
+  prefix: string,
+  table: 'membership_applications' | 'support_conversations' | 'contact_messages'
+): string {
+  for (let i = 0; i < 8; i += 1) {
+    const code = `${prefix}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+    const exists = db.prepare(`SELECT 1 FROM ${table} WHERE reference_code = ?`).get(code);
+    if (!exists) return code;
+  }
+  return `${prefix}-${Date.now().toString(36).toUpperCase().slice(-6)}`;
+}
+
+// ---------- Premium Membership Applications ----------
+app.post('/api/applications', rateLimit(10, 60_000), async (req: Request, res: Response) => {
+  const schema = z.object({
+    full_name: z.string().trim().min(2, 'Full name must be at least 2 characters.').max(100),
+    email: z.string().trim().email('Please enter a valid email address.').max(160),
+    phone: z.string().trim().min(5, 'Phone number with country code is required.').max(40),
+    country: z.string().trim().min(2, 'Please enter your country.').max(80),
+    preferred_contact: z.enum(['Email', 'WhatsApp', 'Phone Call']),
+    message: z.string().trim().min(5, 'Please briefly explain your membership enquiry.').max(3000),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid application details.' });
+    return;
+  }
+
+  const d = parsed.data;
+  const id = crypto.randomUUID();
+  const referenceCode = generateUniqueRefCode('MFX-APP', 'membership_applications');
+  const now = new Date().toISOString();
+
+  db.prepare(
+    `INSERT INTO membership_applications (
+      id, reference_code, full_name, email, phone, country, preferred_contact, message, status, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`
+  ).run(
+    id,
+    referenceCode,
+    d.full_name,
+    d.email.toLowerCase(),
+    d.phone,
+    d.country,
+    d.preferred_contact,
+    d.message,
+    now,
+    now
+  );
+
+  const created = db.prepare('SELECT * FROM membership_applications WHERE id = ?').get(id) as Record<
+    string,
+    unknown
+  >;
+  emitAdminWs('admin:application_created', created);
+
+  await dispatchNotification({
+    title: `New Premium Application (${referenceCode})`,
+    body: `${d.full_name} (${d.country}) applied via ${d.preferred_contact}.`,
+    category: 'announcements',
+    linkUrl: '/admin',
+    targetGroup: 'admins_mods',
+    priority: 'urgent',
+    publishedAt: now,
+    dedupKey: `application:${id}`,
+    broadcastWs: emitAdminWs,
+  });
+
+  res.status(201).json({
+    ok: true,
+    application: created,
+    reference_code: referenceCode,
+  });
+});
+
+app.get('/api/admin/applications', requireRole('admin'), (_req: Request, res: Response) => {
+  const rows = db
+    .prepare(
+      `SELECT a.*, u.username as member_username, u.status as member_status
+       FROM membership_applications a
+       LEFT JOIN users u ON a.member_user_id = u.id
+       ORDER BY a.created_at DESC`
+    )
+    .all() as Array<Record<string, unknown>>;
+
+  let pending = 0;
+  let approved = 0;
+  let rejected = 0;
+  for (const r of rows) {
+    if (r.status === 'pending') pending += 1;
+    else if (r.status === 'approved') approved += 1;
+    else if (r.status === 'rejected') rejected += 1;
+  }
+
+  res.json({
+    summary: {
+      total: rows.length,
+      pending,
+      approved,
+      rejected,
+    },
+    applications: rows,
+  });
+});
+
+app.patch('/api/admin/applications/:id', requireRole('admin'), (req: AuthRequest, res: Response) => {
+  const existing = db
+    .prepare('SELECT * FROM membership_applications WHERE id = ?')
+    .get(req.params.id) as Record<string, unknown> | undefined;
+  if (!existing) {
+    res.status(404).json({ error: 'Membership application not found.' });
+    return;
+  }
+
+  const schema = z.object({
+    status: z.enum(['pending', 'approved', 'rejected']).optional(),
+    admin_notes: z.string().max(1000).nullable().optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid application update.' });
+    return;
+  }
+
+  const now = new Date().toISOString();
+  const nextStatus = parsed.data.status ?? String(existing.status);
+  const nextNotes =
+    parsed.data.admin_notes !== undefined ? parsed.data.admin_notes?.trim() || null : existing.admin_notes;
+
+  db.prepare(
+    `UPDATE membership_applications SET
+      status = ?,
+      admin_notes = ?,
+      reviewed_by = ?,
+      reviewed_at = ?,
+      updated_at = ?
+     WHERE id = ?`
+  ).run(nextStatus, nextNotes, req.user!.name, now, now, req.params.id);
+
+  const updated = db
+    .prepare(
+      `SELECT a.*, u.username as member_username, u.status as member_status
+       FROM membership_applications a
+       LEFT JOIN users u ON a.member_user_id = u.id
+       WHERE a.id = ?`
+    )
+    .get(req.params.id);
+  emitAdminWs('admin:application_updated', updated);
+  res.json({ application: updated });
+});
+
+app.post(
+  '/api/admin/applications/:id/create-member',
+  requireRole('admin'),
+  (req: AuthRequest, res: Response) => {
+    const appRow = db
+      .prepare('SELECT * FROM membership_applications WHERE id = ?')
+      .get(req.params.id) as Record<string, unknown> | undefined;
+    if (!appRow) {
+      res.status(404).json({ error: 'Membership application not found.' });
+      return;
+    }
+
+    if (appRow.member_user_id) {
+      const existingMember = db
+        .prepare('SELECT id FROM users WHERE id = ?')
+        .get(String(appRow.member_user_id));
+      if (existingMember) {
+        res.status(409).json({ error: 'A Premium Member account has already been created for this application.' });
+        return;
+      }
+    }
+
+    const schema = z.object({
+      username: z
+        .string()
+        .trim()
+        .min(3)
+        .max(40)
+        .regex(/^[a-zA-Z0-9._-]+$/, 'Username may contain letters, numbers, dots, underscores, or hyphens.')
+        .optional(),
+      email: z.string().trim().email().max(160).optional(),
+      password: z.string().max(128).optional(),
+      membership_expires_at: z.string().nullable().optional(),
+      membership_notes: z.string().max(500).nullable().optional(),
+    });
+    const parsed = schema.safeParse(req.body || {});
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid member details.' });
+      return;
+    }
+
+    const targetEmail = (parsed.data.email || String(appRow.email)).trim().toLowerCase();
+    if (targetEmail === DESIGNATED_ADMIN_EMAIL) {
+      res.status(400).json({ error: 'Cannot create a member with the designated administrator email.' });
+      return;
+    }
+
+    const dupEmail = db.prepare('SELECT id FROM users WHERE LOWER(email) = ?').get(targetEmail);
+    if (dupEmail) {
+      res.status(409).json({ error: 'A member account with this email address already exists.' });
+      return;
+    }
+
+    let baseUsername = (
+      parsed.data.username ||
+      String(appRow.full_name)
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '.')
+        .replace(/^\.+|\.+$/g, '')
+        .slice(0, 20) ||
+      targetEmail.split('@')[0].replace(/[^a-z0-9._-]/g, '')
+    ).toLowerCase();
+    if (baseUsername.length < 3) baseUsername = `member.${crypto.randomBytes(2).toString('hex')}`;
+
+    let resolvedUsername = baseUsername;
+    if (parsed.data.username) {
+      const dupUsername = db
+        .prepare('SELECT id FROM users WHERE username IS NOT NULL AND LOWER(username) = ?')
+        .get(resolvedUsername);
+      if (dupUsername) {
+        res.status(409).json({ error: 'This username is already assigned to another member.' });
+        return;
+      }
+    } else {
+      let attempt = 0;
+      while (
+        db
+          .prepare('SELECT id FROM users WHERE username IS NOT NULL AND LOWER(username) = ?')
+          .get(resolvedUsername)
+      ) {
+        attempt += 1;
+        resolvedUsername = `${baseUsername.slice(0, 22)}${attempt}`;
+      }
+    }
+
+    const expiry = normalizeOptionalExpiry(parsed.data.membership_expires_at);
+    if (expiry === 'invalid') {
+      res.status(400).json({ error: 'Invalid membership expiry date.' });
+      return;
+    }
+
+    const rawPassword = (parsed.data.password || '').trim() || generateTemporaryPassword();
+    const pwError = validateStrongPassword(rawPassword);
+    if (pwError) {
+      res.status(400).json({ error: pwError });
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const memberId = crypto.randomUUID();
+    const notes =
+      parsed.data.membership_notes?.trim() ||
+      `Approved from application ${String(appRow.reference_code)} (${String(appRow.country)})`;
+
+    db.prepare(
+      `INSERT INTO users (
+        id, name, username, email, password_hash, role, status, email_verified,
+        membership_expires_at, membership_notes, needs_password_setup,
+        terms_accepted_at, timezone, created_at
+      ) VALUES (?, ?, ?, ?, ?, 'user', 'active', 1, ?, ?, 1, ?, 'UTC', ?)`
+    ).run(
+      memberId,
+      String(appRow.full_name),
+      resolvedUsername,
+      targetEmail,
+      hashPassword(rawPassword),
+      expiry,
+      notes,
+      now,
+      now
+    );
+
+    db.prepare(
+      `UPDATE membership_applications SET
+        status = 'approved',
+        member_user_id = ?,
+        reviewed_by = ?,
+        reviewed_at = ?,
+        updated_at = ?
+       WHERE id = ?`
+    ).run(memberId, req.user!.name, now, now, req.params.id);
+
+    logUserActivity(
+      memberId,
+      'Membership Created',
+      `Approved from application ${String(appRow.reference_code)} by ${req.user!.name}.`,
+      req.ip
+    );
+
+    const createdMember = db.prepare('SELECT * FROM users WHERE id = ?').get(memberId) as Record<
+      string,
+      unknown
+    >;
+    const updatedApp = db
+      .prepare(
+        `SELECT a.*, u.username as member_username, u.status as member_status
+         FROM membership_applications a
+         LEFT JOIN users u ON a.member_user_id = u.id
+         WHERE a.id = ?`
+      )
+      .get(req.params.id);
+
+    emitAdminWs('admin:application_updated', updatedApp);
+    res.status(201).json({
+      application: updatedApp,
+      member: mapDbUser(createdMember),
+      temporary_password: rawPassword,
+    });
+  }
+);
+
 // ---------- Contact Form ----------
-app.post('/api/contact', rateLimit(8, 60_000), (req: Request, res: Response) => {
+app.post('/api/contact', rateLimit(8, 60_000), async (req: Request, res: Response) => {
   const schema = z.object({
     name: z.string().trim().min(2).max(100),
     email: z.string().trim().email().max(160),
+    phone: z.string().trim().max(40).optional().nullable(),
     subject: z.string().trim().min(3).max(160),
     message: z.string().trim().min(10).max(3000),
   });
@@ -3844,19 +4409,572 @@ app.post('/api/contact', rateLimit(8, 60_000), (req: Request, res: Response) => 
     return;
   }
 
+  const id = crypto.randomUUID();
+  const referenceCode = generateUniqueRefCode('MFX-ENQ', 'contact_messages');
+  const now = new Date().toISOString();
+
   db.prepare(
-    'INSERT INTO contact_messages (id, name, email, subject, message, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    'INSERT INTO contact_messages (id, reference_code, name, email, phone, subject, message, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
   ).run(
-    crypto.randomUUID(),
+    id,
+    referenceCode,
     parsed.data.name,
-    parsed.data.email,
+    parsed.data.email.toLowerCase(),
+    parsed.data.phone?.trim() || null,
     parsed.data.subject,
     parsed.data.message,
     'new',
-    new Date().toISOString()
+    now
   );
 
-  res.status(201).json({ ok: true });
+  const created = db.prepare('SELECT * FROM contact_messages WHERE id = ?').get(id);
+  emitAdminWs('admin:contact_created', created);
+
+  await dispatchNotification({
+    title: `New Contact Enquiry (${referenceCode})`,
+    body: `${parsed.data.name}: ${parsed.data.subject}`,
+    category: 'announcements',
+    linkUrl: '/admin',
+    targetGroup: 'admins_mods',
+    publishedAt: now,
+    dedupKey: `contact:${id}`,
+    broadcastWs: emitAdminWs,
+  });
+
+  res.status(201).json({ ok: true, reference_code: referenceCode, contact: created });
+});
+
+app.patch('/api/admin/contacts/:id', requireRole('admin'), (req: Request, res: Response) => {
+  const existing = db.prepare('SELECT * FROM contact_messages WHERE id = ?').get(req.params.id) as
+    | Record<string, unknown>
+    | undefined;
+  if (!existing) {
+    res.status(404).json({ error: 'Contact enquiry not found.' });
+    return;
+  }
+
+  const schema = z.object({
+    status: z.enum(['new', 'reviewed', 'replied']).optional(),
+    admin_reply: z.string().max(2000).nullable().optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Invalid contact update.' });
+    return;
+  }
+
+  const now = new Date().toISOString();
+  const nextStatus = parsed.data.status ?? String(existing.status || 'new');
+  const nextReply =
+    parsed.data.admin_reply !== undefined ? parsed.data.admin_reply?.trim() || null : existing.admin_reply;
+  const repliedAt = parsed.data.admin_reply ? now : existing.replied_at;
+
+  db.prepare(
+    'UPDATE contact_messages SET status = ?, admin_reply = ?, replied_at = ? WHERE id = ?'
+  ).run(nextStatus, nextReply, repliedAt, req.params.id);
+
+  const updated = db.prepare('SELECT * FROM contact_messages WHERE id = ?').get(req.params.id);
+  emitAdminWs('admin:contact_updated', updated);
+  res.json({ contact: updated });
+});
+
+// ---------- Two-Way Customer Chat (Public Visitor <-> Admin) ----------
+function mapSupportConversation(row: Record<string, unknown>, includeTokenHash = false) {
+  const mapped: Record<string, unknown> = {
+    id: String(row.id),
+    reference_code: String(row.reference_code),
+    visitor_name: String(row.visitor_name),
+    visitor_email: row.visitor_email ? String(row.visitor_email) : null,
+    visitor_phone: row.visitor_phone ? String(row.visitor_phone) : null,
+    status: String(row.status || 'open'),
+    unread_admin: Number(row.unread_admin || 0),
+    unread_visitor: Number(row.unread_visitor || 0),
+    last_message_preview: row.last_message_preview ? String(row.last_message_preview) : '',
+    last_message_at: String(row.last_message_at),
+    created_at: String(row.created_at),
+    updated_at: String(row.updated_at),
+  };
+  if (includeTokenHash) {
+    mapped.visitor_id = row.visitor_id ? String(row.visitor_id) : null;
+  }
+  return mapped;
+}
+
+function mapSupportMessage(row: Record<string, unknown>) {
+  return {
+    id: String(row.id),
+    conversation_id: String(row.conversation_id),
+    sender_type: String(row.sender_type) as 'visitor' | 'admin',
+    sender_name: String(row.sender_name),
+    content: String(row.content || ''),
+    attachment_url: row.attachment_url ? String(row.attachment_url) : null,
+    attachment_name: row.attachment_name ? String(row.attachment_name) : null,
+    read_by_admin: Boolean(row.read_by_admin),
+    read_by_visitor: Boolean(row.read_by_visitor),
+    created_at: String(row.created_at),
+  };
+}
+
+function resolveSupportConversationForVisitor(req: Request, conversationId: string) {
+  const token = String(
+    req.headers['x-support-token'] || req.query.token || req.body?.visitor_token || ''
+  ).trim();
+  if (!token) return null;
+  const row = db
+    .prepare('SELECT * FROM support_conversations WHERE id = ?')
+    .get(conversationId) as Record<string, unknown> | undefined;
+  if (!row) return null;
+  if (!verifySupportToken(token, String(row.access_token_hash))) return null;
+  return row;
+}
+
+function verifySupportUploadAuth(req: Request, res: Response, next: NextFunction): void {
+  const convId = String(req.headers['x-support-conversation-id'] || '').trim();
+  const token = String(req.headers['x-support-token'] || '').trim();
+  if (!convId || !token) {
+    res.status(401).json({ error: 'Customer chat session token is required to attach images.' });
+    return;
+  }
+  const conv = db
+    .prepare('SELECT id, access_token_hash FROM support_conversations WHERE id = ?')
+    .get(convId) as { id: string; access_token_hash: string } | undefined;
+  if (!conv || !verifySupportToken(token, conv.access_token_hash)) {
+    res.status(403).json({ error: 'Invalid customer chat session token.' });
+    return;
+  }
+  next();
+}
+
+app.post(
+  '/api/support/upload',
+  rateLimit(15, 60_000),
+  verifySupportUploadAuth,
+  supportImageUpload.single('file'),
+  (req: Request, res: Response) => {
+    if (!req.file) {
+      res.status(400).json({ error: 'No image uploaded.' });
+      return;
+    }
+    res.json({
+      url: `/uploads/${req.file.filename}`,
+      original_name: req.file.originalname,
+      mimetype: req.file.mimetype,
+      size: req.file.size,
+    });
+  }
+);
+
+app.post('/api/support/conversations', rateLimit(10, 60_000), async (req: AuthRequest, res: Response) => {
+  const schema = z.object({
+    visitor_name: z.string().trim().min(2, 'Please enter your name.').max(100),
+    visitor_email: z.union([z.string().trim().email().max(160), z.literal('')]).optional(),
+    visitor_phone: z.string().trim().max(40).optional(),
+    initial_message: z.string().trim().max(4000).optional(),
+    attachment_url: z.string().max(500).optional().nullable(),
+    attachment_name: z.string().max(200).optional().nullable(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid chat enquiry details.' });
+    return;
+  }
+
+  const d = parsed.data;
+  const now = new Date().toISOString();
+  const id = crypto.randomUUID();
+  const referenceCode = generateUniqueRefCode('MFX-CHAT', 'support_conversations');
+  const rawToken = crypto.randomBytes(24).toString('hex');
+  const tokenHash = hashSupportToken(rawToken);
+  const actor = resolveReactionActor(req, res, true);
+  const initialMsg = (d.initial_message || '').trim();
+  const hasInitial = Boolean(initialMsg || d.attachment_url);
+  const preview = initialMsg
+    ? initialMsg.slice(0, 140)
+    : d.attachment_url
+      ? 'Shared an image attachment'
+      : 'Started a direct conversation';
+
+  db.prepare(
+    `INSERT INTO support_conversations (
+      id, reference_code, visitor_name, visitor_email, visitor_phone, visitor_id,
+      access_token_hash, status, unread_admin, unread_visitor,
+      last_message_preview, last_message_at, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, 0, ?, ?, ?, ?)`
+  ).run(
+    id,
+    referenceCode,
+    d.visitor_name,
+    d.visitor_email ? d.visitor_email.toLowerCase() : null,
+    d.visitor_phone?.trim() || null,
+    actor?.visitorId || null,
+    tokenHash,
+    hasInitial ? 1 : 0,
+    preview,
+    now,
+    now,
+    now
+  );
+
+  const messages: Array<ReturnType<typeof mapSupportMessage>> = [];
+  if (hasInitial) {
+    const msgId = crypto.randomUUID();
+    db.prepare(
+      `INSERT INTO support_messages (
+        id, conversation_id, sender_type, sender_name, content,
+        attachment_url, attachment_name, read_by_admin, read_by_visitor, created_at
+      ) VALUES (?, ?, 'visitor', ?, ?, ?, ?, 0, 1, ?)`
+    ).run(
+      msgId,
+      id,
+      d.visitor_name,
+      initialMsg,
+      d.attachment_url || null,
+      d.attachment_name || null,
+      now
+    );
+    const msgRow = db.prepare('SELECT * FROM support_messages WHERE id = ?').get(msgId) as Record<
+      string,
+      unknown
+    >;
+    messages.push(mapSupportMessage(msgRow));
+  }
+
+  const convRow = db.prepare('SELECT * FROM support_conversations WHERE id = ?').get(id) as Record<
+    string,
+    unknown
+  >;
+  const mappedConv = mapSupportConversation(convRow);
+  emitAdminWs('admin:support_conversation_created', mappedConv);
+  if (messages[0]) {
+    emitAdminWs('admin:support_message', { conversation: mappedConv, message: messages[0] });
+  }
+
+  await dispatchNotification({
+    title: `Customer Enquiry (${referenceCode})`,
+    body: `${d.visitor_name}: ${preview}`,
+    category: 'announcements',
+    linkUrl: '/admin',
+    targetGroup: 'admins_mods',
+    publishedAt: now,
+    dedupKey: `support_conv:${id}`,
+    broadcastWs: emitAdminWs,
+  });
+
+  res.status(201).json({
+    conversation: mappedConv,
+    messages,
+    visitor_token: rawToken,
+  });
+});
+
+app.get('/api/support/conversations/:id', (req: Request, res: Response) => {
+  const convRow = resolveSupportConversationForVisitor(req, String(req.params.id));
+  if (!convRow) {
+    res.status(403).json({ error: 'Conversation not found or invalid session token.' });
+    return;
+  }
+
+  const msgRows = db
+    .prepare('SELECT * FROM support_messages WHERE conversation_id = ? ORDER BY created_at ASC')
+    .all(String(convRow.id)) as Array<Record<string, unknown>>;
+
+  res.json({
+    conversation: mapSupportConversation(convRow),
+    messages: msgRows.map(mapSupportMessage),
+  });
+});
+
+app.post(
+  '/api/support/conversations/:id/messages',
+  rateLimit(30, 60_000),
+  async (req: AuthRequest, res: Response) => {
+    const convRow = resolveSupportConversationForVisitor(req, String(req.params.id));
+    if (!convRow) {
+      res.status(403).json({ error: 'Conversation not found or invalid session token.' });
+      return;
+    }
+
+    const schema = z
+      .object({
+        content: z.string().max(4000).optional().default(''),
+        attachment_url: z.string().max(500).optional().nullable(),
+        attachment_name: z.string().max(200).optional().nullable(),
+      })
+      .refine((d) => d.content.trim().length > 0 || Boolean(d.attachment_url), {
+        message: 'Enter a message or attach an image before sending.',
+      });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid message payload.' });
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const content = parsed.data.content.trim();
+    const preview = content ? content.slice(0, 140) : 'Sent an image attachment';
+    const msgId = crypto.randomUUID();
+    const convId = String(convRow.id);
+    const actor = resolveReactionActor(req, res, false);
+
+    db.prepare(
+      `INSERT INTO support_messages (
+        id, conversation_id, sender_type, sender_name, content,
+        attachment_url, attachment_name, read_by_admin, read_by_visitor, created_at
+      ) VALUES (?, ?, 'visitor', ?, ?, ?, ?, 0, 1, ?)`
+    ).run(
+      msgId,
+      convId,
+      String(convRow.visitor_name),
+      content,
+      parsed.data.attachment_url || null,
+      parsed.data.attachment_name || null,
+      now
+    );
+
+    db.prepare(
+      `UPDATE support_conversations SET
+        status = 'open',
+        unread_admin = unread_admin + 1,
+        visitor_id = COALESCE(visitor_id, ?),
+        last_message_preview = ?,
+        last_message_at = ?,
+        updated_at = ?
+       WHERE id = ?`
+    ).run(actor?.visitorId || null, preview, now, now, convId);
+
+    const updatedConvRow = db
+      .prepare('SELECT * FROM support_conversations WHERE id = ?')
+      .get(convId) as Record<string, unknown>;
+    const msgRow = db.prepare('SELECT * FROM support_messages WHERE id = ?').get(msgId) as Record<
+      string,
+      unknown
+    >;
+
+    const mappedConv = mapSupportConversation(updatedConvRow);
+    const mappedMsg = mapSupportMessage(msgRow);
+
+    emitSupportWs(convId, 'support:message', { conversation: mappedConv, message: mappedMsg });
+    emitAdminWs('admin:support_message', { conversation: mappedConv, message: mappedMsg });
+
+    await dispatchNotification({
+      title: `Reply from ${String(convRow.visitor_name)} (${String(convRow.reference_code)})`,
+      body: preview,
+      category: 'announcements',
+      linkUrl: '/admin',
+      targetGroup: 'admins_mods',
+      publishedAt: now,
+      dedupKey: `support_msg:${msgId}`,
+      broadcastWs: emitAdminWs,
+    });
+
+    res.status(201).json({ conversation: mappedConv, message: mappedMsg });
+  }
+);
+
+app.post('/api/support/conversations/:id/read', (req: Request, res: Response) => {
+  const convRow = resolveSupportConversationForVisitor(req, String(req.params.id));
+  if (!convRow) {
+    res.status(403).json({ error: 'Conversation not found or invalid session token.' });
+    return;
+  }
+
+  const convId = String(convRow.id);
+  const now = new Date().toISOString();
+  db.prepare(
+    `UPDATE support_messages SET read_by_visitor = 1 WHERE conversation_id = ? AND sender_type = 'admin' AND read_by_visitor = 0`
+  ).run(convId);
+  db.prepare('UPDATE support_conversations SET unread_visitor = 0, updated_at = ? WHERE id = ?').run(
+    now,
+    convId
+  );
+
+  emitSupportWs(convId, 'support:read', { conversation_id: convId, reader: 'visitor' });
+  res.json({ ok: true });
+});
+
+app.get('/api/admin/support/conversations', requireRole('admin'), (_req: Request, res: Response) => {
+  const rows = db
+    .prepare('SELECT * FROM support_conversations ORDER BY last_message_at DESC')
+    .all() as Array<Record<string, unknown>>;
+
+  let unreadMessages = 0;
+  let openCount = 0;
+  for (const r of rows) {
+    unreadMessages += Number(r.unread_admin || 0);
+    if (r.status === 'open') openCount += 1;
+  }
+
+  res.json({
+    conversations: rows.map((r) => mapSupportConversation(r, true)),
+    summary: {
+      total: rows.length,
+      open: openCount,
+      resolved: rows.length - openCount,
+      unread_messages: unreadMessages,
+    },
+  });
+});
+
+app.get('/api/admin/support/conversations/:id', requireRole('admin'), (req: Request, res: Response) => {
+  const convRow = db
+    .prepare('SELECT * FROM support_conversations WHERE id = ?')
+    .get(req.params.id) as Record<string, unknown> | undefined;
+  if (!convRow) {
+    res.status(404).json({ error: 'Customer conversation not found.' });
+    return;
+  }
+
+  const markRead = req.query.markRead !== 'false';
+  if (markRead && Number(convRow.unread_admin || 0) > 0) {
+    db.prepare(
+      `UPDATE support_messages SET read_by_admin = 1 WHERE conversation_id = ? AND sender_type = 'visitor' AND read_by_admin = 0`
+    ).run(String(convRow.id));
+    db.prepare('UPDATE support_conversations SET unread_admin = 0 WHERE id = ?').run(
+      String(convRow.id)
+    );
+    convRow.unread_admin = 0;
+    emitSupportWs(String(convRow.id), 'support:read', {
+      conversation_id: String(convRow.id),
+      reader: 'admin',
+    });
+  }
+
+  const msgRows = db
+    .prepare('SELECT * FROM support_messages WHERE conversation_id = ? ORDER BY created_at ASC')
+    .all(String(convRow.id)) as Array<Record<string, unknown>>;
+
+  res.json({
+    conversation: mapSupportConversation(convRow, true),
+    messages: msgRows.map(mapSupportMessage),
+  });
+});
+
+app.post(
+  '/api/admin/support/conversations/:id/messages',
+  requireRole('admin'),
+  async (req: AuthRequest, res: Response) => {
+    const convRow = db
+      .prepare('SELECT * FROM support_conversations WHERE id = ?')
+      .get(req.params.id) as Record<string, unknown> | undefined;
+    if (!convRow) {
+      res.status(404).json({ error: 'Customer conversation not found.' });
+      return;
+    }
+
+    const schema = z
+      .object({
+        content: z.string().max(4000).optional().default(''),
+        attachment_url: z.string().max(500).optional().nullable(),
+        attachment_name: z.string().max(200).optional().nullable(),
+      })
+      .refine((d) => d.content.trim().length > 0 || Boolean(d.attachment_url), {
+        message: 'Enter a reply or attach an image before sending.',
+      });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid reply payload.' });
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const convId = String(convRow.id);
+    const content = parsed.data.content.trim();
+    const preview = content ? content.slice(0, 140) : 'Desk sent an image attachment';
+    const msgId = crypto.randomUUID();
+
+    db.prepare(
+      `INSERT INTO support_messages (
+        id, conversation_id, sender_type, sender_name, content,
+        attachment_url, attachment_name, read_by_admin, read_by_visitor, created_at
+      ) VALUES (?, ?, 'admin', ?, ?, ?, ?, 1, 0, ?)`
+    ).run(
+      msgId,
+      convId,
+      'MeridianFX Desk',
+      content,
+      parsed.data.attachment_url || null,
+      parsed.data.attachment_name || null,
+      now
+    );
+
+    db.prepare(
+      `UPDATE support_messages SET read_by_admin = 1 WHERE conversation_id = ? AND sender_type = 'visitor' AND read_by_admin = 0`
+    ).run(convId);
+
+    db.prepare(
+      `UPDATE support_conversations SET
+        unread_admin = 0,
+        unread_visitor = unread_visitor + 1,
+        last_message_preview = ?,
+        last_message_at = ?,
+        updated_at = ?
+       WHERE id = ?`
+    ).run(preview, now, now, convId);
+
+    const updatedConvRow = db
+      .prepare('SELECT * FROM support_conversations WHERE id = ?')
+      .get(convId) as Record<string, unknown>;
+    const msgRow = db.prepare('SELECT * FROM support_messages WHERE id = ?').get(msgId) as Record<
+      string,
+      unknown
+    >;
+
+    const mappedConv = mapSupportConversation(updatedConvRow);
+    const mappedMsg = mapSupportMessage(msgRow);
+
+    emitSupportWs(convId, 'support:message', { conversation: mappedConv, message: mappedMsg });
+
+    if (convRow.visitor_id) {
+      await dispatchNotification({
+        title: `MeridianFX Support Reply (${String(convRow.reference_code)})`,
+        body: preview,
+        category: 'announcements',
+        linkUrl: `/profile?chat=${encodeURIComponent(convId)}`,
+        imageUrl: parsed.data.attachment_url || null,
+        priority: 'urgent',
+        respectPrefs: false,
+        targetVisitorIds: [String(convRow.visitor_id)],
+        publishedAt: now,
+        dedupKey: `support_reply:${msgId}`,
+        broadcastWs: emitAdminWs,
+      });
+    }
+
+    res.status(201).json({ conversation: mappedConv, message: mappedMsg });
+  }
+);
+
+app.patch('/api/admin/support/conversations/:id', requireRole('admin'), (req: Request, res: Response) => {
+  const existing = db
+    .prepare('SELECT * FROM support_conversations WHERE id = ?')
+    .get(req.params.id) as Record<string, unknown> | undefined;
+  if (!existing) {
+    res.status(404).json({ error: 'Customer conversation not found.' });
+    return;
+  }
+
+  const schema = z.object({
+    status: z.enum(['open', 'resolved']),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Valid status (open or resolved) is required.' });
+    return;
+  }
+
+  const now = new Date().toISOString();
+  db.prepare('UPDATE support_conversations SET status = ?, updated_at = ? WHERE id = ?').run(
+    parsed.data.status,
+    now,
+    req.params.id
+  );
+
+  const updatedRow = db
+    .prepare('SELECT * FROM support_conversations WHERE id = ?')
+    .get(req.params.id) as Record<string, unknown>;
+  const mapped = mapSupportConversation(updatedRow);
+  emitSupportWs(String(req.params.id), 'support:conversation_updated', mapped);
+  res.json({ conversation: mapped });
 });
 
 // ---------- Administrator Dashboard APIs (/api/admin/*) ----------
@@ -3871,6 +4989,47 @@ app.get('/api/admin/overview', requireRole('admin'), (_req: AuthRequest, res: Re
       c: number;
     }
   ).c;
+
+  const totalApplications = (
+    db.prepare('SELECT COUNT(*) as c FROM membership_applications').get() as { c: number }
+  ).c;
+  const pendingApplications = (
+    db
+      .prepare("SELECT COUNT(*) as c FROM membership_applications WHERE status = 'pending'")
+      .get() as { c: number }
+  ).c;
+  const approvedApplications = (
+    db
+      .prepare("SELECT COUNT(*) as c FROM membership_applications WHERE status = 'approved'")
+      .get() as { c: number }
+  ).c;
+  const activePremiumMembers = (
+    db
+      .prepare(
+        `SELECT COUNT(*) as c FROM users
+         WHERE LOWER(email) != ?
+           AND status = 'active'
+           AND (membership_expires_at IS NULL OR membership_expires_at = '' OR datetime(membership_expires_at) > datetime('now'))`
+      )
+      .get(DESIGNATED_ADMIN_EMAIL) as { c: number }
+  ).c;
+  const unreadCustomerChat = (
+    db.prepare('SELECT COALESCE(SUM(unread_admin), 0) as c FROM support_conversations').get() as {
+      c: number;
+    }
+  ).c;
+  const newContacts = (
+    db.prepare("SELECT COUNT(*) as c FROM contact_messages WHERE status = 'new'").get() as {
+      c: number;
+    }
+  ).c;
+  const totalConversations = (
+    db.prepare('SELECT COUNT(*) as c FROM support_conversations').get() as { c: number }
+  ).c;
+  const totalContacts = (
+    db.prepare('SELECT COUNT(*) as c FROM contact_messages').get() as { c: number }
+  ).c;
+
   const dispatchLogs = db
     .prepare('SELECT * FROM push_dispatch_logs ORDER BY created_at DESC LIMIT 20')
     .all();
@@ -3903,6 +5062,12 @@ app.get('/api/admin/overview', requireRole('admin'), (_req: AuthRequest, res: Re
       ...stats,
       new_registrations_7d: newRegistrations,
       push_subscribers: pushSubscribers,
+      total_applications: totalApplications,
+      pending_applications: pendingApplications,
+      approved_applications: approvedApplications,
+      active_premium_members: activePremiumMembers,
+      unread_customer_messages: unreadCustomerChat + newContacts,
+      total_enquiries: totalConversations + totalContacts,
     },
     dispatch_logs: dispatchLogs,
     push_jobs: pushJobs,

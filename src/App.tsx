@@ -39,7 +39,7 @@ const ProtectedRoute: React.FC<{
 
   React.useEffect(() => {
     if (!authLoading && !user) {
-      navigate(`/login?redirect=${encodeURIComponent(targetPath)}`);
+      navigate(`/profile?redirect=${encodeURIComponent(targetPath)}`);
     }
   }, [authLoading, user, targetPath, navigate]);
 
@@ -51,9 +51,9 @@ const ProtectedRoute: React.FC<{
     return (
       <div className="mx-auto max-w-md py-12">
         <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-8 text-center space-y-3">
-          <h1 className="text-lg font-bold text-slate-900 dark:text-white">Authentication Required</h1>
+          <h1 className="text-lg font-bold text-slate-900 dark:text-white">Premium Member Access</h1>
           <p className="text-sm text-slate-500 dark:text-slate-400">
-            Access denied. Redirecting to sign in...
+            Redirecting to Premium Member Sign In...
           </p>
         </div>
       </div>
@@ -66,6 +66,10 @@ const ProtectedRoute: React.FC<{
 const RouteView: React.FC = () => {
   const { route, user, authLoading, showNotifModal, setShowNotifModal } = usePlatform();
 
+  if (route === '/admin') {
+    return <AdminPage />;
+  }
+
   const renderPage = () => {
     switch (route) {
       case '/':
@@ -74,9 +78,8 @@ const RouteView: React.FC = () => {
       case '/home':
         return <HomePage />;
       case '/login':
-        return <LoginPage />;
       case '/register':
-        return <ProfilePage />;
+        return authLoading && !user ? <SessionRestoreSpinner /> : <ProfilePage />;
       case '/verify-email':
         return <VerifyEmailPage />;
       case '/forgot-password':
@@ -107,12 +110,6 @@ const RouteView: React.FC = () => {
         return authLoading && !user ? <SessionRestoreSpinner /> : <ProfilePage />;
       case '/legal':
         return <LegalPage />;
-      case '/admin':
-        return (
-          <ProtectedRoute targetPath="/admin">
-            <AdminPage />
-          </ProtectedRoute>
-        );
       default:
         return <HomePage />;
     }

@@ -416,6 +416,7 @@ export interface DispatchPayload {
   publishedAt?: string;
   dedupKey?: string;
   targetUserIds?: string[] | null;
+  targetVisitorIds?: string[] | null;
   targetGroup?: PushTargetGroup;
   respectPrefs?: boolean;
   sound?: boolean;
@@ -835,6 +836,7 @@ export async function dispatchNotification(payload: DispatchPayload): Promise<Di
       };
     }
 
+    const hasVisitorTargets = Boolean(payload.targetVisitorIds && payload.targetVisitorIds.length > 0);
     if (resolvedTargetUsers && resolvedTargetUsers.length > 0) {
       const insertNotif = db.prepare(
         `INSERT INTO notifications (id, user_id, title, body, category, link_url, is_read, created_at)
@@ -845,7 +847,7 @@ export async function dispatchNotification(payload: DispatchPayload): Promise<Di
         insertNotif.run(nid, uid, payload.title, payload.body, payload.category, linkUrl, now);
         notificationIds.push(nid);
       }
-    } else if (!resolvedTargetUsers) {
+    } else if (!resolvedTargetUsers && !hasVisitorTargets) {
       const nid = crypto.randomUUID();
       db.prepare(
         `INSERT INTO notifications (id, user_id, title, body, category, link_url, is_read, created_at)
@@ -857,6 +859,7 @@ export async function dispatchNotification(payload: DispatchPayload): Promise<Di
     let eligibleSubs: Array<{
       id: string;
       user_id: string | null;
+      visitor_id: string | null;
       endpoint: string;
       transport: string | null;
       prefs_json: string | null;
@@ -869,7 +872,7 @@ export async function dispatchNotification(payload: DispatchPayload): Promise<Di
     if (isPushEnabled) {
       const subs = db
         .prepare(
-          `SELECT ps.id, ps.user_id, ps.endpoint, ps.transport, ps.prefs_json,
+          `SELECT ps.id, ps.user_id, ps.visitor_id, ps.endpoint, ps.transport, ps.prefs_json,
                   u.notification_prefs, u.status, u.role, u.email_verified
            FROM push_subscriptions ps
            LEFT JOIN users u ON ps.user_id = u.id
@@ -879,6 +882,12 @@ export async function dispatchNotification(payload: DispatchPayload): Promise<Di
 
       eligibleSubs = subs.filter((sub) => {
         if (sub.status === 'suspended') return false;
+        if (hasVisitorTargets) {
+          if (!sub.visitor_id || !payload.targetVisitorIds!.includes(sub.visitor_id)) {
+            return false;
+          }
+          return true;
+        }
         if (targetGroup === 'registered' && !sub.user_id) return false;
         if (targetGroup === 'verified' && (!sub.user_id || !sub.email_verified)) return false;
         if (targetGroup === 'admins_mods' && sub.role !== 'admin' && sub.role !== 'moderator') {

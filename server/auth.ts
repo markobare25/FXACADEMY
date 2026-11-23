@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import type { NextFunction, Request, Response } from 'express';
-import { db } from './db.ts';
+import { DESIGNATED_ADMIN_EMAIL, db } from './db.ts';
 import type { User, UserRole } from '../src/types.ts';
 
 export const ACCESS_TOKEN_TTL_SEC = 15 * 60; // 15 minutes
@@ -203,7 +203,7 @@ export interface RotateRefreshResult {
 
 export function rotateRefreshSession(
   rawRefreshToken: string,
-  meta?: { userAgent?: string; ip?: string }
+  meta?: { userAgent?: string; ip?: string; blockAdmin?: boolean; requireAdmin?: boolean }
 ): RotateRefreshResult | null {
   if (!rawRefreshToken || typeof rawRefreshToken !== 'string' || rawRefreshToken.length < 24) {
     return null;
@@ -247,6 +247,14 @@ export function rotateRefreshSession(
   }
 
   const user = mapDbUser(userRow);
+  const isDesignatedAdmin =
+    user.role === 'admin' && user.email.toLowerCase() === DESIGNATED_ADMIN_EMAIL;
+  if (meta?.blockAdmin && (isDesignatedAdmin || user.role === 'admin')) {
+    return null;
+  }
+  if (meta?.requireAdmin && !isDesignatedAdmin) {
+    return null;
+  }
   const rememberMe = Boolean(session.remember_me);
 
   // Concurrent-tab grace check if matched via previous refresh token
@@ -549,12 +557,9 @@ export function verifyVisitorCookie(cookieValue?: string): string | null {
   return visitorId;
 }
 
-export function extractAuthContext(req: Request): AuthContext {
-  const authHeader = req.headers.authorization;
-  const rawBearer =
-    authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+export function extractBearerContext(rawBearer?: string | null): AuthContext {
   const bearerToken =
-    rawBearer && rawBearer !== 'null' && rawBearer !== 'undefined' ? rawBearer : '';
+    rawBearer && rawBearer !== 'null' && rawBearer !== 'undefined' ? rawBearer.trim() : '';
 
   if (!bearerToken) return {};
 
@@ -603,6 +608,13 @@ export function extractAuthContext(req: Request): AuthContext {
     sid: claims.sid,
     expiresAt: claims.exp,
   };
+}
+
+export function extractAuthContext(req: Request): AuthContext {
+  const authHeader = req.headers.authorization;
+  const rawBearer =
+    authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+  return extractBearerContext(rawBearer);
 }
 
 export function optionalAuth(req: AuthRequest, _res: Response, next: NextFunction): void {

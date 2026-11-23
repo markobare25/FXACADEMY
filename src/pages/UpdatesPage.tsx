@@ -40,7 +40,14 @@ export const UpdatesPage: React.FC = () => {
 
   const handleReact = async (updateId: string, emoji: string) => {
     if (!user) {
-      navigate('/login');
+      setUpdates((prev) =>
+        prev.map((u) => {
+          if (u.id !== updateId) return u;
+          const nextReactions = { ...(u.reactions || {}) };
+          nextReactions[emoji] = (nextReactions[emoji] || 0) + 1;
+          return { ...u, reactions: nextReactions };
+        })
+      );
       return;
     }
     try {
@@ -56,7 +63,9 @@ export const UpdatesPage: React.FC = () => {
 
   const handleBookmark = async (updateId: string) => {
     if (!user) {
-      navigate('/login');
+      setUpdates((prev) =>
+        prev.map((u) => (u.id === updateId ? { ...u, bookmarked: !u.bookmarked } : u))
+      );
       return;
     }
     try {

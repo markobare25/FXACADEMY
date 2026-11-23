@@ -10,7 +10,8 @@ import {
   UserCheck,
   Users,
 } from 'lucide-react';
-import { formatLocalDateTime, getAccessToken, getOrCreateVisitorId } from '../../lib/api';
+import { formatLocalDateTime, getOrCreateVisitorId } from '../../lib/api';
+import { getAdminAccessToken, refreshAdminSession } from '../../lib/adminApi';
 import type { RegistrationAnalyticsPayload } from '../../types';
 
 interface AdminRegistrationsPanelProps {
@@ -62,15 +63,21 @@ export const AdminRegistrationsPanel: React.FC<AdminRegistrationsPanelProps> = (
   const handleExportCsv = async () => {
     setExporting(true);
     try {
-      const token = getAccessToken();
+      let token = getAdminAccessToken();
+      if (!token) {
+        const refreshed = await refreshAdminSession();
+        token = refreshed?.token || null;
+      }
       const headers = new Headers({
         'X-Visitor-Id': getOrCreateVisitorId(),
+        'X-Requested-With': 'MeridianFX-Admin',
       });
       if (token) headers.set('Authorization', `Bearer ${token}`);
 
       const res = await fetch('/api/admin/registrations/export', {
         headers,
         credentials: 'include',
+        cache: 'no-store',
       });
       if (!res.ok) {
         throw new Error(`Export failed (${res.status})`);

@@ -14,12 +14,12 @@ import {
   UserX,
   X,
 } from 'lucide-react';
+import { formatLocalDateTime, getOrCreateVisitorId } from '../../lib/api';
 import {
-  apiFetch,
-  formatLocalDateTime,
-  getAccessToken,
-  getOrCreateVisitorId,
-} from '../../lib/api';
+  adminApiFetch,
+  getAdminAccessToken,
+  refreshAdminSession,
+} from '../../lib/adminApi';
 import type { AdminMembersPayload, User } from '../../types';
 
 interface AdminMembersPanelProps {
@@ -114,7 +114,7 @@ export const AdminMembersPanel: React.FC<AdminMembersPanelProps> = ({
 
   const loadMembers = useCallback(async () => {
     try {
-      const payload = await apiFetch<AdminMembersPayload>('/api/admin/members');
+      const payload = await adminApiFetch<AdminMembersPayload>('/api/admin/members');
       setData(payload);
       const nextDates: Record<string, string> = {};
       for (const m of payload.members) {
@@ -146,7 +146,7 @@ export const AdminMembersPanel: React.FC<AdminMembersPanelProps> = ({
     e.preventDefault();
     setCreating(true);
     try {
-      const res = await apiFetch<{ member: User; temporary_password: string }>(
+      const res = await adminApiFetch<{ member: User; temporary_password: string }>(
         '/api/admin/members',
         {
           method: 'POST',
@@ -195,7 +195,7 @@ export const AdminMembersPanel: React.FC<AdminMembersPanelProps> = ({
     setBusyMemberId(member.id);
     try {
       const nextStatus = member.status === 'active' ? 'suspended' : 'active';
-      await apiFetch(`/api/admin/members/${member.id}`, {
+      await adminApiFetch(`/api/admin/members/${member.id}`, {
         method: 'PATCH',
         body: JSON.stringify({ status: nextStatus }),
       });
@@ -218,7 +218,7 @@ export const AdminMembersPanel: React.FC<AdminMembersPanelProps> = ({
     try {
       const rawVal = overrideDate !== undefined ? overrideDate : expiryEdits[member.id] ?? '';
       const nextExpiry = rawVal && rawVal.trim() ? rawVal.trim() : null;
-      await apiFetch(`/api/admin/members/${member.id}`, {
+      await adminApiFetch(`/api/admin/members/${member.id}`, {
         method: 'PATCH',
         body: JSON.stringify({ membership_expires_at: nextExpiry }),
       });
@@ -239,7 +239,7 @@ export const AdminMembersPanel: React.FC<AdminMembersPanelProps> = ({
   const handleResetPassword = async (member: User) => {
     setBusyMemberId(member.id);
     try {
-      const res = await apiFetch<{
+      const res = await adminApiFetch<{
         ok: boolean;
         temporary_password: string;
         member: User;
@@ -268,7 +268,7 @@ export const AdminMembersPanel: React.FC<AdminMembersPanelProps> = ({
   const handleDeleteMember = async (member: User) => {
     setBusyMemberId(member.id);
     try {
-      await apiFetch(`/api/admin/members/${member.id}`, {
+      await adminApiFetch(`/api/admin/members/${member.id}`, {
         method: 'DELETE',
       });
       setConfirmDeleteId(null);
@@ -285,14 +285,20 @@ export const AdminMembersPanel: React.FC<AdminMembersPanelProps> = ({
   const handleExportCsv = async () => {
     setExporting(true);
     try {
-      const token = getAccessToken();
+      let token = getAdminAccessToken();
+      if (!token) {
+        const refreshed = await refreshAdminSession();
+        token = refreshed?.token || null;
+      }
       const headers = new Headers({
         'X-Visitor-Id': getOrCreateVisitorId(),
+        'X-Requested-With': 'MeridianFX-Admin',
       });
       if (token) headers.set('Authorization', `Bearer ${token}`);
       const res = await fetch('/api/admin/members/export', {
         headers,
         credentials: 'include',
+        cache: 'no-store',
       });
       if (!res.ok) throw new Error(`Export failed (${res.status})`);
       const blob = await res.blob();
@@ -321,7 +327,7 @@ export const AdminMembersPanel: React.FC<AdminMembersPanelProps> = ({
       `Email: ${receipt.email}`,
       `Temporary Password: ${receipt.temporaryPassword}`,
       receipt.expiresAt ? `Membership Expiry: ${receipt.expiresAt.slice(0, 10)}` : 'Membership Expiry: Ongoing',
-      `Sign In URL: ${window.location.origin}/login`,
+      `Sign In URL: ${window.location.origin}/profile`,
     ].join('\n');
     try {
       await navigator.clipboard.writeText(text);

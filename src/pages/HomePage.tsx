@@ -90,10 +90,10 @@ export const HomePage: React.FC = () => {
               {user ? (
                 <button
                   type="button"
-                  onClick={() => navigate(user.role === 'admin' ? '/admin' : '/dashboard')}
+                  onClick={() => navigate('/dashboard')}
                   className="inline-flex items-center gap-2 rounded-lg bg-[#881337] px-5 py-3 text-sm font-semibold text-white hover:bg-[#6B0F2B] transition-colors min-h-[44px]"
                 >
-                  <span>{user.role === 'admin' ? 'Open Admin Desk' : 'Open Member Dashboard'}</span>
+                  <span>Open Member Dashboard</span>
                   <ArrowRight className="w-4 h-4" />
                 </button>
               ) : (

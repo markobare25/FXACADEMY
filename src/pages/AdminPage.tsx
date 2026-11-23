@@ -3,29 +3,51 @@ import {
   BarChart3,
   Bell,
   BookOpen,
+  CheckCircle2,
+  ClipboardList,
   Database,
   Download,
   Edit3,
+  ExternalLink,
+  Eye,
+  EyeOff,
+  Inbox,
   KeyRound,
   LayoutDashboard,
-  MessageSquareText,
+  Lock,
+  LogOut,
+  Moon,
   Pin,
   Radio,
+  RefreshCw,
   Settings as SettingsIcon,
-  ShieldAlert,
+  ShieldCheck,
+  Sun,
   Trash2,
   TrendingUp,
   Upload,
   Users,
 } from 'lucide-react';
 import { usePlatform } from '../context/PlatformContext';
-import { apiFetch, formatLocalDateTime, uploadMediaFile } from '../lib/api';
+import { formatLocalDateTime } from '../lib/api';
+import {
+  adminApiFetch,
+  adminUploadMediaFile,
+  bootstrapAdminSession,
+  getAdminAccessToken,
+  loginAdmin,
+  logoutAdmin,
+  refreshAdminSession,
+} from '../lib/adminApi';
+import { sendTestPushNotification } from '../lib/pushClient';
 import { AdminAcademyManager } from '../components/admin/AdminAcademyManager';
+import { AdminApplicationsPanel } from '../components/admin/AdminApplicationsPanel';
+import { AdminEnquiriesPanel } from '../components/admin/AdminEnquiriesPanel';
 import { AdminMembersPanel } from '../components/admin/AdminMembersPanel';
 import { AdminRegistrationsPanel } from '../components/admin/AdminRegistrationsPanel';
-import { CheckCircle2, ExternalLink } from 'lucide-react';
-import { sendTestPushNotification } from '../lib/pushClient';
+import { AdminSignalsBroadcastStudio } from '../components/admin/AdminSignalsBroadcastStudio';
 import type {
+  AdminOverviewStats,
   MarketUpdate,
   MarketUpdateCategory,
   PlatformSettings,
@@ -43,26 +65,18 @@ import type {
 
 type AdminTab =
   | 'overview'
-  | 'registrations'
+  | 'applications'
+  | 'enquiries'
   | 'signals'
   | 'updates'
-  | 'notifications'
+  | 'members'
+  | 'registrations'
   | 'academy'
-  | 'users'
+  | 'notifications'
   | 'settings';
 
 interface OverviewPayload {
-  stats: {
-    total_signals: number;
-    active_signals: number;
-    completed_signals: number;
-    total_updates: number;
-    total_courses: number;
-    total_lessons: number;
-    total_users: number;
-    new_registrations_7d: number;
-    push_subscribers: number;
-  };
+  stats: AdminOverviewStats;
   dispatch_logs: Array<{
     id: string;
     title: string;
@@ -92,8 +106,19 @@ interface OverviewPayload {
 }
 
 export const AdminPage: React.FC = () => {
-  const { user, authLoading, settings, signals, refreshAll, navigate, subscribePushJobEvents } =
-    usePlatform();
+  const { settings, signals, theme, toggleTheme, refreshAll, navigate } = usePlatform();
+
+  // Isolated Admin Session State
+  const [adminUser, setAdminUser] = useState<User | null>(null);
+  const [adminAuthLoading, setAdminAuthLoading] = useState(true);
+  const [loginIdentifier, setLoginIdentifier] = useState('');
+  const [loginPassword, setLoginPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [rememberMe, setRememberMe] = useState(true);
+  const [loginSubmitting, setLoginSubmitting] = useState(false);
+  const [loginError, setLoginError] = useState<string | null>(null);
+
+  // Dashboard State
   const [tab, setTab] = useState<AdminTab>('overview');
   const [overview, setOverview] = useState<OverviewPayload | null>(null);
   const [registrations, setRegistrations] = useState<RegistrationAnalyticsPayload | null>(null);
@@ -110,9 +135,12 @@ export const AdminPage: React.FC = () => {
       created_at: string;
     }>
   >([]);
-  const [contacts, setContacts] = useState<
-    Array<{ id: string; name: string; email: string; subject: string; message: string; created_at: string }>
-  >([]);
+
+  // Live ticks driven by admin WebSocket notifications
+  const [appsLiveTick, setAppsLiveTick] = useState(0);
+  const [enquiriesLiveTick, setEnquiriesLiveTick] = useState(0);
+  const [signalsLiveTick, setSignalsLiveTick] = useState(0);
+
   const [toast, setToast] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [publishReceipt, setPublishReceipt] = useState<{
@@ -121,7 +149,7 @@ export const AdminPage: React.FC = () => {
     pushJob: PushJobSummary | null;
   } | null>(null);
 
-  // Signal Form State
+  // Structured Signal Form State
   const [editingSignalId, setEditingSignalId] = useState<string | null>(null);
   const [sigForm, setSigForm] = useState({
     pair: 'EURUSD',
@@ -211,59 +239,159 @@ export const AdminPage: React.FC = () => {
     setSettingsForm(settings);
   }, [settings]);
 
+  // Bootstrap isolated /admin session on mount
+  useEffect(() => {
+    let active = true;
+    bootstrapAdminSession()
+      .then((u) => {
+        if (active) setAdminUser(u && u.role === 'admin' ? u : null);
+      })
+      .finally(() => {
+        if (active) setAdminAuthLoading(false);
+      });
+
+    const handleExpired = () => {
+      setAdminUser(null);
+      setLoginError('Administrator session expired. Please sign in again.');
+    };
+    window.addEventListener('mfx:admin-auth-expired', handleExpired);
+    return () => {
+      active = false;
+      window.removeEventListener('mfx:admin-auth-expired', handleExpired);
+    };
+  }, []);
+
+  const notifyOk = useCallback((msg: string) => {
+    setErrorMsg(null);
+    setToast(msg);
+    window.setTimeout(() => setToast(null), 4000);
+  }, []);
+
   const loadAdminData = useCallback(async () => {
-    if (user?.role !== 'admin') return;
+    if (!adminUser || adminUser.role !== 'admin') return;
     try {
-      const [ov, reg, upd, usr, rep, cnt, diag] = await Promise.all([
-        apiFetch<OverviewPayload>('/api/admin/overview'),
-        apiFetch<RegistrationAnalyticsPayload>('/api/admin/registrations'),
-        apiFetch<{ updates: MarketUpdate[] }>('/api/updates?includeAll=true'),
-        apiFetch<{ users: User[] }>('/api/admin/users'),
-        apiFetch<{ reports: typeof reports }>('/api/admin/reports'),
-        apiFetch<{ messages: typeof contacts }>('/api/admin/contacts'),
-        apiFetch<NonNullable<typeof pushDiagnostics>>('/api/admin/push-diagnostics'),
+      const [ov, reg, upd, usr, rep, diag] = await Promise.all([
+        adminApiFetch<OverviewPayload>('/api/admin/overview'),
+        adminApiFetch<RegistrationAnalyticsPayload>('/api/admin/registrations'),
+        adminApiFetch<{ updates: MarketUpdate[] }>('/api/updates?includeAll=true'),
+        adminApiFetch<{ users: User[] }>('/api/admin/users'),
+        adminApiFetch<{ reports: typeof reports }>('/api/admin/reports'),
+        adminApiFetch<NonNullable<typeof pushDiagnostics>>('/api/admin/push-diagnostics'),
       ]);
       setOverview(ov);
       setRegistrations(reg);
       setAllUpdates(upd.updates);
       setUsersList(usr.users);
       setReports(rep.reports);
-      setContacts(cnt.messages);
       setPushDiagnostics(diag);
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : 'Failed to load admin data.');
+      setErrorMsg(err instanceof Error ? err.message : 'Failed to load admin console data.');
     }
-  }, [user?.role]);
+  }, [adminUser]);
 
   useEffect(() => {
     loadAdminData();
   }, [loadAdminData]);
 
+  // Dedicated Real-Time Admin WebSocket Connection
   useEffect(() => {
-    return subscribePushJobEvents((job) => {
-      setPublishReceipt((cur) =>
-        cur?.pushJob?.id === job.id ? { ...cur, pushJob: job } : cur
-      );
-      setOverview((cur) => {
-        if (!cur?.push_jobs) return cur;
-        const exists = cur.push_jobs.some((j) => j.id === job.id);
-        return {
-          ...cur,
-          push_jobs: exists
-            ? cur.push_jobs.map((j) => (j.id === job.id ? job : j))
-            : [job, ...cur.push_jobs],
-        };
-      });
-    });
-  }, [subscribePushJobEvents]);
+    if (!adminUser || adminUser.role !== 'admin') return;
 
+    let ws: WebSocket | null = null;
+    let closedByCleanup = false;
+    let reconnectTimer: number | null = null;
+    let attempt = 0;
+
+    const connect = async () => {
+      if (closedByCleanup) return;
+      let token = getAdminAccessToken();
+      if (!token) {
+        const refreshed = await refreshAdminSession();
+        token = refreshed?.token || null;
+      }
+      if (!token || closedByCleanup) return;
+
+      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      ws = new WebSocket(`${proto}//${window.location.host}/ws`);
+
+      ws.addEventListener('open', () => {
+        attempt = 0;
+        const activeToken = getAdminAccessToken();
+        if (activeToken && ws?.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ event: 'admin:subscribe', token: activeToken }));
+        }
+      });
+
+      ws.addEventListener('message', (ev) => {
+        try {
+          const msg = JSON.parse(String(ev.data)) as { event: string; data?: unknown };
+          if (
+            msg.event === 'admin:application_created' ||
+            msg.event === 'admin:application_updated'
+          ) {
+            setAppsLiveTick((n) => n + 1);
+            loadAdminData();
+          } else if (
+            msg.event === 'admin:support_conversation_created' ||
+            msg.event === 'admin:support_message' ||
+            msg.event === 'support:message' ||
+            msg.event === 'support:read' ||
+            msg.event === 'admin:contact_created' ||
+            msg.event === 'admin:contact_updated'
+          ) {
+            setEnquiriesLiveTick((n) => n + 1);
+            loadAdminData();
+          } else if (
+            msg.event === 'signals_chat:created' ||
+            msg.event === 'signals_chat:updated' ||
+            msg.event === 'signals_chat:deleted'
+          ) {
+            setSignalsLiveTick((n) => n + 1);
+          } else if (msg.event === 'push:job_updated' && msg.data) {
+            const job = msg.data as PushJobSummary;
+            setPublishReceipt((cur) =>
+              cur?.pushJob?.id === job.id ? { ...cur, pushJob: job } : cur
+            );
+            setOverview((cur) => {
+              if (!cur?.push_jobs) return cur;
+              const exists = cur.push_jobs.some((j) => j.id === job.id);
+              return {
+                ...cur,
+                push_jobs: exists
+                  ? cur.push_jobs.map((j) => (j.id === job.id ? job : j))
+                  : [job, ...cur.push_jobs],
+              };
+            });
+          }
+        } catch {
+          // ignore malformed frames
+        }
+      });
+
+      ws.addEventListener('close', () => {
+        if (closedByCleanup) return;
+        const delay = Math.min(2000 * Math.pow(1.5, attempt), 15_000);
+        attempt += 1;
+        reconnectTimer = window.setTimeout(connect, delay);
+      });
+    };
+
+    connect();
+    return () => {
+      closedByCleanup = true;
+      if (reconnectTimer) window.clearTimeout(reconnectTimer);
+      if (ws && ws.readyState < 2) ws.close();
+    };
+  }, [adminUser, loadAdminData]);
+
+  // Poll queued push job until finished
   useEffect(() => {
     const jobId = publishReceipt?.pushJob?.id;
     const queued = publishReceipt?.pushJob?.queued_count ?? 0;
-    if (!jobId || queued <= 0) return;
+    if (!adminUser || !jobId || queued <= 0) return;
 
     const timer = window.setInterval(() => {
-      apiFetch<{ job: PushJobSummary }>(`/api/admin/push-jobs/${jobId}`)
+      adminApiFetch<{ job: PushJobSummary }>(`/api/admin/push-jobs/${jobId}`)
         .then((res) => {
           setPublishReceipt((cur) =>
             cur?.pushJob?.id === jobId ? { ...cur, pushJob: res.job } : cur
@@ -271,55 +399,189 @@ export const AdminPage: React.FC = () => {
         })
         .catch(() => undefined);
     }, 3000);
-    return () => clearInterval(timer);
-  }, [publishReceipt?.pushJob?.id, publishReceipt?.pushJob?.queued_count]);
+    return () => window.clearInterval(timer);
+  }, [adminUser, publishReceipt?.pushJob?.id, publishReceipt?.pushJob?.queued_count]);
 
-  const notifyOk = (msg: string) => {
-    setErrorMsg(null);
-    setToast(msg);
-    setTimeout(() => setToast(null), 3500);
+  const handleAdminSignIn = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoginError(null);
+    setLoginSubmitting(true);
+    try {
+      const res = await loginAdmin(loginIdentifier.trim(), loginPassword, rememberMe);
+      setAdminUser(res.user);
+      setLoginPassword('');
+      setLoginError(null);
+    } catch (err) {
+      setLoginError(
+        err instanceof Error ? err.message : 'Unable to sign in to administrator console.'
+      );
+    } finally {
+      setLoginSubmitting(false);
+    }
   };
 
-  if (authLoading && !user) {
+  const handleAdminSignOut = async () => {
+    await logoutAdmin();
+    setAdminUser(null);
+    setOverview(null);
+    setRegistrations(null);
+  };
+
+  // --- Admin Login Screen (Standalone) ---
+  if (adminAuthLoading) {
     return (
-      <div className="mx-auto max-w-lg py-12">
-        <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-8 text-center text-sm text-slate-500">
-          Verifying administrator session...
+      <div className="min-h-screen bg-[#F8FAFC] dark:bg-[#0B0F17] flex items-center justify-center p-4">
+        <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] px-8 py-7 text-center space-y-2 shadow-sm">
+          <div className="w-8 h-8 rounded-full border-2 border-[#881337] border-t-transparent animate-spin mx-auto" />
+          <p className="text-sm font-medium text-slate-600 dark:text-slate-300">
+            Verifying administrator session...
+          </p>
         </div>
       </div>
     );
   }
 
-  if (!user || user.role !== 'admin') {
+  if (!adminUser || adminUser.role !== 'admin') {
     return (
-      <div className="mx-auto max-w-lg py-12">
-        <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-8 text-center space-y-4">
-          <ShieldAlert className="w-10 h-10 text-amber-500 mx-auto" />
-          <h1 className="text-xl font-bold text-slate-900 dark:text-white">
-            Administrator Access Required
-          </h1>
-          <p className="text-sm text-slate-500 dark:text-slate-400">
-            This console is restricted to authorized platform administrators.
-          </p>
+      <div className="min-h-screen bg-[#F8FAFC] dark:bg-[#0B0F17] flex flex-col justify-between p-4 sm:p-6">
+        <div className="max-w-5xl w-full mx-auto flex items-center justify-between">
+          <a
+            href="/"
+            onClick={(e) => {
+              e.preventDefault();
+              navigate('/');
+            }}
+            className="inline-flex items-center gap-2.5 text-sm font-bold text-slate-900 dark:text-white"
+          >
+            <img
+              src={settings.logo_url}
+              alt={settings.brand_name}
+              className="w-8 h-8 rounded-lg object-cover border border-slate-200 dark:border-slate-800"
+            />
+            <span>{settings.brand_name}</span>
+          </a>
+
           <button
             type="button"
-            onClick={() => navigate(user ? '/dashboard' : '/login')}
-            className="rounded-lg bg-[#881337] px-5 py-2.5 text-sm font-semibold text-white hover:bg-[#6B0F2B]"
+            onClick={toggleTheme}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-300"
           >
-            {user ? 'Return to Dashboard' : 'Sign In as Administrator'}
+            {theme === 'dark' ? <Sun className="w-3.5 h-3.5" /> : <Moon className="w-3.5 h-3.5" />}
+            <span>{theme === 'dark' ? 'Light' : 'Dark'}</span>
           </button>
         </div>
+
+        <div className="w-full max-w-md mx-auto my-8">
+          <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-6 sm:p-8 shadow-sm space-y-6">
+            <div className="space-y-2 text-center">
+              <div className="w-12 h-12 rounded-2xl bg-[#881337]/10 dark:bg-rose-500/15 text-[#881337] dark:text-rose-400 flex items-center justify-center mx-auto">
+                <ShieldCheck className="w-6 h-6" />
+              </div>
+              <h1 className="text-xl font-bold text-slate-900 dark:text-white">
+                {settings.brand_name} Admin Portal
+              </h1>
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Sign in with your designated administrator account to manage Signals, Applications, Customer Chat, Academy, and Platform Settings.
+              </p>
+            </div>
+
+            {loginError && (
+              <div className="rounded-xl border border-red-500/30 bg-red-500/10 px-3.5 py-2.5 text-xs font-semibold text-red-600 dark:text-red-400">
+                {loginError}
+              </div>
+            )}
+
+            <form onSubmit={handleAdminSignIn} className="space-y-4">
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1.5">
+                  Administrator Email or Username
+                </label>
+                <input
+                  type="text"
+                  required
+                  autoComplete="username"
+                  placeholder="Enter administrator email"
+                  value={loginIdentifier}
+                  onChange={(e) => setLoginIdentifier(e.target.value)}
+                  className="w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3.5 py-2.5 text-sm text-slate-900 dark:text-white"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1.5">
+                  Password
+                </label>
+                <div className="relative">
+                  <input
+                    type={showPassword ? 'text' : 'password'}
+                    required
+                    autoComplete="current-password"
+                    placeholder="Enter administrator password"
+                    value={loginPassword}
+                    onChange={(e) => setLoginPassword(e.target.value)}
+                    className="w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 pl-3.5 pr-10 py-2.5 text-sm text-slate-900 dark:text-white"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword((s) => !s)}
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
+                    aria-label={showPassword ? 'Hide password' : 'Show password'}
+                  >
+                    {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
+              </div>
+
+              <label className="inline-flex items-center gap-2 text-xs text-slate-600 dark:text-slate-300 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={rememberMe}
+                  onChange={(e) => setRememberMe(e.target.checked)}
+                  className="accent-[#881337]"
+                />
+                <span>Keep administrator session active (30 days)</span>
+              </label>
+
+              <button
+                type="submit"
+                disabled={loginSubmitting}
+                className="w-full inline-flex items-center justify-center gap-2 rounded-xl bg-[#881337] py-3 text-sm font-bold text-white hover:bg-[#6B0F2B] disabled:opacity-60 min-h-[44px]"
+              >
+                <Lock className="w-4 h-4" />
+                <span>{loginSubmitting ? 'Signing In...' : 'Sign In to Admin Portal'}</span>
+              </button>
+            </form>
+
+            <div className="pt-3 border-t border-slate-100 dark:border-slate-800 text-center">
+              <a
+                href="/"
+                onClick={(e) => {
+                  e.preventDefault();
+                  navigate('/');
+                }}
+                className="text-xs font-semibold text-slate-500 hover:text-[#881337] dark:hover:text-rose-400"
+              >
+                &larr; Return to Public MeridianFX Website
+              </a>
+            </div>
+          </div>
+        </div>
+
+        <p className="text-center text-[11px] text-slate-400">
+          Isolated Administrator Desk · Protected by HTTP-Only Scoped Refresh Cookie
+        </p>
       </div>
     );
   }
 
+  // --- Helper Handlers ---
   const handleUploadField = async (
     file: File | undefined,
     onDone: (url: string, origName: string) => void
   ) => {
     if (!file) return;
     try {
-      const uploaded = await uploadMediaFile(file);
+      const uploaded = await adminUploadMediaFile(file);
       onDone(uploaded.url, uploaded.original_name);
       notifyOk(`Uploaded ${uploaded.original_name}`);
     } catch (err) {
@@ -327,19 +589,51 @@ export const AdminPage: React.FC = () => {
     }
   };
 
-  // --- Signal Handlers ---
+  const handleDownloadBackup = async (filename: string) => {
+    try {
+      let token = getAdminAccessToken();
+      if (!token) {
+        const refreshed = await refreshAdminSession();
+        token = refreshed?.token || null;
+      }
+      if (!token) throw new Error('Administrator session required to download backups.');
+
+      const res = await fetch(`/api/admin/backups/${encodeURIComponent(filename)}`, {
+        credentials: 'include',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'X-Requested-With': 'MeridianFX-Admin',
+        },
+      });
+      if (!res.ok) throw new Error(`Backup download failed (${res.status})`);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      notifyOk(`Downloaded ${filename}`);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Failed to download backup.');
+    }
+  };
+
+  // --- Structured Signal Handlers ---
   const handleSubmitSignal = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
       if (editingSignalId) {
-        const res = await apiFetch<{
+        const res = await adminApiFetch<{
           signal_message?: SignalChatMessage | null;
           push_job?: PushJobSummary | null;
         }>(`/api/signals/${editingSignalId}`, {
           method: 'PATCH',
           body: JSON.stringify(sigForm),
         });
-        notifyOk('Signal updated and synced to all connected clients.');
+        notifyOk('Trading signal updated and synced live.');
         if (res.signal_message || res.push_job) {
           setPublishReceipt({
             title: `${sigForm.pair} status update published publicly`,
@@ -348,7 +642,7 @@ export const AdminPage: React.FC = () => {
           });
         }
       } else {
-        const res = await apiFetch<{
+        const res = await adminApiFetch<{
           signal_message?: SignalChatMessage | null;
           push_job?: PushJobSummary | null;
         }>('/api/signals', {
@@ -382,6 +676,7 @@ export const AdminPage: React.FC = () => {
         is_premium: false,
         send_push: true,
       });
+      setSignalsLiveTick((n) => n + 1);
       await Promise.all([refreshAll(), loadAdminData()]);
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Failed to save signal.');
@@ -390,7 +685,7 @@ export const AdminPage: React.FC = () => {
 
   const handleQuickSignalStatus = async (sig: TradingSignal, nextStatus: SignalStatus) => {
     try {
-      const res = await apiFetch<{
+      const res = await adminApiFetch<{
         signal_message?: SignalChatMessage | null;
         push_job?: PushJobSummary | null;
       }>(`/api/signals/${sig.id}`, {
@@ -403,7 +698,8 @@ export const AdminPage: React.FC = () => {
         signalMessageId: res.signal_message?.id || null,
         pushJob: res.push_job || null,
       });
-      await loadAdminData();
+      setSignalsLiveTick((n) => n + 1);
+      await Promise.all([refreshAll(), loadAdminData()]);
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Failed to update status.');
     }
@@ -413,7 +709,7 @@ export const AdminPage: React.FC = () => {
     e.preventDefault();
     if (!followUpSignalId) return;
     try {
-      const res = await apiFetch<{
+      const res = await adminApiFetch<{
         signal_message?: SignalChatMessage | null;
         push_job?: PushJobSummary | null;
       }>(`/api/signals/${followUpSignalId}/updates`, {
@@ -432,24 +728,29 @@ export const AdminPage: React.FC = () => {
         signalMessageId: res.signal_message?.id || null,
         pushJob: res.push_job || null,
       });
-      await loadAdminData();
+      setSignalsLiveTick((n) => n + 1);
+      await Promise.all([refreshAll(), loadAdminData()]);
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Failed to post follow-up.');
     }
   };
 
   const handleDeleteSignal = async (id: string) => {
-    await apiFetch(`/api/signals/${id}`, { method: 'DELETE' });
-    notifyOk('Signal deleted.');
-    await Promise.all([refreshAll(), loadAdminData()]);
+    try {
+      await adminApiFetch(`/api/signals/${id}`, { method: 'DELETE' });
+      notifyOk('Signal deleted.');
+      await Promise.all([refreshAll(), loadAdminData()]);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Failed to delete signal.');
+    }
   };
 
-  // --- Update Handlers ---
+  // --- Market Update Handlers ---
   const handlePublishUpdate = async (e: React.FormEvent) => {
     e.preventDefault();
     const isScheduled = Boolean(updForm.scheduled_at);
     try {
-      const res = await apiFetch<{
+      const res = await adminApiFetch<{
         signal_message?: SignalChatMessage | null;
         push_job?: PushJobSummary | null;
       }>('/api/updates', {
@@ -474,7 +775,7 @@ export const AdminPage: React.FC = () => {
         scheduled_at: '',
         send_push: true,
       });
-      notifyOk(isScheduled ? 'Update scheduled.' : 'Market update published live to Updates & Signals Channel.');
+      notifyOk(isScheduled ? 'Update scheduled.' : 'Market update published live.');
       if (!isScheduled) {
         setPublishReceipt({
           title: `"${publishedTitle}" published publicly`,
@@ -489,24 +790,32 @@ export const AdminPage: React.FC = () => {
   };
 
   const handleTogglePin = async (upd: MarketUpdate) => {
-    await apiFetch(`/api/updates/${upd.id}`, {
-      method: 'PATCH',
-      body: JSON.stringify({ pinned: !upd.pinned }),
-    });
-    await Promise.all([refreshAll(), loadAdminData()]);
+    try {
+      await adminApiFetch(`/api/updates/${upd.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ pinned: !upd.pinned }),
+      });
+      await Promise.all([refreshAll(), loadAdminData()]);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Failed to update pin.');
+    }
   };
 
   const handleDeleteUpdate = async (id: string) => {
-    await apiFetch(`/api/updates/${id}`, { method: 'DELETE' });
-    notifyOk('Market update deleted.');
-    await Promise.all([refreshAll(), loadAdminData()]);
+    try {
+      await adminApiFetch(`/api/updates/${id}`, { method: 'DELETE' });
+      notifyOk('Market update deleted.');
+      await Promise.all([refreshAll(), loadAdminData()]);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Failed to delete update.');
+    }
   };
 
-  // --- Notification Broadcast ---
+  // --- Notification Broadcast Handlers ---
   const handleSendBroadcast = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
-      const res = await apiFetch<{
+      const res = await adminApiFetch<{
         scheduled: boolean;
         push_job?: PushJobSummary | null;
       }>('/api/admin/notifications/send', {
@@ -548,7 +857,7 @@ export const AdminPage: React.FC = () => {
     setErrorMsg(null);
     try {
       await sendTestPushNotification();
-      notifyOk('Test push notification sent to this admin device.');
+      notifyOk('Test push notification sent to this device.');
       await loadAdminData();
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'No active push subscription on this device.');
@@ -561,7 +870,7 @@ export const AdminPage: React.FC = () => {
     setTestingAllPush(true);
     setErrorMsg(null);
     try {
-      const res = await apiFetch<{
+      const res = await adminApiFetch<{
         ok: boolean;
         targeted: number;
         delivered: number;
@@ -589,7 +898,7 @@ export const AdminPage: React.FC = () => {
 
   const handlePruneInactiveSubs = async () => {
     try {
-      const res = await apiFetch<{ deleted: number }>('/api/admin/push-subscriptions/prune', {
+      const res = await adminApiFetch<{ deleted: number }>('/api/admin/push-subscriptions/prune', {
         method: 'POST',
         body: JSON.stringify({ older_than_days: 0 }),
       });
@@ -600,20 +909,23 @@ export const AdminPage: React.FC = () => {
     }
   };
 
-  // --- Moderation & Settings Handlers ---
   const handleReportAction = async (id: string, action: 'hide_post' | 'dismiss') => {
-    await apiFetch(`/api/admin/reports/${id}`, {
-      method: 'PATCH',
-      body: JSON.stringify({ action }),
-    });
-    notifyOk(action === 'hide_post' ? 'Post hidden and report resolved.' : 'Report dismissed.');
-    await loadAdminData();
+    try {
+      await adminApiFetch(`/api/admin/reports/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ action }),
+      });
+      notifyOk(action === 'hide_post' ? 'Post hidden and report resolved.' : 'Report dismissed.');
+      await loadAdminData();
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Failed to update report.');
+    }
   };
 
   const handleSaveSettings = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
-      await apiFetch('/api/admin/settings', {
+      await adminApiFetch('/api/admin/settings', {
         method: 'PATCH',
         body: JSON.stringify({
           ...settingsForm,
@@ -628,35 +940,113 @@ export const AdminPage: React.FC = () => {
   };
 
   const handleCreateBackup = async () => {
-    await apiFetch('/api/admin/backup', { method: 'POST' });
-    notifyOk('Database backup snapshot created.');
-    await loadAdminData();
+    try {
+      await adminApiFetch('/api/admin/backup', { method: 'POST', body: '{}' });
+      notifyOk('Database backup snapshot created.');
+      await loadAdminData();
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Failed to create backup.');
+    }
   };
 
-  const tabs: Array<{ key: AdminTab; label: string; icon: React.ComponentType<{ className?: string }> }> = [
+  const pendingAppsCount = overview?.stats.pending_applications ?? 0;
+  const unreadEnquiriesCount = overview?.stats.unread_customer_messages ?? 0;
+
+  const tabs: Array<{
+    key: AdminTab;
+    label: string;
+    icon: React.ComponentType<{ className?: string }>;
+    badge?: number;
+  }> = [
     { key: 'overview', label: 'Overview', icon: LayoutDashboard },
-    { key: 'users', label: 'Members', icon: Users },
-    { key: 'registrations', label: 'Member Analytics', icon: BarChart3 },
-    { key: 'signals', label: 'Signals', icon: TrendingUp },
+    {
+      key: 'applications',
+      label: 'Applications',
+      icon: ClipboardList,
+      badge: pendingAppsCount > 0 ? pendingAppsCount : undefined,
+    },
+    {
+      key: 'enquiries',
+      label: 'Customer Chat & Enquiries',
+      icon: Inbox,
+      badge: unreadEnquiriesCount > 0 ? unreadEnquiriesCount : undefined,
+    },
+    { key: 'signals', label: 'Signals Studio', icon: TrendingUp },
     { key: 'updates', label: 'Updates', icon: Radio },
-    { key: 'notifications', label: 'Push Alerts', icon: Bell },
+    { key: 'members', label: 'Members', icon: Users },
+    { key: 'registrations', label: 'Analytics', icon: BarChart3 },
     { key: 'academy', label: 'Academy', icon: BookOpen },
+    { key: 'notifications', label: 'Push Alerts', icon: Bell },
     { key: 'settings', label: 'Settings', icon: SettingsIcon },
   ];
 
   return (
-    <div className="space-y-6">
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-bold text-slate-900 dark:text-white">
-            Administrator Command Desk
-          </h1>
-          <p className="text-xs text-slate-500 dark:text-slate-400">
-            All changes synchronize live across the public website, user dashboards, and installed PWAs.
-          </p>
+    <div className="min-h-screen bg-[#F8FAFC] dark:bg-[#0B0F17] text-slate-900 dark:text-slate-100">
+      {/* Standalone Admin Header */}
+      <header className="sticky top-0 z-30 border-b border-slate-200 dark:border-slate-800 bg-white/95 dark:bg-[#111827]/95 backdrop-blur">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 py-3 flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <img
+              src={settings.logo_url}
+              alt={settings.brand_name}
+              className="w-9 h-9 rounded-xl object-cover border border-slate-200 dark:border-slate-800"
+            />
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="font-bold text-sm sm:text-base text-slate-900 dark:text-white">
+                  {settings.brand_name}
+                </span>
+                <span className="rounded-md bg-[#881337] px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-white">
+                  Admin Portal
+                </span>
+              </div>
+              <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                Signed in as <span className="font-mono">{adminUser.email}</span>
+              </p>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={loadAdminData}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 dark:border-slate-700 px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">Sync</span>
+            </button>
+            <button
+              type="button"
+              onClick={toggleTheme}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 dark:border-slate-700 px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800"
+              aria-label="Toggle color theme"
+            >
+              {theme === 'dark' ? <Sun className="w-3.5 h-3.5" /> : <Moon className="w-3.5 h-3.5" />}
+            </button>
+            <a
+              href="/"
+              onClick={(e) => {
+                e.preventDefault();
+                navigate('/');
+              }}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 dark:border-slate-700 px-3 py-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800"
+            >
+              <ExternalLink className="w-3.5 h-3.5" />
+              <span>Public Website</span>
+            </a>
+            <button
+              type="button"
+              onClick={handleAdminSignOut}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 dark:bg-slate-800 px-3 py-1.5 text-xs font-semibold text-white hover:bg-slate-700"
+            >
+              <LogOut className="w-3.5 h-3.5" />
+              <span>Sign Out</span>
+            </button>
+          </div>
         </div>
 
-        <div className="flex items-center gap-2 overflow-x-auto pb-1">
+        {/* Navigation Strip */}
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 pb-3 flex items-center gap-1.5 overflow-x-auto">
           {tabs.map((t) => {
             const Icon = t.icon;
             return (
@@ -667,376 +1057,734 @@ export const AdminPage: React.FC = () => {
                 className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold whitespace-nowrap shrink-0 transition-colors ${
                   tab === t.key
                     ? 'bg-[#881337] text-white'
-                    : 'bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-300'
+                    : 'bg-slate-100 dark:bg-slate-800/80 text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800'
                 }`}
               >
                 <Icon className="w-3.5 h-3.5" />
                 <span>{t.label}</span>
+                {t.badge !== undefined && (
+                  <span
+                    className={`rounded-full px-1.5 py-0.5 text-[10px] font-bold leading-none ${
+                      tab === t.key
+                        ? 'bg-white text-[#881337]'
+                        : 'bg-[#881337] text-white'
+                    }`}
+                  >
+                    {t.badge}
+                  </span>
+                )}
               </button>
             );
           })}
         </div>
-      </div>
+      </header>
 
-      {toast && (
-        <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-2.5 text-xs font-semibold text-emerald-600 dark:text-emerald-400">
-          {toast}
-        </div>
-      )}
-      {publishReceipt && (
-        <div className="rounded-2xl border border-emerald-200 dark:border-emerald-900/50 bg-emerald-50/80 dark:bg-emerald-950/25 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-          <div className="space-y-1">
-            <p className="text-xs font-bold text-[#15803D] dark:text-emerald-400 flex items-center gap-1.5">
-              <CheckCircle2 className="w-4 h-4 shrink-0" />
-              <span>{publishReceipt.title}</span>
-            </p>
-            {publishReceipt.pushJob ? (
-              <div className="flex flex-wrap items-center gap-3 text-[11px] font-mono tabular-nums text-slate-700 dark:text-slate-300">
-                <span>Queued: {publishReceipt.pushJob.queued_count}</span>
-                <span className="text-[#15803D] dark:text-emerald-400 font-semibold">
-                  Delivered: {publishReceipt.pushJob.delivered_count}
-                </span>
-                <span
-                  className={
-                    publishReceipt.pushJob.failed_count > 0
-                      ? 'text-red-600 dark:text-red-400 font-semibold'
-                      : ''
-                  }
-                >
-                  Failures: {publishReceipt.pushJob.failed_count}
-                </span>
-                <span>Targeted: {publishReceipt.pushJob.total_targeted}</span>
-              </div>
-            ) : (
-              <p className="text-[11px] text-slate-600 dark:text-slate-400">
-                Visible immediately in public Signals Channel (push alert not selected).
-              </p>
-            )}
+      <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
+        {toast && (
+          <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-2.5 text-xs font-semibold text-emerald-700 dark:text-emerald-400">
+            {toast}
           </div>
-          <div className="flex items-center gap-2 shrink-0">
-            {publishReceipt.signalMessageId && (
+        )}
+
+        {publishReceipt && (
+          <div className="rounded-2xl border border-emerald-200 dark:border-emerald-900/50 bg-emerald-50/80 dark:bg-emerald-950/25 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="space-y-1">
+              <p className="text-xs font-bold text-[#15803D] dark:text-emerald-400 flex items-center gap-1.5">
+                <CheckCircle2 className="w-4 h-4 shrink-0" />
+                <span>{publishReceipt.title}</span>
+              </p>
+              {publishReceipt.pushJob ? (
+                <div className="flex flex-wrap items-center gap-3 text-[11px] font-mono tabular-nums text-slate-700 dark:text-slate-300">
+                  <span>Queued: {publishReceipt.pushJob.queued_count}</span>
+                  <span className="text-[#15803D] dark:text-emerald-400 font-semibold">
+                    Delivered: {publishReceipt.pushJob.delivered_count}
+                  </span>
+                  <span
+                    className={
+                      publishReceipt.pushJob.failed_count > 0
+                        ? 'text-red-600 dark:text-red-400 font-semibold'
+                        : ''
+                    }
+                  >
+                    Failures: {publishReceipt.pushJob.failed_count}
+                  </span>
+                  <span>Targeted: {publishReceipt.pushJob.total_targeted}</span>
+                </div>
+              ) : (
+                <p className="text-[11px] text-slate-600 dark:text-slate-400">
+                  Visible immediately in public Signals Channel (push alert not selected).
+                </p>
+              )}
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              {publishReceipt.signalMessageId && (
+                <button
+                  type="button"
+                  onClick={() => navigate(`/signals?message=${publishReceipt.signalMessageId}`)}
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-[#881337] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#6B0F2B]"
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                  <span>View in Signals</span>
+                </button>
+              )}
               <button
                 type="button"
-                onClick={() => navigate(`/signals?message=${publishReceipt.signalMessageId}`)}
-                className="inline-flex items-center gap-1.5 rounded-lg bg-[#881337] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#6B0F2B]"
+                onClick={() => setPublishReceipt(null)}
+                className="rounded-lg border border-slate-300 dark:border-slate-700 px-2.5 py-1.5 text-xs text-slate-600 dark:text-slate-300"
               >
-                <ExternalLink className="w-3.5 h-3.5" />
-                <span>View in Signals</span>
+                Dismiss
               </button>
-            )}
-            <button
-              type="button"
-              onClick={() => setPublishReceipt(null)}
-              className="rounded-lg border border-slate-300 dark:border-slate-700 px-2.5 py-1.5 text-xs text-slate-600 dark:text-slate-300"
-            >
-              Dismiss
-            </button>
-          </div>
-        </div>
-      )}
-      {errorMsg && (
-        <div className="rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-2.5 text-xs font-semibold text-red-600 dark:text-red-400">
-          {errorMsg}
-        </div>
-      )}
-
-      {/* A. OVERVIEW */}
-      {tab === 'overview' && overview && (
-        <div className="space-y-6">
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-4">
-              <p className="text-xs text-slate-500">Members &amp; Admin</p>
-              <p className="mt-1 text-2xl font-bold font-mono tabular-nums text-slate-900 dark:text-white">
-                {overview.stats.total_users}
-              </p>
-              <p className="text-[11px] text-slate-500">
-                +{overview.stats.new_registrations_7d} added in last 7d
-              </p>
-            </div>
-            <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-4">
-              <p className="text-xs text-slate-500">Trading Signals</p>
-              <p className="mt-1 text-2xl font-bold font-mono tabular-nums text-slate-900 dark:text-white">
-                {overview.stats.total_signals}
-              </p>
-              <p className="text-[11px] text-slate-500">
-                {overview.stats.active_signals} active · {overview.stats.completed_signals} completed
-              </p>
-            </div>
-            <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-4">
-              <p className="text-xs text-slate-500">Market Updates</p>
-              <p className="mt-1 text-2xl font-bold font-mono tabular-nums text-slate-900 dark:text-white">
-                {overview.stats.total_updates}
-              </p>
-              <p className="text-[11px] text-slate-500">Published briefings</p>
-            </div>
-            <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-4">
-              <p className="text-xs text-slate-500">Push Devices</p>
-              <p className="mt-1 text-2xl font-bold font-mono tabular-nums text-slate-900 dark:text-white">
-                {overview.stats.push_subscribers}
-              </p>
-              <p className="text-[11px] text-slate-500">Active Web Push endpoints</p>
             </div>
           </div>
+        )}
 
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            {/* Backups */}
-            <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5 space-y-4">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <Database className="w-4 h-4 text-[#881337] dark:text-rose-400" />
-                  <h2 className="text-sm font-bold text-slate-900 dark:text-white">
-                    Database Backups
-                  </h2>
-                </div>
-                <button
-                  type="button"
-                  onClick={handleCreateBackup}
-                  className="rounded-lg bg-[#15803D] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#166534]"
-                >
-                  Create Snapshot Now
-                </button>
-              </div>
-              <div className="divide-y divide-slate-100 dark:divide-slate-800 text-xs">
-                {overview.backups.map((b) => (
-                  <div key={b} className="py-2 flex items-center justify-between gap-2">
-                    <span className="font-mono text-slate-600 dark:text-slate-300 truncate">{b}</span>
-                    <a
-                      href={`/api/admin/backups/${encodeURIComponent(b)}`}
-                      className="inline-flex items-center gap-1 text-[#881337] dark:text-rose-400 hover:underline shrink-0"
-                    >
-                      <Download className="w-3.5 h-3.5" /> Download
-                    </a>
+        {errorMsg && (
+          <div className="rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-2.5 text-xs font-semibold text-red-600 dark:text-red-400">
+            {errorMsg}
+          </div>
+        )}
+
+        {/* 1. OVERVIEW */}
+        {tab === 'overview' && overview && (
+          <div className="space-y-6">
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+              <button
+                type="button"
+                onClick={() => setTab('applications')}
+                className="text-left rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-4 hover:border-[#881337]/50 transition-colors"
+              >
+                <p className="text-xs text-slate-500">Membership Applications</p>
+                <p className="mt-1 text-2xl font-bold font-mono tabular-nums text-slate-900 dark:text-white">
+                  {overview.stats.total_applications}
+                </p>
+                <p className="text-[11px] font-semibold text-amber-600 dark:text-amber-400">
+                  {overview.stats.pending_applications} pending · {overview.stats.approved_applications} approved
+                </p>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setTab('enquiries')}
+                className="text-left rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-4 hover:border-[#881337]/50 transition-colors"
+              >
+                <p className="text-xs text-slate-500">Customer Chat &amp; Enquiries</p>
+                <p className="mt-1 text-2xl font-bold font-mono tabular-nums text-slate-900 dark:text-white">
+                  {overview.stats.total_enquiries}
+                </p>
+                <p className="text-[11px] font-semibold text-[#881337] dark:text-rose-400">
+                  {overview.stats.unread_customer_messages} unread waiting reply
+                </p>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setTab('members')}
+                className="text-left rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-4 hover:border-[#881337]/50 transition-colors"
+              >
+                <p className="text-xs text-slate-500">Active Premium Members</p>
+                <p className="mt-1 text-2xl font-bold font-mono tabular-nums text-[#15803D] dark:text-emerald-400">
+                  {overview.stats.active_premium_members}
+                </p>
+                <p className="text-[11px] text-slate-500">
+                  {overview.stats.total_users} total accounts (+{overview.stats.new_registrations_7d} in 7d)
+                </p>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setTab('signals')}
+                className="text-left rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-4 hover:border-[#881337]/50 transition-colors"
+              >
+                <p className="text-xs text-slate-500">Signals &amp; Push Reach</p>
+                <p className="mt-1 text-2xl font-bold font-mono tabular-nums text-slate-900 dark:text-white">
+                  {overview.stats.total_signals}
+                </p>
+                <p className="text-[11px] text-slate-500">
+                  {overview.stats.active_signals} active · {overview.stats.push_subscribers} push device(s)
+                </p>
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              {/* Backups */}
+              <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5 space-y-4">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Database className="w-4 h-4 text-[#881337] dark:text-rose-400" />
+                    <h2 className="text-sm font-bold text-slate-900 dark:text-white">
+                      Database Backups
+                    </h2>
                   </div>
-                ))}
-              </div>
-            </div>
-
-            {/* System & Error Logs */}
-            <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5 space-y-3">
-              <h2 className="text-sm font-bold text-slate-900 dark:text-white">
-                Server & API Error Monitoring
-              </h2>
-              {overview.system_logs.length === 0 ? (
-                <p className="text-xs text-slate-500">Zero runtime warnings or errors logged.</p>
-              ) : (
-                <div className="divide-y divide-slate-100 dark:divide-slate-800 max-h-56 overflow-y-auto text-xs">
-                  {overview.system_logs.map((l) => (
-                    <div key={l.id} className="py-2">
-                      <span className="font-mono font-semibold text-amber-500">[{l.level}]</span>{' '}
-                      <span className="font-mono text-slate-400">{l.source}</span> — {l.message}
+                  <button
+                    type="button"
+                    onClick={handleCreateBackup}
+                    className="rounded-lg bg-[#15803D] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#166534]"
+                  >
+                    Create Snapshot Now
+                  </button>
+                </div>
+                <div className="divide-y divide-slate-100 dark:divide-slate-800 text-xs">
+                  {overview.backups.map((b) => (
+                    <div key={b} className="py-2 flex items-center justify-between gap-2">
+                      <span className="font-mono text-slate-600 dark:text-slate-300 truncate">{b}</span>
+                      <button
+                        type="button"
+                        onClick={() => handleDownloadBackup(b)}
+                        className="inline-flex items-center gap-1 text-[#881337] dark:text-rose-400 hover:underline shrink-0"
+                      >
+                        <Download className="w-3.5 h-3.5" /> Download
+                      </button>
                     </div>
                   ))}
+                  {overview.backups.length === 0 && (
+                    <p className="py-2 text-slate-500">No backup snapshots yet.</p>
+                  )}
                 </div>
-              )}
+              </div>
+
+              {/* System & Error Logs */}
+              <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5 space-y-3">
+                <h2 className="text-sm font-bold text-slate-900 dark:text-white">
+                  Server &amp; API Error Monitoring
+                </h2>
+                {overview.system_logs.length === 0 ? (
+                  <p className="text-xs text-slate-500">Zero runtime warnings or errors logged.</p>
+                ) : (
+                  <div className="divide-y divide-slate-100 dark:divide-slate-800 max-h-56 overflow-y-auto text-xs">
+                    {overview.system_logs.map((l) => (
+                      <div key={l.id} className="py-2">
+                        <span className="font-mono font-semibold text-amber-500">[{l.level}]</span>{' '}
+                        <span className="font-mono text-slate-400">{l.source}</span> — {l.message}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        )}
 
-      {/* B. SIGNAL MANAGEMENT */}
-      {tab === 'signals' && (
-        <div className="space-y-6">
-          <div className="rounded-2xl border border-[#881337]/30 bg-rose-50/70 dark:bg-rose-950/20 p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-            <div className="flex items-start gap-3">
-              <div className="w-10 h-10 rounded-xl bg-[#881337] text-white flex items-center justify-center shrink-0">
-                <MessageSquareText className="w-5 h-5" />
-              </div>
+        {/* 2. MEMBERSHIP APPLICATIONS */}
+        {tab === 'applications' && (
+          <AdminApplicationsPanel
+            onNotify={notifyOk}
+            onError={setErrorMsg}
+            onGlobalRefresh={loadAdminData}
+            liveTick={appsLiveTick}
+          />
+        )}
+
+        {/* 3. CUSTOMER CHAT & CONTACT ENQUIRIES */}
+        {tab === 'enquiries' && (
+          <AdminEnquiriesPanel
+            onNotify={notifyOk}
+            onError={setErrorMsg}
+            onGlobalRefresh={loadAdminData}
+            liveTick={enquiriesLiveTick}
+          />
+        )}
+
+        {/* 4. SIGNALS STUDIO (Live Broadcast Channel + Structured Trading Signals) */}
+        {tab === 'signals' && (
+          <div className="space-y-8">
+            <AdminSignalsBroadcastStudio
+              onNotify={notifyOk}
+              onError={setErrorMsg}
+              onPublishReceipt={(receipt) => setPublishReceipt(receipt)}
+              onOpenPublicSignals={(msgId) =>
+                navigate(msgId ? `/signals?message=${msgId}` : '/signals?tab=active')
+              }
+              liveTick={signalsLiveTick}
+            />
+
+            {/* Structured Trading Signal Publisher & Active Setups */}
+            <div className="pt-4 border-t border-slate-200 dark:border-slate-800 space-y-4">
               <div>
-                <h2 className="text-sm sm:text-base font-bold text-slate-900 dark:text-white">
-                  Live Signals Community Channel
+                <h2 className="text-base font-bold text-slate-900 dark:text-white">
+                  Structured Trading Signal Cards
                 </h2>
-                <p className="text-xs text-slate-600 dark:text-slate-300 mt-0.5">
-                  Publish real-time messages, chart screenshots, pinned announcements, and archive completed updates directly in the Signals chat composer.
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  Publish structured Entry / Stop-Loss / TP1-TP4 signal records. Active signals also mirror to the live Signals Channel feed.
                 </p>
               </div>
-            </div>
-            <button
-              type="button"
-              onClick={() => navigate('/signals?tab=active')}
-              className="inline-flex items-center justify-center gap-2 rounded-xl bg-[#881337] px-4 py-2.5 text-xs font-semibold text-white hover:bg-[#6B0F2B] shrink-0 min-h-[42px]"
-            >
-              <MessageSquareText className="w-4 h-4" />
-              <span>Open Live Signals Chat & Composer</span>
-            </button>
-          </div>
 
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                <form
+                  onSubmit={handleSubmitSignal}
+                  className="lg:col-span-5 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5 space-y-3.5 h-fit"
+                >
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-sm font-bold text-slate-900 dark:text-white">
+                      {editingSignalId ? 'Edit Structured Signal' : 'Publish Structured Signal'}
+                    </h3>
+                    {editingSignalId && (
+                      <button
+                        type="button"
+                        onClick={() => setEditingSignalId(null)}
+                        className="text-xs text-slate-500 underline"
+                      >
+                        Cancel Edit
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <input
+                      type="text"
+                      required
+                      placeholder="Pair (e.g. XAUUSD)"
+                      value={sigForm.pair}
+                      onChange={(e) => setSigForm({ ...sigForm, pair: e.target.value.toUpperCase() })}
+                      className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm font-mono"
+                    />
+                    <select
+                      value={sigForm.direction}
+                      onChange={(e) =>
+                        setSigForm({ ...sigForm, direction: e.target.value as SignalDirection })
+                      }
+                      className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm font-semibold"
+                    >
+                      <option value="BUY">BUY</option>
+                      <option value="SELL">SELL</option>
+                    </select>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <input
+                      type="text"
+                      required
+                      placeholder="Entry Price"
+                      value={sigForm.entry_price}
+                      onChange={(e) => setSigForm({ ...sigForm, entry_price: e.target.value })}
+                      className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm font-mono"
+                    />
+                    <input
+                      type="text"
+                      required
+                      placeholder="Stop Loss"
+                      value={sigForm.stop_loss}
+                      onChange={(e) => setSigForm({ ...sigForm, stop_loss: e.target.value })}
+                      className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm font-mono"
+                    />
+                  </div>
+
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                    <input
+                      type="text"
+                      required
+                      placeholder="TP1"
+                      value={sigForm.tp1}
+                      onChange={(e) => setSigForm({ ...sigForm, tp1: e.target.value })}
+                      className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2.5 py-2 text-xs font-mono"
+                    />
+                    <input
+                      type="text"
+                      placeholder="TP2"
+                      value={sigForm.tp2}
+                      onChange={(e) => setSigForm({ ...sigForm, tp2: e.target.value })}
+                      className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2.5 py-2 text-xs font-mono"
+                    />
+                    <input
+                      type="text"
+                      placeholder="TP3"
+                      value={sigForm.tp3}
+                      onChange={(e) => setSigForm({ ...sigForm, tp3: e.target.value })}
+                      className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2.5 py-2 text-xs font-mono"
+                    />
+                    <input
+                      type="text"
+                      placeholder="TP4"
+                      value={sigForm.tp4}
+                      onChange={(e) => setSigForm({ ...sigForm, tp4: e.target.value })}
+                      className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2.5 py-2 text-xs font-mono"
+                    />
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-2">
+                    <input
+                      type="text"
+                      required
+                      placeholder="R:R (1 : 3)"
+                      value={sigForm.risk_reward}
+                      onChange={(e) => setSigForm({ ...sigForm, risk_reward: e.target.value })}
+                      className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2.5 py-2 text-xs font-mono"
+                    />
+                    <input
+                      type="text"
+                      required
+                      placeholder="Timeframe"
+                      value={sigForm.timeframe}
+                      onChange={(e) => setSigForm({ ...sigForm, timeframe: e.target.value })}
+                      className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2.5 py-2 text-xs font-mono"
+                    />
+                    <select
+                      value={sigForm.classification}
+                      onChange={(e) =>
+                        setSigForm({
+                          ...sigForm,
+                          classification: e.target.value as 'Educational' | 'Verified',
+                        })
+                      }
+                      className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2 py-2 text-xs"
+                    >
+                      <option value="Educational">Educational</option>
+                      <option value="Verified">Verified</option>
+                    </select>
+                  </div>
+
+                  <select
+                    value={sigForm.status}
+                    onChange={(e) =>
+                      setSigForm({ ...sigForm, status: e.target.value as SignalStatus })
+                    }
+                    className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs font-medium"
+                  >
+                    {(['Active', 'Pending', 'TP Hit', 'SL Hit', 'Closed', 'Cancelled'] as const).map(
+                      (st) => (
+                        <option key={st} value={st}>
+                          Status: {st}
+                        </option>
+                      )
+                    )}
+                  </select>
+
+                  <textarea
+                    rows={3}
+                    required
+                    placeholder="Technical & macro analysis explanation..."
+                    value={sigForm.analysis}
+                    onChange={(e) => setSigForm({ ...sigForm, analysis: e.target.value })}
+                    className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
+                  />
+
+                  <input
+                    type="text"
+                    placeholder="Admin remarks / trade management instructions"
+                    value={sigForm.admin_remarks}
+                    onChange={(e) => setSigForm({ ...sigForm, admin_remarks: e.target.value })}
+                    className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs"
+                  />
+
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                    <label className="inline-flex items-center gap-2 cursor-pointer rounded-lg border border-slate-300 dark:border-slate-700 px-3 py-1.5">
+                      <Upload className="w-3.5 h-3.5" />
+                      <span>{sigForm.chart_image_url ? 'Chart Attached' : 'Upload Chart Image'}</span>
+                      <input
+                        type="file"
+                        accept="image/*"
+                        className="hidden"
+                        onChange={(e) =>
+                          handleUploadField(e.target.files?.[0], (url) =>
+                            setSigForm((f) => ({ ...f, chart_image_url: url }))
+                          )
+                        }
+                      />
+                    </label>
+
+                    <div className="flex flex-wrap items-center gap-4">
+                      <label className="inline-flex items-center gap-2">
+                        <input
+                          type="checkbox"
+                          checked={sigForm.is_premium}
+                          onChange={(e) => setSigForm({ ...sigForm, is_premium: e.target.checked })}
+                          className="accent-[#881337]"
+                        />
+                        <span>Premium Only</span>
+                      </label>
+                      <label className="inline-flex items-center gap-2">
+                        <input
+                          type="checkbox"
+                          checked={sigForm.send_push}
+                          onChange={(e) => setSigForm({ ...sigForm, send_push: e.target.checked })}
+                          className="accent-[#881337]"
+                        />
+                        <span>Send Push</span>
+                      </label>
+                    </div>
+                  </div>
+
+                  <button
+                    type="submit"
+                    className="w-full rounded-lg bg-[#881337] py-2.5 text-sm font-semibold text-white hover:bg-[#6B0F2B] min-h-[44px]"
+                  >
+                    {editingSignalId ? 'Save Signal Changes' : 'Publish Structured Signal'}
+                  </button>
+                </form>
+
+                <div className="lg:col-span-7 space-y-4">
+                  {followUpSignalId && (
+                    <form
+                      onSubmit={handlePostFollowUp}
+                      className="rounded-2xl border border-rose-200 dark:border-rose-900/40 bg-rose-50/70 dark:bg-rose-950/20 p-4 space-y-3"
+                    >
+                      <p className="text-xs font-bold text-[#881337] dark:text-rose-400">
+                        Post Follow-Up Update &amp; Push Alert
+                      </p>
+                      <div className="flex flex-col sm:flex-row gap-2">
+                        <select
+                          value={followUpStatus}
+                          onChange={(e) => setFollowUpStatus(e.target.value as SignalStatus)}
+                          className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs"
+                        >
+                          {(
+                            ['Active', 'Pending', 'TP Hit', 'SL Hit', 'Closed', 'Cancelled'] as const
+                          ).map((st) => (
+                            <option key={st} value={st}>
+                              {st}
+                            </option>
+                          ))}
+                        </select>
+                        <input
+                          type="text"
+                          required
+                          value={followUpNote}
+                          onChange={(e) => setFollowUpNote(e.target.value)}
+                          placeholder="e.g. TP1 hit! Move stop loss to entry."
+                          className="flex-1 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs"
+                        />
+                        <button
+                          type="submit"
+                          className="rounded-lg bg-[#881337] px-4 py-2 text-xs font-semibold text-white hover:bg-[#6B0F2B]"
+                        >
+                          Post
+                        </button>
+                      </div>
+                    </form>
+                  )}
+
+                  <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] divide-y divide-slate-100 dark:divide-slate-800">
+                    {signals.map((sig) => (
+                      <div
+                        key={sig.id}
+                        className="p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+                      >
+                        <div>
+                          <div className="flex items-center gap-2">
+                            <span className="font-mono font-bold text-sm text-slate-900 dark:text-white">
+                              {sig.pair}
+                            </span>
+                            <span
+                              className={`text-xs font-bold ${
+                                sig.direction === 'BUY'
+                                  ? 'text-[#15803D] dark:text-emerald-400'
+                                  : 'text-[#9F1239] dark:text-rose-400'
+                              }`}
+                            >
+                              {sig.direction}
+                            </span>
+                            <span className="text-xs text-slate-500">
+                              · {sig.status} · {sig.timeframe}
+                              {sig.is_premium ? ' · Premium' : ''}
+                            </span>
+                          </div>
+                          <p className="text-xs font-mono text-slate-500 mt-0.5 tabular-nums">
+                            Entry {sig.entry_price} · SL {sig.stop_loss} · TP1 {sig.tp1}
+                          </p>
+                        </div>
+
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => handleQuickSignalStatus(sig, 'TP Hit')}
+                            className="rounded-md bg-emerald-50 border border-emerald-200 text-[#15803D] dark:bg-emerald-500/15 dark:border-emerald-500/30 dark:text-emerald-400 px-2.5 py-1 text-[11px] font-semibold"
+                          >
+                            TP Hit
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleQuickSignalStatus(sig, 'SL Hit')}
+                            className="rounded-md bg-rose-50 border border-rose-200 text-[#9F1239] dark:bg-rose-500/15 dark:border-rose-500/30 dark:text-rose-400 px-2.5 py-1 text-[11px] font-semibold"
+                          >
+                            SL Hit
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setFollowUpSignalId(sig.id);
+                              setFollowUpStatus(sig.status);
+                            }}
+                            className="rounded-md border border-slate-300 dark:border-slate-700 px-2.5 py-1 text-[11px] font-medium"
+                          >
+                            Follow-Up
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setEditingSignalId(sig.id);
+                              setSigForm({
+                                pair: sig.pair,
+                                direction: sig.direction,
+                                entry_price: sig.entry_price,
+                                stop_loss: sig.stop_loss,
+                                tp1: sig.tp1,
+                                tp2: sig.tp2 || '',
+                                tp3: sig.tp3 || '',
+                                tp4: sig.tp4 || '',
+                                risk_reward: sig.risk_reward,
+                                timeframe: sig.timeframe,
+                                status: sig.status,
+                                classification: sig.classification,
+                                analysis: sig.analysis,
+                                chart_image_url: sig.chart_image_url || '',
+                                admin_remarks: sig.admin_remarks || '',
+                                is_premium: Boolean(sig.is_premium),
+                                send_push: true,
+                              });
+                            }}
+                            className="p-1.5 text-slate-400 hover:text-[#881337]"
+                          >
+                            <Edit3 className="w-4 h-4" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteSignal(sig.id)}
+                            className="p-1.5 text-slate-400 hover:text-red-500"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                    {signals.length === 0 && (
+                      <p className="p-5 text-xs text-slate-500">
+                        No structured signal cards published yet.
+                      </p>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* 5. MARKET UPDATES */}
+        {tab === 'updates' && (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
             <form
-              onSubmit={handleSubmitSignal}
+              onSubmit={handlePublishUpdate}
               className="lg:col-span-5 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5 space-y-3.5 h-fit"
             >
-            <div className="flex items-center justify-between">
               <h2 className="text-base font-bold text-slate-900 dark:text-white">
-                {editingSignalId ? 'Edit Trading Signal' : 'Publish New Signal'}
+                Publish Market Update
               </h2>
-              {editingSignalId && (
-                <button
-                  type="button"
-                  onClick={() => setEditingSignalId(null)}
-                  className="text-xs text-slate-500 underline"
-                >
-                  Cancel Edit
-                </button>
-              )}
-            </div>
-
-            <div className="grid grid-cols-2 gap-3">
               <input
                 type="text"
                 required
-                placeholder="Pair (e.g. XAUUSD)"
-                value={sigForm.pair}
-                onChange={(e) => setSigForm({ ...sigForm, pair: e.target.value.toUpperCase() })}
-                className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm font-mono"
+                placeholder="Update headline"
+                value={updForm.title}
+                onChange={(e) => setUpdForm({ ...updForm, title: e.target.value })}
+                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
               />
               <select
-                value={sigForm.direction}
+                value={updForm.category}
                 onChange={(e) =>
-                  setSigForm({ ...sigForm, direction: e.target.value as SignalDirection })
+                  setUpdForm({ ...updForm, category: e.target.value as MarketUpdateCategory })
                 }
-                className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm font-semibold"
+                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs"
               >
-                <option value="BUY">BUY</option>
-                <option value="SELL">SELL</option>
-              </select>
-            </div>
-
-            <div className="grid grid-cols-2 gap-3">
-              <input
-                type="text"
-                required
-                placeholder="Entry Price"
-                value={sigForm.entry_price}
-                onChange={(e) => setSigForm({ ...sigForm, entry_price: e.target.value })}
-                className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm font-mono"
-              />
-              <input
-                type="text"
-                required
-                placeholder="Stop Loss"
-                value={sigForm.stop_loss}
-                onChange={(e) => setSigForm({ ...sigForm, stop_loss: e.target.value })}
-                className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm font-mono"
-              />
-            </div>
-
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-              <input
-                type="text"
-                required
-                placeholder="TP1"
-                value={sigForm.tp1}
-                onChange={(e) => setSigForm({ ...sigForm, tp1: e.target.value })}
-                className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2.5 py-2 text-xs font-mono"
-              />
-              <input
-                type="text"
-                placeholder="TP2"
-                value={sigForm.tp2}
-                onChange={(e) => setSigForm({ ...sigForm, tp2: e.target.value })}
-                className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2.5 py-2 text-xs font-mono"
-              />
-              <input
-                type="text"
-                placeholder="TP3"
-                value={sigForm.tp3}
-                onChange={(e) => setSigForm({ ...sigForm, tp3: e.target.value })}
-                className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2.5 py-2 text-xs font-mono"
-              />
-              <input
-                type="text"
-                placeholder="TP4"
-                value={sigForm.tp4}
-                onChange={(e) => setSigForm({ ...sigForm, tp4: e.target.value })}
-                className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2.5 py-2 text-xs font-mono"
-              />
-            </div>
-
-            <div className="grid grid-cols-3 gap-2">
-              <input
-                type="text"
-                required
-                placeholder="R:R (1 : 3)"
-                value={sigForm.risk_reward}
-                onChange={(e) => setSigForm({ ...sigForm, risk_reward: e.target.value })}
-                className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2.5 py-2 text-xs font-mono"
-              />
-              <input
-                type="text"
-                required
-                placeholder="Timeframe"
-                value={sigForm.timeframe}
-                onChange={(e) => setSigForm({ ...sigForm, timeframe: e.target.value })}
-                className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2.5 py-2 text-xs font-mono"
-              />
-              <select
-                value={sigForm.classification}
-                onChange={(e) =>
-                  setSigForm({
-                    ...sigForm,
-                    classification: e.target.value as 'Educational' | 'Verified',
-                  })
-                }
-                className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2 py-2 text-xs"
-              >
-                <option value="Educational">Educational</option>
-                <option value="Verified">Verified</option>
-              </select>
-            </div>
-
-            <select
-              value={sigForm.status}
-              onChange={(e) => setSigForm({ ...sigForm, status: e.target.value as SignalStatus })}
-              className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs font-medium"
-            >
-              {(['Active', 'Pending', 'TP Hit', 'SL Hit', 'Closed', 'Cancelled'] as const).map(
-                (st) => (
-                  <option key={st} value={st}>
-                    Status: {st}
+                {[
+                  'Breaking News',
+                  'Forex Update',
+                  'Economic Announcement',
+                  'Trading Opportunity',
+                  'Gold & Crypto',
+                  'Risk Warning',
+                  'Daily Outlook',
+                  'Session Alert',
+                  'Platform Announcement',
+                ].map((cat) => (
+                  <option key={cat} value={cat}>
+                    {cat}
                   </option>
-                )
-              )}
-            </select>
-
-            <textarea
-              rows={3}
-              required
-              placeholder="Technical & macro analysis explanation..."
-              value={sigForm.analysis}
-              onChange={(e) => setSigForm({ ...sigForm, analysis: e.target.value })}
-              className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
-            />
-
-            <input
-              type="text"
-              placeholder="Admin remarks / trade management instructions"
-              value={sigForm.admin_remarks}
-              onChange={(e) => setSigForm({ ...sigForm, admin_remarks: e.target.value })}
-              className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs"
-            />
-
-            <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
-              <label className="inline-flex items-center gap-2 cursor-pointer rounded-lg border border-slate-300 dark:border-slate-700 px-3 py-1.5">
-                <Upload className="w-3.5 h-3.5" />
-                <span>{sigForm.chart_image_url ? 'Chart Attached' : 'Upload Chart Image'}</span>
+                ))}
+              </select>
+              <textarea
+                rows={4}
+                required
+                placeholder="Write detailed market briefing..."
+                value={updForm.content}
+                onChange={(e) => setUpdForm({ ...updForm, content: e.target.value })}
+                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
+              />
+              <input
+                type="url"
+                placeholder="Optional external link (https://...)"
+                value={updForm.external_link}
+                onChange={(e) => setUpdForm({ ...updForm, external_link: e.target.value })}
+                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs"
+              />
+              <div>
+                <label className="block text-[11px] text-slate-500 mb-1">
+                  Schedule Publish Time (leave blank for immediate)
+                </label>
                 <input
-                  type="file"
-                  accept="image/*"
-                  className="hidden"
-                  onChange={(e) =>
-                    handleUploadField(e.target.files?.[0], (url) =>
-                      setSigForm((f) => ({ ...f, chart_image_url: url }))
-                    )
-                  }
+                  type="datetime-local"
+                  value={updForm.scheduled_at}
+                  onChange={(e) => setUpdForm({ ...updForm, scheduled_at: e.target.value })}
+                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs"
                 />
-              </label>
+              </div>
 
-              <div className="flex flex-wrap items-center gap-4">
+              <div className="flex flex-wrap gap-2 text-xs">
+                <label className="inline-flex items-center gap-1.5 cursor-pointer rounded-lg border border-slate-300 dark:border-slate-700 px-2.5 py-1.5">
+                  <Upload className="w-3.5 h-3.5" />
+                  <span>{updForm.image_url ? 'Image Ready' : 'Image'}</span>
+                  <input
+                    type="file"
+                    accept="image/*"
+                    className="hidden"
+                    onChange={(e) =>
+                      handleUploadField(e.target.files?.[0], (url) =>
+                        setUpdForm((f) => ({ ...f, image_url: url }))
+                      )
+                    }
+                  />
+                </label>
+                <label className="inline-flex items-center gap-1.5 cursor-pointer rounded-lg border border-slate-300 dark:border-slate-700 px-2.5 py-1.5">
+                  <Upload className="w-3.5 h-3.5" />
+                  <span>{updForm.video_url ? 'Video Ready' : 'Video'}</span>
+                  <input
+                    type="file"
+                    accept="video/mp4,video/webm"
+                    className="hidden"
+                    onChange={(e) =>
+                      handleUploadField(e.target.files?.[0], (url) =>
+                        setUpdForm((f) => ({ ...f, video_url: url }))
+                      )
+                    }
+                  />
+                </label>
+                <label className="inline-flex items-center gap-1.5 cursor-pointer rounded-lg border border-slate-300 dark:border-slate-700 px-2.5 py-1.5">
+                  <Upload className="w-3.5 h-3.5" />
+                  <span>{updForm.attachment_url ? 'Doc Ready' : 'PDF/Doc'}</span>
+                  <input
+                    type="file"
+                    accept="application/pdf"
+                    className="hidden"
+                    onChange={(e) =>
+                      handleUploadField(e.target.files?.[0], (url, name) =>
+                        setUpdForm((f) => ({ ...f, attachment_url: url, attachment_name: name }))
+                      )
+                    }
+                  />
+                </label>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-3 text-xs">
                 <label className="inline-flex items-center gap-2">
                   <input
                     type="checkbox"
-                    checked={sigForm.is_premium}
-                    onChange={(e) => setSigForm({ ...sigForm, is_premium: e.target.checked })}
+                    checked={updForm.pinned}
+                    onChange={(e) => setUpdForm({ ...updForm, pinned: e.target.checked })}
+                    className="accent-[#881337]"
+                  />
+                  <span>Pin to top</span>
+                </label>
+                <label className="inline-flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={updForm.is_premium}
+                    onChange={(e) => setUpdForm({ ...updForm, is_premium: e.target.checked })}
                     className="accent-[#881337]"
                   />
                   <span>Premium Members Only</span>
@@ -1044,147 +1792,53 @@ export const AdminPage: React.FC = () => {
                 <label className="inline-flex items-center gap-2">
                   <input
                     type="checkbox"
-                    checked={sigForm.send_push}
-                    onChange={(e) => setSigForm({ ...sigForm, send_push: e.target.checked })}
+                    checked={updForm.send_push}
+                    onChange={(e) => setUpdForm({ ...updForm, send_push: e.target.checked })}
                     className="accent-[#881337]"
                   />
                   <span>Send Push Alert</span>
                 </label>
               </div>
-            </div>
 
-            <button
-              type="submit"
-              className="w-full rounded-lg bg-[#881337] py-2.5 text-sm font-semibold text-white hover:bg-[#6B0F2B] min-h-[44px]"
-            >
-              {editingSignalId ? 'Save Signal Changes' : 'Publish Signal Live'}
-            </button>
-          </form>
-
-          {/* Existing Signals Table / List */}
-          <div className="lg:col-span-7 space-y-4">
-            {followUpSignalId && (
-              <form
-                onSubmit={handlePostFollowUp}
-                className="rounded-2xl border border-rose-200 dark:border-rose-900/40 bg-rose-50/70 dark:bg-rose-950/20 p-4 space-y-3"
+              <button
+                type="submit"
+                className="w-full rounded-lg bg-[#881337] py-2.5 text-sm font-semibold text-white hover:bg-[#6B0F2B] min-h-[44px]"
               >
-                <p className="text-xs font-bold text-[#881337] dark:text-rose-400">
-                  Post Follow-Up Update & Push Alert
-                </p>
-                <div className="flex flex-col sm:flex-row gap-2">
-                  <select
-                    value={followUpStatus}
-                    onChange={(e) => setFollowUpStatus(e.target.value as SignalStatus)}
-                    className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs"
-                  >
-                    {(['Active', 'Pending', 'TP Hit', 'SL Hit', 'Closed', 'Cancelled'] as const).map(
-                      (st) => (
-                        <option key={st} value={st}>
-                          {st}
-                        </option>
-                      )
-                    )}
-                  </select>
-                  <input
-                    type="text"
-                    required
-                    value={followUpNote}
-                    onChange={(e) => setFollowUpNote(e.target.value)}
-                    placeholder="e.g. TP1 hit! Move stop loss to entry."
-                    className="flex-1 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs"
-                  />
-                  <button
-                    type="submit"
-                    className="rounded-lg bg-[#881337] px-4 py-2 text-xs font-semibold text-white hover:bg-[#6B0F2B]"
-                  >
-                    Post
-                  </button>
-                </div>
-              </form>
-            )}
+                {updForm.scheduled_at ? 'Schedule Update' : 'Publish Update Live'}
+              </button>
+            </form>
 
-            <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] divide-y divide-slate-100 dark:divide-slate-800">
-              {signals.map((sig) => (
-                <div key={sig.id} className="p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                  <div>
-                    <div className="flex items-center gap-2">
-                      <span className="font-mono font-bold text-sm text-slate-900 dark:text-white">
-                        {sig.pair}
-                      </span>
-                      <span
-                        className={`text-xs font-bold ${
-                          sig.direction === 'BUY' ? 'text-[#15803D] dark:text-emerald-400' : 'text-[#9F1239] dark:text-rose-400'
-                        }`}
-                      >
-                        {sig.direction}
-                      </span>
-                      <span className="text-xs text-slate-500">
-                        · {sig.status} · {sig.timeframe}
-                        {sig.is_premium ? ' · Premium' : ''}
-                      </span>
-                    </div>
-                    <p className="text-xs font-mono text-slate-500 mt-0.5 tabular-nums">
-                      Entry {sig.entry_price} · SL {sig.stop_loss} · TP1 {sig.tp1}
+            <div className="lg:col-span-7 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] divide-y divide-slate-100 dark:divide-slate-800">
+              {allUpdates.map((u) => (
+                <div key={u.id} className="p-4 flex items-start justify-between gap-4">
+                  <div className="min-w-0">
+                    <p className="text-xs text-slate-500">
+                      {u.pinned ? 'Pinned · ' : ''}
+                      {u.is_premium ? 'Premium · ' : ''}
+                      {!u.published ? 'Scheduled · ' : ''}
+                      {u.category} · {formatLocalDateTime(u.created_at)}
+                    </p>
+                    <p className="mt-1 text-sm font-bold text-slate-900 dark:text-white">{u.title}</p>
+                    <p className="mt-1 text-xs text-slate-600 dark:text-slate-400 line-clamp-2">
+                      {u.content}
                     </p>
                   </div>
-
-                  <div className="flex flex-wrap items-center gap-1.5">
+                  <div className="flex items-center gap-1 shrink-0">
                     <button
                       type="button"
-                      onClick={() => handleQuickSignalStatus(sig, 'TP Hit')}
-                      className="rounded-md bg-emerald-50 border border-emerald-200 text-[#15803D] dark:bg-emerald-500/15 dark:border-emerald-500/30 dark:text-emerald-400 px-2.5 py-1 text-[11px] font-semibold"
+                      onClick={() => handleTogglePin(u)}
+                      className={`p-2 rounded-lg ${
+                        u.pinned ? 'text-[#881337] dark:text-rose-400' : 'text-slate-400 hover:text-slate-600'
+                      }`}
+                      title="Toggle Pin"
                     >
-                      TP Hit
+                      <Pin className="w-4 h-4" />
                     </button>
                     <button
                       type="button"
-                      onClick={() => handleQuickSignalStatus(sig, 'SL Hit')}
-                      className="rounded-md bg-rose-50 border border-rose-200 text-[#9F1239] dark:bg-rose-500/15 dark:border-rose-500/30 dark:text-rose-400 px-2.5 py-1 text-[11px] font-semibold"
-                    >
-                      SL Hit
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setFollowUpSignalId(sig.id);
-                        setFollowUpStatus(sig.status);
-                      }}
-                      className="rounded-md border border-slate-300 dark:border-slate-700 px-2.5 py-1 text-[11px] font-medium"
-                    >
-                      Follow-Up
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setEditingSignalId(sig.id);
-                        setSigForm({
-                          pair: sig.pair,
-                          direction: sig.direction,
-                          entry_price: sig.entry_price,
-                          stop_loss: sig.stop_loss,
-                          tp1: sig.tp1,
-                          tp2: sig.tp2 || '',
-                          tp3: sig.tp3 || '',
-                          tp4: sig.tp4 || '',
-                          risk_reward: sig.risk_reward,
-                          timeframe: sig.timeframe,
-                          status: sig.status,
-                          classification: sig.classification,
-                          analysis: sig.analysis,
-                          chart_image_url: sig.chart_image_url || '',
-                          admin_remarks: sig.admin_remarks || '',
-                          is_premium: Boolean(sig.is_premium),
-                          send_push: true,
-                        });
-                      }}
-                      className="p-1.5 text-slate-400 hover:text-[#881337]"
-                    >
-                      <Edit3 className="w-4 h-4" />
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleDeleteSignal(sig.id)}
-                      className="p-1.5 text-slate-400 hover:text-red-500"
+                      onClick={() => handleDeleteUpdate(u.id)}
+                      className="p-2 rounded-lg text-slate-400 hover:text-red-500"
+                      title="Delete Update"
                     >
                       <Trash2 className="w-4 h-4" />
                     </button>
@@ -1193,212 +1847,87 @@ export const AdminPage: React.FC = () => {
               ))}
             </div>
           </div>
-          </div>
-        </div>
-      )}
+        )}
 
-      {/* C. MARKET UPDATES */}
-      {tab === 'updates' && (
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-          <form
-            onSubmit={handlePublishUpdate}
-            className="lg:col-span-5 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5 space-y-3.5 h-fit"
-          >
-            <h2 className="text-base font-bold text-slate-900 dark:text-white">
-              Publish Market Update
-            </h2>
-            <input
-              type="text"
-              required
-              placeholder="Update headline"
-              value={updForm.title}
-              onChange={(e) => setUpdForm({ ...updForm, title: e.target.value })}
-              className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
+        {/* 6. PREMIUM MEMBERS & MODERATION */}
+        {tab === 'members' && (
+          <div className="space-y-6">
+            <AdminMembersPanel
+              onNotify={notifyOk}
+              onError={setErrorMsg}
+              onGlobalRefresh={loadAdminData}
             />
-            <select
-              value={updForm.category}
-              onChange={(e) =>
-                setUpdForm({ ...updForm, category: e.target.value as MarketUpdateCategory })
-              }
-              className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs"
-            >
-              {[
-                'Breaking News',
-                'Forex Update',
-                'Economic Announcement',
-                'Trading Opportunity',
-                'Gold & Crypto',
-                'Risk Warning',
-                'Daily Outlook',
-                'Session Alert',
-                'Platform Announcement',
-              ].map((cat) => (
-                <option key={cat} value={cat}>
-                  {cat}
-                </option>
+
+            <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5 space-y-3">
+              <h3 className="text-sm font-bold text-slate-900 dark:text-white">
+                Community Moderation Queue ({reports.length})
+              </h3>
+              {reports.map((r) => (
+                <div
+                  key={r.id}
+                  className="rounded-xl border border-slate-200 dark:border-slate-800 p-3 text-xs space-y-2"
+                >
+                  <p className="font-semibold">
+                    {r.post_title || 'Reported Item'} · Status: {r.status}
+                  </p>
+                  <p className="text-slate-500">
+                    Reported by {r.reporter_name}: {r.reason}
+                  </p>
+                  {r.status === 'pending' && (
+                    <div className="flex gap-2">
+                      <button
+                        type="button"
+                        onClick={() => handleReportAction(r.id, 'hide_post')}
+                        className="rounded bg-red-600 px-2.5 py-1 text-white font-semibold"
+                      >
+                        Hide Post
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleReportAction(r.id, 'dismiss')}
+                        className="rounded border border-slate-300 dark:border-slate-700 px-2.5 py-1"
+                      >
+                        Dismiss
+                      </button>
+                    </div>
+                  )}
+                </div>
               ))}
-            </select>
-            <textarea
-              rows={4}
-              required
-              placeholder="Write detailed market briefing..."
-              value={updForm.content}
-              onChange={(e) => setUpdForm({ ...updForm, content: e.target.value })}
-              className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
-            />
-            <input
-              type="url"
-              placeholder="Optional external link (https://...)"
-              value={updForm.external_link}
-              onChange={(e) => setUpdForm({ ...updForm, external_link: e.target.value })}
-              className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs"
-            />
-            <div>
-              <label className="block text-[11px] text-slate-500 mb-1">
-                Schedule Publish Time (leave blank for immediate)
-              </label>
-              <input
-                type="datetime-local"
-                value={updForm.scheduled_at}
-                onChange={(e) => setUpdForm({ ...updForm, scheduled_at: e.target.value })}
-                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs"
-              />
+              {reports.length === 0 && <p className="text-xs text-slate-500">No community reports.</p>}
             </div>
-
-            <div className="flex flex-wrap gap-2 text-xs">
-              <label className="inline-flex items-center gap-1.5 cursor-pointer rounded-lg border border-slate-300 dark:border-slate-700 px-2.5 py-1.5">
-                <Upload className="w-3.5 h-3.5" />
-                <span>{updForm.image_url ? 'Image Ready' : 'Image'}</span>
-                <input
-                  type="file"
-                  accept="image/*"
-                  className="hidden"
-                  onChange={(e) =>
-                    handleUploadField(e.target.files?.[0], (url) =>
-                      setUpdForm((f) => ({ ...f, image_url: url }))
-                    )
-                  }
-                />
-              </label>
-              <label className="inline-flex items-center gap-1.5 cursor-pointer rounded-lg border border-slate-300 dark:border-slate-700 px-2.5 py-1.5">
-                <Upload className="w-3.5 h-3.5" />
-                <span>{updForm.video_url ? 'Video Ready' : 'Video'}</span>
-                <input
-                  type="file"
-                  accept="video/mp4,video/webm"
-                  className="hidden"
-                  onChange={(e) =>
-                    handleUploadField(e.target.files?.[0], (url) =>
-                      setUpdForm((f) => ({ ...f, video_url: url }))
-                    )
-                  }
-                />
-              </label>
-              <label className="inline-flex items-center gap-1.5 cursor-pointer rounded-lg border border-slate-300 dark:border-slate-700 px-2.5 py-1.5">
-                <Upload className="w-3.5 h-3.5" />
-                <span>{updForm.attachment_url ? 'Doc Ready' : 'PDF/Doc'}</span>
-                <input
-                  type="file"
-                  accept="application/pdf"
-                  className="hidden"
-                  onChange={(e) =>
-                    handleUploadField(e.target.files?.[0], (url, name) =>
-                      setUpdForm((f) => ({ ...f, attachment_url: url, attachment_name: name }))
-                    )
-                  }
-                />
-              </label>
-            </div>
-
-            <div className="flex flex-wrap items-center justify-between gap-3 text-xs">
-              <label className="inline-flex items-center gap-2">
-                <input
-                  type="checkbox"
-                  checked={updForm.pinned}
-                  onChange={(e) => setUpdForm({ ...updForm, pinned: e.target.checked })}
-                  className="accent-[#881337]"
-                />
-                <span>Pin to top</span>
-              </label>
-              <label className="inline-flex items-center gap-2">
-                <input
-                  type="checkbox"
-                  checked={updForm.is_premium}
-                  onChange={(e) => setUpdForm({ ...updForm, is_premium: e.target.checked })}
-                  className="accent-[#881337]"
-                />
-                <span>Premium Members Only</span>
-              </label>
-              <label className="inline-flex items-center gap-2">
-                <input
-                  type="checkbox"
-                  checked={updForm.send_push}
-                  onChange={(e) => setUpdForm({ ...updForm, send_push: e.target.checked })}
-                  className="accent-[#881337]"
-                />
-                <span>Send Push Alert</span>
-              </label>
-            </div>
-
-            <button
-              type="submit"
-              className="w-full rounded-lg bg-[#881337] py-2.5 text-sm font-semibold text-white hover:bg-[#6B0F2B] min-h-[44px]"
-            >
-              {updForm.scheduled_at ? 'Schedule Update' : 'Publish Update Live'}
-            </button>
-          </form>
-
-          <div className="lg:col-span-7 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] divide-y divide-slate-100 dark:divide-slate-800">
-            {allUpdates.map((u) => (
-              <div key={u.id} className="p-4 flex items-start justify-between gap-4">
-                <div className="min-w-0">
-                  <p className="text-xs text-slate-500">
-                    {u.pinned ? 'Pinned · ' : ''}
-                    {u.is_premium ? 'Premium · ' : ''}
-                    {!u.published ? 'Scheduled · ' : ''}
-                    {u.category} · {formatLocalDateTime(u.created_at)}
-                  </p>
-                  <p className="mt-1 text-sm font-bold text-slate-900 dark:text-white">{u.title}</p>
-                  <p className="mt-1 text-xs text-slate-600 dark:text-slate-400 line-clamp-2">
-                    {u.content}
-                  </p>
-                </div>
-                <div className="flex items-center gap-1 shrink-0">
-                  <button
-                    type="button"
-                    onClick={() => handleTogglePin(u)}
-                    className={`p-2 rounded-lg ${
-                      u.pinned ? 'text-[#881337] dark:text-rose-400' : 'text-slate-400 hover:text-slate-600'
-                    }`}
-                    title="Toggle Pin"
-                  >
-                    <Pin className="w-4 h-4" />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => handleDeleteUpdate(u.id)}
-                    className="p-2 rounded-lg text-slate-400 hover:text-red-500"
-                    title="Delete Update"
-                  >
-                    <Trash2 className="w-4 h-4" />
-                  </button>
-                </div>
-              </div>
-            ))}
           </div>
-        </div>
-      )}
+        )}
 
-      {/* D. PUSH NOTIFICATIONS */}
-      {tab === 'notifications' && (
-        <div className="space-y-6">
+        {/* 7. MEMBER ANALYTICS */}
+        {tab === 'registrations' && (
+          <AdminRegistrationsPanel
+            analytics={registrations}
+            onRefresh={loadAdminData}
+            onError={setErrorMsg}
+          />
+        )}
+
+        {/* 8. ACADEMY CMS */}
+        {tab === 'academy' && (
+          <AdminAcademyManager
+            studentProgress={overview?.student_progress || []}
+            onNotify={notifyOk}
+            onError={setErrorMsg}
+            onGlobalRefresh={async () => {
+              await Promise.all([refreshAll(), loadAdminData()]);
+            }}
+          />
+        )}
+
+        {/* 9. PUSH NOTIFICATIONS */}
+        {tab === 'notifications' && (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
             <form
               onSubmit={handleSendBroadcast}
               className="lg:col-span-6 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5 space-y-4"
             >
               <h2 className="text-base font-bold text-slate-900 dark:text-white">
-                Compose Push & In-App Broadcast
+                Compose Push &amp; In-App Broadcast
               </h2>
               <input
                 type="text"
@@ -1461,11 +1990,11 @@ export const AdminPage: React.FC = () => {
                   }
                   className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs"
                 >
-                  <option value="all">All Subscribed Devices (Visitors & Registered Users)</option>
-                  <option value="registered">All Registered Accounts</option>
-                  <option value="verified">Email-Verified Traders Only</option>
-                  <option value="admins_mods">Administrators & Moderators</option>
-                  <option value="selected">Specific Selected Users</option>
+                  <option value="all">All Subscribed Devices (Public Visitors &amp; Members)</option>
+                  <option value="registered">All Premium Member Accounts</option>
+                  <option value="verified">Verified Member Accounts Only</option>
+                  <option value="admins_mods">Administrators</option>
+                  <option value="selected">Specific Selected Members</option>
                 </select>
               </div>
 
@@ -1501,7 +2030,7 @@ export const AdminPage: React.FC = () => {
                     }
                     className="w-4 h-4 accent-[#881337]"
                   />
-                  <span>Respect user category subscriptions</span>
+                  <span>Respect category subscriptions</span>
                 </label>
                 <label className="inline-flex items-center gap-2 cursor-pointer">
                   <input
@@ -1510,7 +2039,7 @@ export const AdminPage: React.FC = () => {
                     onChange={(e) => setNotifForm({ ...notifForm, sound: e.target.checked })}
                     className="w-4 h-4 accent-[#881337]"
                   />
-                  <span>Play sound & vibration</span>
+                  <span>Play sound &amp; vibration</span>
                 </label>
               </div>
 
@@ -1535,7 +2064,7 @@ export const AdminPage: React.FC = () => {
             </form>
 
             <div className="lg:col-span-6 space-y-5">
-              {/* Infrastructure Readiness Card */}
+              {/* Infrastructure Readiness */}
               <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5 space-y-3">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div>
@@ -1563,7 +2092,7 @@ export const AdminPage: React.FC = () => {
                   <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-3 flex items-start justify-between gap-3">
                     <div>
                       <p className="font-semibold text-slate-900 dark:text-white">
-                        Web Push (VAPID · Desktop, Android & iOS 16.4+ PWA)
+                        Web Push (VAPID · Desktop, Android &amp; iOS 16.4+ PWA)
                       </p>
                       <p className="text-[11px] text-slate-500 mt-0.5">
                         Key source: {pushDiagnostics?.infrastructure.web_push.source || 'database'} ·{' '}
@@ -1627,11 +2156,11 @@ export const AdminPage: React.FC = () => {
                 </div>
               </div>
 
-              {/* Device Endpoints & Delivery Counters */}
+              {/* Subscribed Devices & Stats */}
               <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5 space-y-3">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <h2 className="text-base font-bold text-slate-900 dark:text-white">
-                    Subscribed Devices & Delivery Stats
+                    Subscribed Devices &amp; Delivery Stats
                   </h2>
                   <div className="flex flex-wrap items-center gap-2">
                     <button
@@ -1679,45 +2208,14 @@ export const AdminPage: React.FC = () => {
                   </div>
                 </div>
 
-                <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 text-xs">
-                  <div className="rounded-lg bg-slate-50 dark:bg-slate-900/70 p-2.5">
-                    <p className="text-[10px] text-slate-500 uppercase">Queued</p>
-                    <p className="font-mono font-bold text-amber-600 dark:text-amber-400">
-                      {pushDiagnostics?.summary.totals.queued ?? 0}
-                    </p>
-                  </div>
-                  <div className="rounded-lg bg-slate-50 dark:bg-slate-900/70 p-2.5">
-                    <p className="text-[10px] text-slate-500 uppercase">Sent</p>
-                    <p className="font-mono font-bold text-emerald-600 dark:text-emerald-400">
-                      {pushDiagnostics?.summary.totals.delivered ?? 0}
-                    </p>
-                  </div>
-                  <div className="rounded-lg bg-slate-50 dark:bg-slate-900/70 p-2.5">
-                    <p className="text-[10px] text-slate-500 uppercase">Confirmed</p>
-                    <p className="font-mono font-bold text-[#15803D] dark:text-emerald-300">
-                      {pushDiagnostics?.summary.totals.confirmed ?? 0}
-                    </p>
-                  </div>
-                  <div className="rounded-lg bg-slate-50 dark:bg-slate-900/70 p-2.5">
-                    <p className="text-[10px] text-slate-500 uppercase">Failed</p>
-                    <p className="font-mono font-bold text-red-600 dark:text-red-400">
-                      {pushDiagnostics?.summary.totals.failed ?? 0}
-                    </p>
-                  </div>
-                  <div className="rounded-lg bg-slate-50 dark:bg-slate-900/70 p-2.5">
-                    <p className="text-[10px] text-slate-500 uppercase">Invalid</p>
-                    <p className="font-mono font-bold text-slate-600 dark:text-slate-300">
-                      {pushDiagnostics?.summary.total_inactive ?? 0}
-                    </p>
-                  </div>
-                </div>
-
                 <div className="divide-y divide-slate-100 dark:divide-slate-800 max-h-48 overflow-y-auto text-xs">
                   {(pushDiagnostics?.subscriptions || []).slice(0, 25).map((sub) => (
                     <div key={sub.id} className="py-2 flex items-center justify-between gap-2">
                       <div className="min-w-0">
                         <p className="font-medium text-slate-900 dark:text-white truncate">
-                          {sub.user_name ? `${sub.user_name} (${sub.user_email})` : sub.device_label || 'Anonymous Device'}{' '}
+                          {sub.user_name
+                            ? `${sub.user_name} (${sub.user_email})`
+                            : sub.device_label || 'Public Device'}{' '}
                           <span className="uppercase text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300">
                             {sub.platform} · {sub.transport}
                           </span>
@@ -1747,10 +2245,10 @@ export const AdminPage: React.FC = () => {
                 </div>
               </div>
 
-              {/* Push Jobs & Per-Device Delivery Receipts */}
+              {/* Recent Push Jobs */}
               <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5 space-y-3">
                 <h2 className="text-base font-bold text-slate-900 dark:text-white">
-                  Notification History & Delivery Logs
+                  Notification History &amp; Delivery Logs
                 </h2>
                 <div className="divide-y divide-slate-100 dark:divide-slate-800 max-h-64 overflow-y-auto text-xs">
                   {((pushDiagnostics?.jobs && pushDiagnostics.jobs.length > 0
@@ -1774,11 +2272,6 @@ export const AdminPage: React.FC = () => {
                         <span className="ml-2 text-[#15803D] dark:text-emerald-300">
                           {job.confirmed_count ?? 0} ack
                         </span>
-                        {job.queued_count > 0 && (
-                          <span className="ml-2 text-amber-600 dark:text-amber-400">
-                            {job.queued_count} queued
-                          </span>
-                        )}
                         {job.failed_count > 0 && (
                           <span className="ml-2 text-red-600 dark:text-red-400">
                             {job.failed_count} fail
@@ -1787,321 +2280,221 @@ export const AdminPage: React.FC = () => {
                       </div>
                     </div>
                   ))}
-                  {(!pushDiagnostics?.jobs || pushDiagnostics.jobs.length === 0) &&
-                    (!overview?.push_jobs || overview.push_jobs.length === 0) && (
-                      <p className="py-3 text-xs text-slate-500">No push notifications dispatched yet.</p>
-                    )}
                 </div>
-
-                {pushDiagnostics?.deliveries && pushDiagnostics.deliveries.length > 0 && (
-                  <div className="pt-3 border-t border-slate-100 dark:border-slate-800 space-y-2">
-                    <p className="text-[11px] font-bold uppercase tracking-wide text-slate-500">
-                      Recent Device Delivery Receipts
-                    </p>
-                    <div className="divide-y divide-slate-100 dark:divide-slate-800 max-h-44 overflow-y-auto text-[11px]">
-                      {pushDiagnostics.deliveries.slice(0, 20).map((d) => (
-                        <div key={d.id} className="py-1.5 flex items-center justify-between gap-2">
-                          <span className="text-slate-700 dark:text-slate-300 truncate">
-                            {d.device_label || d.platform} ({d.transport}) · {d.status}
-                            {d.device_received_at ? ' · Received' : ''}
-                            {d.opened_at ? ' · Opened' : ''}
-                            {d.last_error ? ` · ${d.last_error}` : ''}
-                          </span>
-                          <span className="font-mono text-slate-400 shrink-0">
-                            {d.status_code ?? '—'}
-                          </span>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
               </div>
             </div>
           </div>
-        </div>
-      )}
+        )}
 
-      {/* E. ACADEMY MANAGEMENT */}
-      {tab === 'academy' && (
-        <AdminAcademyManager
-          studentProgress={overview?.student_progress || []}
-          onNotify={notifyOk}
-          onError={setErrorMsg}
-          onGlobalRefresh={async () => {
-            await Promise.all([refreshAll(), loadAdminData()]);
-          }}
-        />
-      )}
+        {/* 10. PLATFORM SETTINGS & ADMIN SECURITY */}
+        {tab === 'settings' && (
+          <div className="space-y-6 max-w-3xl">
+            <form
+              onSubmit={handleSaveSettings}
+              className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-6 space-y-4"
+            >
+              <h2 className="text-base font-bold text-slate-900 dark:text-white">
+                Platform Branding, Official Contact Details &amp; SEO
+              </h2>
 
-      {/* A2. REGISTRATION ANALYTICS */}
-      {tab === 'registrations' && (
-        <AdminRegistrationsPanel
-          analytics={registrations}
-          onRefresh={loadAdminData}
-          onError={setErrorMsg}
-        />
-      )}
-
-      {/* F. PREMIUM MEMBERS MANAGEMENT, REPORTS & CONTACT INQUIRIES */}
-      {tab === 'users' && (
-        <div className="space-y-6">
-          <AdminMembersPanel
-            onNotify={notifyOk}
-            onError={setErrorMsg}
-            onGlobalRefresh={loadAdminData}
-          />
-
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5 space-y-3">
-              <h3 className="text-sm font-bold text-slate-900 dark:text-white">
-                Community Moderation Queue ({reports.length})
-              </h3>
-              {reports.map((r) => (
-                <div key={r.id} className="rounded-xl border border-slate-200 dark:border-slate-800 p-3 text-xs space-y-2">
-                  <p className="font-semibold">
-                    {r.post_title || 'Reported Item'} · Status: {r.status}
-                  </p>
-                  <p className="text-slate-500">
-                    Reported by {r.reporter_name}: {r.reason}
-                  </p>
-                  {r.status === 'pending' && (
-                    <div className="flex gap-2">
-                      <button
-                        type="button"
-                        onClick={() => handleReportAction(r.id, 'hide_post')}
-                        className="rounded bg-red-600 px-2.5 py-1 text-white font-semibold"
-                      >
-                        Hide Post
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => handleReportAction(r.id, 'dismiss')}
-                        className="rounded border border-slate-300 dark:border-slate-700 px-2.5 py-1"
-                      >
-                        Dismiss
-                      </button>
-                    </div>
-                  )}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs font-medium mb-1">Brand Name</label>
+                  <input
+                    type="text"
+                    value={settingsForm.brand_name}
+                    onChange={(e) => setSettingsForm({ ...settingsForm, brand_name: e.target.value })}
+                    className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
+                  />
                 </div>
-              ))}
-              {reports.length === 0 && <p className="text-xs text-slate-500">No community reports.</p>}
-            </div>
-
-            <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5 space-y-3">
-              <h3 className="text-sm font-bold text-slate-900 dark:text-white">
-                Contact &amp; Membership Inquiries ({contacts.length})
-              </h3>
-              {contacts.map((c) => (
-                <div key={c.id} className="rounded-xl border border-slate-200 dark:border-slate-800 p-3 text-xs space-y-1">
-                  <p className="font-semibold">
-                    {c.subject} — {c.name} ({c.email})
-                  </p>
-                  <p className="text-slate-500">{c.message}</p>
+                <div>
+                  <label className="block text-xs font-medium mb-1">Official Business Email</label>
+                  <input
+                    type="email"
+                    value={settingsForm.contact_email}
+                    onChange={(e) =>
+                      setSettingsForm({ ...settingsForm, contact_email: e.target.value })
+                    }
+                    className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
+                  />
                 </div>
-              ))}
-              {contacts.length === 0 && <p className="text-xs text-slate-500">No inquiries yet.</p>}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* G. PLATFORM SETTINGS & ADMIN SECURITY */}
-      {tab === 'settings' && (
-        <div className="space-y-6 max-w-3xl">
-          <form
-            onSubmit={handleSaveSettings}
-            className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-6 space-y-4"
-          >
-            <h2 className="text-base font-bold text-slate-900 dark:text-white">
-              Platform Branding, Official Contact Details &amp; SEO
-            </h2>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              <div>
-                <label className="block text-xs font-medium mb-1">Brand Name</label>
-                <input
-                  type="text"
-                  value={settingsForm.brand_name}
-                  onChange={(e) => setSettingsForm({ ...settingsForm, brand_name: e.target.value })}
-                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
-                />
               </div>
-              <div>
-                <label className="block text-xs font-medium mb-1">Official Business Email</label>
-                <input
-                  type="email"
-                  value={settingsForm.contact_email}
-                  onChange={(e) => setSettingsForm({ ...settingsForm, contact_email: e.target.value })}
-                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
-                />
-              </div>
-            </div>
 
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-              <div>
-                <label className="block text-xs font-medium mb-1">
-                  Official WhatsApp Number (optional)
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                <div>
+                  <label className="block text-xs font-medium mb-1">
+                    Official WhatsApp Number (optional)
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="+447911123456 (blank hides WhatsApp button)"
+                    value={settingsForm.contact_whatsapp || ''}
+                    onChange={(e) =>
+                      setSettingsForm({ ...settingsForm, contact_whatsapp: e.target.value })
+                    }
+                    className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium mb-1">Official Phone Number</label>
+                  <input
+                    type="text"
+                    placeholder="Optional support phone"
+                    value={settingsForm.contact_phone || ''}
+                    onChange={(e) =>
+                      setSettingsForm({ ...settingsForm, contact_phone: e.target.value })
+                    }
+                    className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium mb-1">Official Location / Desk</label>
+                  <input
+                    type="text"
+                    placeholder="City / Desk hours"
+                    value={settingsForm.contact_address || ''}
+                    onChange={(e) =>
+                      setSettingsForm({ ...settingsForm, contact_address: e.target.value })
+                    }
+                    className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
+                  />
+                </div>
+              </div>
+
+              <div className="flex items-center gap-3 text-xs">
+                <label className="inline-flex items-center gap-2 cursor-pointer rounded-lg border border-slate-300 dark:border-slate-700 px-3 py-2">
+                  <Upload className="w-3.5 h-3.5" />
+                  <span>Upload Custom Brand Logo</span>
+                  <input
+                    type="file"
+                    accept="image/*"
+                    className="hidden"
+                    onChange={(e) =>
+                      handleUploadField(e.target.files?.[0], (url) =>
+                        setSettingsForm((f) => ({ ...f, logo_url: url }))
+                      )
+                    }
+                  />
                 </label>
-                <input
-                  type="text"
-                  placeholder="+447911123456 (blank hides WhatsApp button)"
-                  value={settingsForm.contact_whatsapp || ''}
-                  onChange={(e) =>
-                    setSettingsForm({ ...settingsForm, contact_whatsapp: e.target.value })
-                  }
-                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
-                />
+                <span className="font-mono text-slate-500">{settingsForm.logo_url}</span>
               </div>
-              <div>
-                <label className="block text-xs font-medium mb-1">Official Phone Number</label>
-                <input
-                  type="text"
-                  placeholder="Optional support phone"
-                  value={settingsForm.contact_phone || ''}
-                  onChange={(e) =>
-                    setSettingsForm({ ...settingsForm, contact_phone: e.target.value })
-                  }
-                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-medium mb-1">Official Location / Desk</label>
-                <input
-                  type="text"
-                  placeholder="City / Desk hours"
-                  value={settingsForm.contact_address || ''}
-                  onChange={(e) =>
-                    setSettingsForm({ ...settingsForm, contact_address: e.target.value })
-                  }
-                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
-                />
-              </div>
-            </div>
 
-            <div className="flex items-center gap-3 text-xs">
-              <label className="inline-flex items-center gap-2 cursor-pointer rounded-lg border border-slate-300 dark:border-slate-700 px-3 py-2">
-                <Upload className="w-3.5 h-3.5" />
-                <span>Upload Custom Brand Logo</span>
+              <div>
+                <label className="block text-xs font-medium mb-1">Homepage Hero Headline</label>
                 <input
-                  type="file"
-                  accept="image/*"
-                  className="hidden"
-                  onChange={(e) =>
-                    handleUploadField(e.target.files?.[0], (url) =>
-                      setSettingsForm((f) => ({ ...f, logo_url: url }))
-                    )
-                  }
+                  type="text"
+                  value={settingsForm.hero_title}
+                  onChange={(e) => setSettingsForm({ ...settingsForm, hero_title: e.target.value })}
+                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
                 />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium mb-1">Homepage Hero Subtitle</label>
+                <textarea
+                  rows={2}
+                  value={settingsForm.hero_subtitle}
+                  onChange={(e) =>
+                    setSettingsForm({ ...settingsForm, hero_subtitle: e.target.value })
+                  }
+                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium mb-1">About Section Text</label>
+                <textarea
+                  rows={3}
+                  value={settingsForm.about_text}
+                  onChange={(e) => setSettingsForm({ ...settingsForm, about_text: e.target.value })}
+                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
+                />
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs font-medium mb-1">SEO Title</label>
+                  <input
+                    type="text"
+                    value={settingsForm.seo_title}
+                    onChange={(e) => setSettingsForm({ ...settingsForm, seo_title: e.target.value })}
+                    className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium mb-1">SEO Meta Description</label>
+                  <input
+                    type="text"
+                    value={settingsForm.seo_description}
+                    onChange={(e) =>
+                      setSettingsForm({ ...settingsForm, seo_description: e.target.value })
+                    }
+                    className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
+                  />
+                </div>
+              </div>
+
+              <label className="inline-flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={settingsForm.push_enabled}
+                  onChange={(e) =>
+                    setSettingsForm({ ...settingsForm, push_enabled: e.target.checked })
+                  }
+                  className="accent-[#881337]"
+                />
+                <span>Enable Global Push Notification Delivery</span>
               </label>
-              <span className="font-mono text-slate-500">{settingsForm.logo_url}</span>
-            </div>
 
-            <div>
-              <label className="block text-xs font-medium mb-1">Homepage Hero Headline</label>
-              <input
-                type="text"
-                value={settingsForm.hero_title}
-                onChange={(e) => setSettingsForm({ ...settingsForm, hero_title: e.target.value })}
-                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs font-medium mb-1">Homepage Hero Subtitle</label>
-              <textarea
-                rows={2}
-                value={settingsForm.hero_subtitle}
-                onChange={(e) => setSettingsForm({ ...settingsForm, hero_subtitle: e.target.value })}
-                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs font-medium mb-1">About Section Text</label>
-              <textarea
-                rows={3}
-                value={settingsForm.about_text}
-                onChange={(e) => setSettingsForm({ ...settingsForm, about_text: e.target.value })}
-                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
-              />
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div>
-                <label className="block text-xs font-medium mb-1">SEO Title</label>
-                <input
-                  type="text"
-                  value={settingsForm.seo_title}
-                  onChange={(e) => setSettingsForm({ ...settingsForm, seo_title: e.target.value })}
-                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
-                />
+                <button
+                  type="submit"
+                  className="rounded-lg bg-[#881337] px-5 py-2.5 text-sm font-semibold text-white hover:bg-[#6B0F2B] min-h-[44px]"
+                >
+                  Save Platform Configuration
+                </button>
               </div>
-              <div>
-                <label className="block text-xs font-medium mb-1">SEO Meta Description</label>
-                <input
-                  type="text"
-                  value={settingsForm.seo_description}
-                  onChange={(e) =>
-                    setSettingsForm({ ...settingsForm, seo_description: e.target.value })
-                  }
-                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
-                />
-              </div>
-            </div>
+            </form>
 
-            <label className="inline-flex items-center gap-2 text-sm">
-              <input
-                type="checkbox"
-                checked={settingsForm.push_enabled}
-                onChange={(e) =>
-                  setSettingsForm({ ...settingsForm, push_enabled: e.target.checked })
-                }
-                className="accent-[#881337]"
-              />
-              <span>Enable Global Push Notification Delivery</span>
-            </label>
-
-            <div>
-              <button
-                type="submit"
-                className="rounded-lg bg-[#881337] px-5 py-2.5 text-sm font-semibold text-white hover:bg-[#6B0F2B] min-h-[44px]"
-              >
-                Save Platform Configuration
-              </button>
-            </div>
-          </form>
-
-          {/* Administrator Security Policy */}
-          <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-6 space-y-2">
-            <div className="flex items-start gap-3">
-              <KeyRound className="w-5 h-5 text-[#881337] dark:text-rose-400 shrink-0 mt-0.5" />
-              <div className="space-y-1">
-                <h2 className="text-base font-bold text-slate-900 dark:text-white">
-                  Administrator Account &amp; Access Policy
-                </h2>
-                <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
-                  Signed in as{' '}
-                  <span className="font-mono font-semibold text-slate-900 dark:text-white">
-                    {user.email}
-                  </span>
-                  . Designated administrator credentials remain fixed and protected via server
-                  environment configuration (<span className="font-mono">ADMIN_PASSWORD</span> /{' '}
-                  <span className="font-mono">ADMIN_RESET_KEY</span>). Premium member accounts,
-                  usernames, expiry dates, and temporary password resets are managed from the{' '}
-                  <button
-                    type="button"
-                    onClick={() => setTab('users')}
-                    className="font-semibold text-[#881337] dark:text-rose-400 hover:underline"
-                  >
-                    Members
-                  </button>{' '}
-                  tab.
-                </p>
+            {/* Administrator Security Policy */}
+            <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-6 space-y-2">
+              <div className="flex items-start gap-3">
+                <KeyRound className="w-5 h-5 text-[#881337] dark:text-rose-400 shrink-0 mt-0.5" />
+                <div className="space-y-1">
+                  <h2 className="text-base font-bold text-slate-900 dark:text-white">
+                    Administrator Account &amp; Access Policy
+                  </h2>
+                  <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
+                    Signed in as{' '}
+                    <span className="font-mono font-semibold text-slate-900 dark:text-white">
+                      {adminUser.email}
+                    </span>
+                    . Administrator authentication is isolated exclusively on{' '}
+                    <span className="font-mono">/admin</span> and cannot be accessed through public
+                    member sign-in. Premium member accounts are managed from the{' '}
+                    <button
+                      type="button"
+                      onClick={() => setTab('members')}
+                      className="font-semibold text-[#881337] dark:text-rose-400 hover:underline"
+                    >
+                      Members
+                    </button>{' '}
+                    and{' '}
+                    <button
+                      type="button"
+                      onClick={() => setTab('applications')}
+                      className="font-semibold text-[#881337] dark:text-rose-400 hover:underline"
+                    >
+                      Applications
+                    </button>{' '}
+                    tabs.
+                  </p>
+                </div>
               </div>
             </div>
           </div>
-        </div>
-      )}
+        )}
+      </main>
     </div>
   );
 };

@@ -43,7 +43,7 @@ export const CourseAssessmentPanel: React.FC<CourseAssessmentPanelProps> = ({
   const handleSubmit = async () => {
     setErrorMsg(null);
     if (!user) {
-      navigate('/login');
+      navigate('/profile');
       return;
     }
     const payload = questions.map((_, idx) => answers[idx] ?? -1);
@@ -194,7 +194,7 @@ export const CourseAssessmentPanel: React.FC<CourseAssessmentPanelProps> = ({
           className="inline-flex items-center gap-2 rounded-lg bg-[#881337] px-5 py-2.5 text-sm font-semibold text-white hover:bg-[#6B0F2B] min-h-[44px]"
         >
           <CheckCircle2 className="w-4 h-4" />
-          <span>{submitting ? 'Grading...' : user ? 'Submit Course Assessment' : 'Sign In & Submit Assessment'}</span>
+          <span>{submitting ? 'Grading...' : user ? 'Submit Course Assessment' : 'Premium Member Sign In to Submit'}</span>
         </button>
 
         {result && (

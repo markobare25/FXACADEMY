@@ -6,28 +6,19 @@ import {
   BadgeCheck,
   Bell,
   BellRing,
-  Check,
   CheckCircle2,
-  Edit3,
-  Film,
-  ImagePlus,
   Info,
   Loader2,
   MessageSquareText,
   Moon,
   Pin,
-  PinOff,
-  RotateCcw,
   Search,
-  Send,
-  Shield,
   Sun,
-  Trash2,
   X,
   Zap,
 } from 'lucide-react';
 import { usePlatform, type SignalChatWsEvent } from '../context/PlatformContext';
-import { apiFetch, formatLocalDateTime, getOrCreateVisitorId, uploadMediaFile } from '../lib/api';
+import { apiFetch, formatLocalDateTime, getOrCreateVisitorId } from '../lib/api';
 import {
   detectPushPlatform,
   dismissNotificationPrompt,
@@ -38,10 +29,8 @@ import {
   subscribeToPushNotifications,
 } from '../lib/pushClient';
 import type {
-  PushJobSummary,
   SignalChatMessage,
   SignalChatMessageType,
-  SignalChatPriority,
   SignalReactionType,
   SignalReactionsMap,
 } from '../types';
@@ -181,9 +170,7 @@ export const SignalsPage: React.FC = () => {
     showNotifModal,
     setShowNotifModal,
     subscribeSignalChatEvents,
-    subscribePushJobEvents,
   } = usePlatform();
-  const isAdmin = user?.role === 'admin';
 
   // Always default to live chat view when opening Signals
   const [view, setView] = useState<ChannelView>('chat');
@@ -214,56 +201,18 @@ export const SignalsPage: React.FC = () => {
   // Real channel subscriber counter
   const [subscriberCount, setSubscriberCount] = useState<number>(0);
 
-  // Admin Composer state
-  const [composerText, setComposerText] = useState('');
-  const [composerType, setComposerType] = useState<SignalChatMessageType>('signal');
-  const [composerPriority, setComposerPriority] = useState<SignalChatPriority>('normal');
-  const [composerPinned, setComposerPinned] = useState(false);
-  const [composerPush, setComposerPush] = useState(true);
-  const [attachmentUrl, setAttachmentUrl] = useState<string | null>(null);
-  const [attachmentMediaType, setAttachmentMediaType] = useState<'image' | 'video' | null>(null);
-  const [attachmentName, setAttachmentName] = useState<string | null>(null);
-  const [attachmentPreview, setAttachmentPreview] = useState<string | null>(null);
-  const [uploadingImage, setUploadingImage] = useState(false);
-  const [sendingMessage, setSendingMessage] = useState(false);
-  const [savingDraft, setSavingDraft] = useState(false);
-  const [composerError, setComposerError] = useState<string | null>(null);
-
-  // Admin Drafts & Publish Confirmation state
-  const [draftMessages, setDraftMessages] = useState<SignalChatMessage[]>([]);
-  const [showDrafts, setShowDrafts] = useState(false);
-  const [publishingDraftId, setPublishingDraftId] = useState<string | null>(null);
-  const [publishConfirmation, setPublishConfirmation] = useState<{
-    messageId: string;
-    label: string;
-    pushJob: PushJobSummary | null;
-  } | null>(null);
+  // Inline notification prompt state
   const [pushSubscribed, setPushSubscribed] = useState(false);
   const [promptDismissed, setPromptDismissed] = useState<boolean>(() => isNotificationPromptDismissed());
   const [enablingInlinePush, setEnablingInlinePush] = useState(false);
   const [inlinePushStatus, setInlinePushStatus] = useState<string | null>(null);
   const [inlinePushError, setInlinePushError] = useState<string | null>(null);
 
-  // Message editing / archiving / deleting / lightbox state
-  const [editingMsgId, setEditingMsgId] = useState<string | null>(null);
-  const [editDraftText, setEditDraftText] = useState('');
-  const [editDraftType, setEditDraftType] = useState<SignalChatMessageType>('update');
-  const [editDraftPriority, setEditDraftPriority] = useState<SignalChatPriority>('normal');
-  const [editDraftImageUrl, setEditDraftImageUrl] = useState<string | null>(null);
-  const [savingEdit, setSavingEdit] = useState(false);
-
-  const [completingMsg, setCompletingMsg] = useState<SignalChatMessage | null>(null);
-  const [completeSummary, setCompleteSummary] = useState('');
-  const [submittingComplete, setSubmittingComplete] = useState(false);
-
-  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
   const [reactionNotice, setReactionNotice] = useState<string | null>(null);
   const [avatarFailed, setAvatarFailed] = useState(false);
 
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
   const isNearBottomRef = useRef<boolean>(true);
   const latestCreatedAtRef = useRef<string | null>(null);
   const viewerKeyRef = useRef<string | null>(null);
@@ -400,29 +349,9 @@ export const SignalsPage: React.FC = () => {
     }
   }, []);
 
-  const fetchDraftMessages = useCallback(async () => {
-    if (!isAdmin) return;
-    try {
-      const res = await apiFetch<{ messages: SignalChatMessage[] }>(
-        '/api/signals/messages?status=draft&limit=50'
-      );
-      setDraftMessages(res.messages);
-    } catch {
-      // ignore
-    }
-  }, [isAdmin]);
-
   useEffect(() => {
     fetchActiveMessages(false);
   }, [fetchActiveMessages]);
-
-  useEffect(() => {
-    if (isAdmin) {
-      fetchDraftMessages();
-    } else {
-      setDraftMessages([]);
-    }
-  }, [isAdmin, fetchDraftMessages]);
 
   // Refresh push subscription indicator when page loads or modal closes
   useEffect(() => {
@@ -430,34 +359,6 @@ export const SignalsPage: React.FC = () => {
       .then((sub) => setPushSubscribed(Boolean(sub)))
       .catch(() => setPushSubscribed(false));
   }, [showNotifModal]);
-
-  // Keep push confirmation counts updated live via WebSocket
-  useEffect(() => {
-    return subscribePushJobEvents((job) => {
-      setPublishConfirmation((cur) => {
-        if (!cur || !cur.pushJob || cur.pushJob.id !== job.id) return cur;
-        return { ...cur, pushJob: job };
-      });
-    });
-  }, [subscribePushJobEvents]);
-
-  // Poll briefly while any push deliveries are still queued/retrying
-  useEffect(() => {
-    const jobId = publishConfirmation?.pushJob?.id;
-    const queued = publishConfirmation?.pushJob?.queued_count ?? 0;
-    if (!isAdmin || !jobId || queued <= 0) return;
-
-    const timer = window.setInterval(() => {
-      apiFetch<{ job: PushJobSummary }>(`/api/admin/push-jobs/${jobId}`)
-        .then((res) => {
-          setPublishConfirmation((cur) =>
-            cur?.pushJob?.id === jobId ? { ...cur, pushJob: res.job } : cur
-          );
-        })
-        .catch(() => undefined);
-    }, 3000);
-    return () => clearInterval(timer);
-  }, [isAdmin, publishConfirmation?.pushJob?.id, publishConfirmation?.pushJob?.queued_count]);
 
   useEffect(() => {
     const curId = user?.id ?? null;
@@ -650,42 +551,6 @@ export const SignalsPage: React.FC = () => {
     }
   };
 
-  // Handle Media (Image or Video) Selection & Upload in Composer
-  const handleSelectImage = async (file: File | undefined) => {
-    if (!file) return;
-    setComposerError(null);
-    const mediaType: 'image' | 'video' = file.type.startsWith('video/') ? 'video' : 'image';
-    const localPreview = URL.createObjectURL(file);
-    setAttachmentPreview(localPreview);
-    setAttachmentMediaType(mediaType);
-    setAttachmentName(file.name);
-    setUploadingImage(true);
-    try {
-      const uploaded = await uploadMediaFile(file);
-      setAttachmentUrl(uploaded.url);
-      setAttachmentMediaType(uploaded.mimetype?.startsWith('video/') ? 'video' : mediaType);
-      setAttachmentName(uploaded.original_name);
-    } catch (err) {
-      setComposerError(err instanceof Error ? err.message : 'Media upload failed.');
-      setAttachmentPreview(null);
-      setAttachmentUrl(null);
-      setAttachmentMediaType(null);
-      setAttachmentName(null);
-    } finally {
-      setUploadingImage(false);
-      if (fileInputRef.current) fileInputRef.current.value = '';
-    }
-  };
-
-  const handleCancelAttachment = () => {
-    if (attachmentPreview) URL.revokeObjectURL(attachmentPreview);
-    setAttachmentPreview(null);
-    setAttachmentUrl(null);
-    setAttachmentMediaType(null);
-    setAttachmentName(null);
-    if (fileInputRef.current) fileInputRef.current.value = '';
-  };
-
   const handleInlineEnablePush = async () => {
     setEnablingInlinePush(true);
     setInlinePushError(null);
@@ -704,110 +569,6 @@ export const SignalsPage: React.FC = () => {
   const handleInlineMaybeLater = () => {
     dismissNotificationPrompt();
     setPromptDismissed(true);
-  };
-
-  const handleSendMessage = async (e?: React.FormEvent, asDraft = false) => {
-    if (e) e.preventDefault();
-    if (!isAdmin || sendingMessage || savingDraft || uploadingImage) return;
-    if (!composerText.trim() && !attachmentUrl) {
-      setComposerError('Type a message or attach an image/video.');
-      return;
-    }
-
-    if (asDraft) setSavingDraft(true);
-    else setSendingMessage(true);
-    setComposerError(null);
-    const requestId =
-      typeof crypto !== 'undefined' && crypto.randomUUID
-        ? crypto.randomUUID()
-        : `${Date.now()}-${Math.random()}`;
-
-    try {
-      const res = await apiFetch<{ message: SignalChatMessage; push_job?: PushJobSummary | null }>(
-        '/api/signals/messages',
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            content: composerText.trim(),
-            image_url: attachmentMediaType === 'image' ? attachmentUrl : null,
-            image_name: attachmentMediaType === 'image' ? attachmentName : null,
-            media_url: attachmentUrl,
-            media_type: attachmentUrl ? attachmentMediaType : null,
-            media_name: attachmentName,
-            message_type: composerType,
-            priority: composerPriority,
-            status: asDraft ? 'draft' : 'active',
-            pinned: !asDraft && composerPinned,
-            send_push: asDraft ? false : composerPush,
-            client_request_id: requestId,
-          }),
-        }
-      );
-
-      if (res.message.status === 'draft') {
-        setDraftMessages((prev) => [res.message, ...prev]);
-        setShowDrafts(true);
-      } else {
-        setActiveMessages((prev) =>
-          prev.some((m) => m.id === res.message.id) ? prev : [...prev, res.message]
-        );
-        if (res.message.pinned) {
-          setPinnedMessages((prev) =>
-            prev.some((m) => m.id === res.message.id) ? prev : [res.message, ...prev]
-          );
-        }
-        setPublishConfirmation({
-          messageId: res.message.id,
-          label: 'Published publicly to MeridianFX Signals Channel',
-          pushJob: res.push_job || null,
-        });
-      }
-
-      setComposerText('');
-      setComposerPinned(false);
-      setComposerPriority('normal');
-      handleCancelAttachment();
-      if (!asDraft) {
-        requestAnimationFrame(() => {
-          scrollToBottom(true);
-          composerInputRef.current?.focus();
-        });
-      }
-    } catch (err) {
-      setComposerError(err instanceof Error ? err.message : 'Unable to publish message.');
-    } finally {
-      setSendingMessage(false);
-      setSavingDraft(false);
-    }
-  };
-
-  const handlePublishDraft = async (draft: SignalChatMessage) => {
-    if (!isAdmin || publishingDraftId) return;
-    setPublishingDraftId(draft.id);
-    setComposerError(null);
-    try {
-      const res = await apiFetch<{ message: SignalChatMessage; push_job?: PushJobSummary | null }>(
-        `/api/signals/messages/${draft.id}`,
-        {
-          method: 'PATCH',
-          body: JSON.stringify({ status: 'active', send_push: true }),
-        }
-      );
-      setDraftMessages((prev) => prev.filter((d) => d.id !== draft.id));
-      setActiveMessages((prev) =>
-        prev.some((m) => m.id === res.message.id) ? prev : [...prev, res.message]
-      );
-      setPublishConfirmation({
-        messageId: res.message.id,
-        label: 'Draft published publicly to Signals Channel',
-        pushJob: res.push_job || null,
-      });
-      requestAnimationFrame(() => scrollToBottom(true));
-    } catch (err) {
-      setComposerError(err instanceof Error ? err.message : 'Unable to publish draft.');
-    } finally {
-      setPublishingDraftId(null);
-    }
   };
 
   const handleReact = async (msg: SignalChatMessage, reaction: SignalReactionType) => {
@@ -861,101 +622,7 @@ export const SignalsPage: React.FC = () => {
     }
   };
 
-  // Admin Edit / Pin / Complete / Delete handlers
-  const handleStartEdit = (msg: SignalChatMessage) => {
-    setEditingMsgId(msg.id);
-    setEditDraftText(msg.content);
-    setEditDraftType(msg.message_type);
-    setEditDraftPriority(msg.priority || 'normal');
-    setEditDraftImageUrl(msg.image_url || null);
-    setConfirmDeleteId(null);
-  };
 
-  const handleSaveEdit = async (msgId: string) => {
-    if (!editDraftText.trim() && !editDraftImageUrl) return;
-    setSavingEdit(true);
-    try {
-      const res = await apiFetch<{ message: SignalChatMessage }>(`/api/signals/messages/${msgId}`, {
-        method: 'PATCH',
-        body: JSON.stringify({
-          content: editDraftText.trim(),
-          message_type: editDraftType,
-          priority: editDraftPriority,
-          image_url: editDraftImageUrl,
-        }),
-      });
-      setActiveMessages((prev) => prev.map((m) => (m.id === msgId ? res.message : m)));
-      setPinnedMessages((prev) => prev.map((m) => (m.id === msgId ? res.message : m)));
-      setCompletedMessages((prev) => prev.map((m) => (m.id === msgId ? res.message : m)));
-      setSelectedCompleted((cur) => (cur?.id === msgId ? res.message : cur));
-      setEditingMsgId(null);
-    } finally {
-      setSavingEdit(false);
-    }
-  };
-
-  const handleTogglePin = async (msg: SignalChatMessage) => {
-    const res = await apiFetch<{ message: SignalChatMessage }>(`/api/signals/messages/${msg.id}`, {
-      method: 'PATCH',
-      body: JSON.stringify({ pinned: !msg.pinned }),
-    });
-    setActiveMessages((prev) => prev.map((m) => (m.id === msg.id ? res.message : m)));
-    setPinnedMessages((prev) => {
-      const filtered = prev.filter((m) => m.id !== msg.id);
-      return res.message.pinned ? [res.message, ...filtered] : filtered;
-    });
-  };
-
-  const handleMarkCompleted = async () => {
-    if (!completingMsg) return;
-    setSubmittingComplete(true);
-    try {
-      const res = await apiFetch<{ message: SignalChatMessage }>(
-        `/api/signals/messages/${completingMsg.id}`,
-        {
-          method: 'PATCH',
-          body: JSON.stringify({
-            status: 'completed',
-            completed_summary: completeSummary.trim() || null,
-          }),
-        }
-      );
-      setActiveMessages((prev) => prev.filter((m) => m.id !== completingMsg.id));
-      setPinnedMessages((prev) => prev.filter((m) => m.id !== completingMsg.id));
-      setCompletedMessages((prev) => [res.message, ...prev.filter((m) => m.id !== res.message.id)]);
-      setCompletedCount((c) => c + 1);
-      setCompletingMsg(null);
-      setCompleteSummary('');
-    } finally {
-      setSubmittingComplete(false);
-    }
-  };
-
-  const handleRestoreToActive = async (msg: SignalChatMessage) => {
-    const res = await apiFetch<{ message: SignalChatMessage }>(`/api/signals/messages/${msg.id}`, {
-      method: 'PATCH',
-      body: JSON.stringify({ status: 'active' }),
-    });
-    setCompletedMessages((prev) => prev.filter((m) => m.id !== msg.id));
-    setSelectedCompleted(null);
-    setActiveMessages((prev) =>
-      [...prev.filter((m) => m.id !== res.message.id), res.message].sort((a, b) =>
-        a.created_at.localeCompare(b.created_at)
-      )
-    );
-    setCompletedCount((c) => Math.max(0, c - 1));
-    setView('chat');
-  };
-
-  const handleDeleteMessage = async (msgId: string) => {
-    await apiFetch(`/api/signals/messages/${msgId}`, { method: 'DELETE' });
-    setActiveMessages((prev) => prev.filter((m) => m.id !== msgId));
-    setPinnedMessages((prev) => prev.filter((m) => m.id !== msgId));
-    setDraftMessages((prev) => prev.filter((m) => m.id !== msgId));
-    setCompletedMessages((prev) => prev.filter((m) => m.id !== msgId));
-    setSelectedCompleted((cur) => (cur?.id === msgId ? null : cur));
-    setConfirmDeleteId(null);
-  };
 
   const jumpToMessage = useCallback((msgId: string) => {
     const node = messageRefs.current.get(msgId);
@@ -1282,9 +949,7 @@ export const SignalsPage: React.FC = () => {
                         MeridianFX Signal Channel
                       </p>
                       <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
-                        {isAdmin
-                          ? 'Publish your first real-time message, trading setup, or chart image using the composer below.'
-                          : 'Live trading signals, chart analysis, and instant desk broadcasts appear here automatically.'}
+                        Live trading signals, chart analysis, and instant desk broadcasts appear here automatically.
                       </p>
                     </div>
                   </div>
@@ -1301,8 +966,6 @@ export const SignalsPage: React.FC = () => {
                     }
 
                     const msg = item.msg;
-                    const isEditing = editingMsgId === msg.id;
-                    const isConfirmingDelete = confirmDeleteId === msg.id;
                     const isHighlighted = highlightedMsgId === msg.id;
 
                     return (
@@ -1323,7 +986,7 @@ export const SignalsPage: React.FC = () => {
                                 : 'bg-white dark:bg-[#151E2E]'
                           }`}
                         >
-                          {/* Compact Sender Line + Admin Controls */}
+                          {/* Compact Sender Line */}
                           <div className="flex items-center justify-between gap-2 mb-1.5">
                             <div className="flex flex-wrap items-center gap-1.5 min-w-0">
                               <span className="text-xs font-bold text-[#881337] dark:text-rose-400">
@@ -1337,193 +1000,38 @@ export const SignalsPage: React.FC = () => {
                                   <Zap className="w-2.5 h-2.5" /> Urgent
                                 </span>
                               )}
-                              {isAdmin && (
-                                <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-500">
-                                  · Published
-                                </span>
-                              )}
                               {msg.pinned && (
                                 <span className="inline-flex items-center gap-0.5 text-[11px] font-semibold text-[#881337] dark:text-rose-400">
                                   · <Pin className="w-3 h-3" /> Pinned
                                 </span>
                               )}
                             </div>
-
-                            {isAdmin && !isEditing && (
-                              <div className="flex items-center gap-0.5 shrink-0">
-                                <button
-                                  type="button"
-                                  onClick={() => handleTogglePin(msg)}
-                                  title={msg.pinned ? 'Unpin message' : 'Pin message'}
-                                  aria-label={msg.pinned ? 'Unpin message' : 'Pin message'}
-                                  className="p-1.5 rounded-md text-slate-400 hover:text-[#881337] hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
-                                >
-                                  {msg.pinned ? (
-                                    <PinOff className="w-3.5 h-3.5 text-[#881337] dark:text-rose-400" />
-                                  ) : (
-                                    <Pin className="w-3.5 h-3.5" />
-                                  )}
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => handleStartEdit(msg)}
-                                  title="Edit message"
-                                  aria-label="Edit message"
-                                  className="p-1.5 rounded-md text-slate-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
-                                >
-                                  <Edit3 className="w-3.5 h-3.5" />
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    setCompletingMsg(msg);
-                                    setCompleteSummary('');
-                                  }}
-                                  title="Move to Completed Updates"
-                                  aria-label="Move to Completed Updates"
-                                  className="p-1.5 rounded-md text-slate-400 hover:text-[#15803D] hover:bg-emerald-50 dark:hover:bg-emerald-950/30 transition-colors"
-                                >
-                                  <CheckCircle2 className="w-3.5 h-3.5" />
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    setConfirmDeleteId(isConfirmingDelete ? null : msg.id)
-                                  }
-                                  title="Delete message"
-                                  aria-label="Delete message"
-                                  className="p-1.5 rounded-md text-slate-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30 transition-colors"
-                                >
-                                  <Trash2 className="w-3.5 h-3.5" />
-                                </button>
-                              </div>
-                            )}
                           </div>
 
-                          {/* Delete Confirmation Inline Bar */}
-                          {isAdmin && isConfirmingDelete && (
-                            <div className="mb-2.5 rounded-lg bg-red-50 dark:bg-red-950/30 px-3 py-2 flex items-center justify-between gap-2 text-xs">
-                              <span className="text-red-700 dark:text-red-300 font-medium">
-                                Delete this message?
-                              </span>
-                              <div className="flex items-center gap-2 shrink-0">
-                                <button
-                                  type="button"
-                                  onClick={() => setConfirmDeleteId(null)}
-                                  className="px-2.5 py-1 rounded border border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300"
-                                >
-                                  Cancel
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => handleDeleteMessage(msg.id)}
-                                  className="px-2.5 py-1 rounded bg-red-600 text-white font-semibold hover:bg-red-700"
-                                >
-                                  Delete
-                                </button>
-                              </div>
-                            </div>
-                          )}
-
-                          {/* Edit Mode vs Message Content */}
-                          {isEditing ? (
-                            <div className="space-y-2 py-1">
-                              <div className="flex flex-wrap items-center gap-2">
-                                <select
-                                  value={editDraftType}
-                                  onChange={(e) =>
-                                    setEditDraftType(e.target.value as SignalChatMessageType)
-                                  }
-                                  className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2.5 py-1.5 text-xs text-slate-900 dark:text-white"
-                                >
-                                  <option value="signal">Trading Signal</option>
-                                  <option value="setup">Buy / Sell Setup</option>
-                                  <option value="analysis">Chart Analysis</option>
-                                  <option value="update">Market Update</option>
-                                  <option value="news">Economic News Alert</option>
-                                  <option value="announcement">Announcement</option>
-                                </select>
-                                <select
-                                  value={editDraftPriority}
-                                  onChange={(e) =>
-                                    setEditDraftPriority(e.target.value as SignalChatPriority)
-                                  }
-                                  className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2.5 py-1.5 text-xs text-slate-900 dark:text-white"
-                                >
-                                  <option value="normal">Normal Priority</option>
-                                  <option value="urgent">Urgent Alert</option>
-                                </select>
-                              </div>
-
-                              <textarea
-                                rows={3}
-                                value={editDraftText}
-                                onChange={(e) => setEditDraftText(e.target.value)}
-                                className="w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-base sm:text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-[#881337]"
+                          {msg.media_type === 'video' && msg.media_url ? (
+                            <div className={msg.content ? 'mb-2.5' : 'mb-1'}>
+                              <video
+                                src={msg.media_url}
+                                controls
+                                playsInline
+                                preload="metadata"
+                                className="w-full max-h-80 rounded-xl bg-black"
                               />
-
-                              {editDraftImageUrl && (
-                                <div className="flex items-center justify-between gap-2 rounded-lg bg-slate-100 dark:bg-slate-800 px-3 py-1.5 text-xs">
-                                  <span className="truncate text-slate-600 dark:text-slate-300">
-                                    Image attachment kept
-                                  </span>
-                                  <button
-                                    type="button"
-                                    onClick={() => setEditDraftImageUrl(null)}
-                                    className="text-red-600 hover:underline shrink-0"
-                                  >
-                                    Remove
-                                  </button>
-                                </div>
-                              )}
-
-                              <div className="flex items-center justify-end gap-2">
-                                <button
-                                  type="button"
-                                  onClick={() => setEditingMsgId(null)}
-                                  className="rounded-lg border border-slate-300 dark:border-slate-700 px-3 py-1.5 text-xs font-medium text-slate-600 dark:text-slate-300"
-                                >
-                                  Cancel
-                                </button>
-                                <button
-                                  type="button"
-                                  disabled={savingEdit}
-                                  onClick={() => handleSaveEdit(msg.id)}
-                                  className="inline-flex items-center gap-1 rounded-lg bg-[#881337] px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-[#6B0F2B] disabled:opacity-60"
-                                >
-                                  <Check className="w-3.5 h-3.5" />
-                                  <span>{savingEdit ? 'Saving...' : 'Save'}</span>
-                                </button>
-                              </div>
                             </div>
-                          ) : (
-                            <>
-                              {msg.media_type === 'video' && msg.media_url ? (
-                                <div className={msg.content ? 'mb-2.5' : 'mb-1'}>
-                                  <video
-                                    src={msg.media_url}
-                                    controls
-                                    playsInline
-                                    preload="metadata"
-                                    className="w-full max-h-80 rounded-xl bg-black"
-                                  />
-                                </div>
-                              ) : (msg.media_url || msg.image_url) ? (
-                                <div className={msg.content ? 'mb-2.5' : 'mb-1'}>
-                                  <ChatImageAttachment
-                                    src={msg.media_url || msg.image_url || ''}
-                                    alt={msg.media_name || msg.image_name || 'Trading chart attachment'}
-                                    onOpen={setLightboxUrl}
-                                  />
-                                </div>
-                              ) : null}
+                          ) : (msg.media_url || msg.image_url) ? (
+                            <div className={msg.content ? 'mb-2.5' : 'mb-1'}>
+                              <ChatImageAttachment
+                                src={msg.media_url || msg.image_url || ''}
+                                alt={msg.media_name || msg.image_name || 'Trading chart attachment'}
+                                onOpen={setLightboxUrl}
+                              />
+                            </div>
+                          ) : null}
 
-                              {msg.content && (
-                                <p className="text-[15px] text-slate-800 dark:text-slate-100 leading-relaxed whitespace-pre-wrap break-words">
-                                  {renderMessageText(msg.content)}
-                                </p>
-                              )}
-                            </>
+                          {msg.content && (
+                            <p className="text-[15px] text-slate-800 dark:text-slate-100 leading-relaxed whitespace-pre-wrap break-words">
+                              {renderMessageText(msg.content)}
+                            </p>
                           )}
 
                           {/* Telegram-Style 5-Emoji Reaction Row + Timestamp */}
@@ -1579,267 +1087,6 @@ export const SignalsPage: React.FC = () => {
               </button>
             )}
           </div>
-
-          {/* Fixed Bottom Composer (Admin Only) */}
-          {isAdmin && (
-            <form
-              onSubmit={(e) => handleSendMessage(e, false)}
-              className="border-t border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0F172A] px-3 sm:px-5 py-2.5 space-y-2 shrink-0 z-20"
-            >
-              <div className="mx-auto max-w-3xl space-y-2">
-                {/* Post-Publish Public & Push Delivery Confirmation Banner */}
-                {publishConfirmation && (
-                  <div className="rounded-xl border border-emerald-200 dark:border-emerald-900/50 bg-emerald-50/90 dark:bg-emerald-950/30 px-3 py-2 flex flex-wrap items-center justify-between gap-2 text-xs">
-                    <div className="space-y-0.5 min-w-0">
-                      <p className="font-bold text-[#15803D] dark:text-emerald-400 flex items-center gap-1.5">
-                        <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
-                        <span>{publishConfirmation.label}</span>
-                      </p>
-                      <p className="text-[11px] text-slate-600 dark:text-slate-300 font-mono tabular-nums">
-                        {publishConfirmation.pushJob
-                          ? `Targeted: ${publishConfirmation.pushJob.total_targeted} · Sent: ${publishConfirmation.pushJob.delivered_count} · Confirmed: ${publishConfirmation.pushJob.confirmed_count} · Queued: ${publishConfirmation.pushJob.queued_count} · Failed: ${publishConfirmation.pushJob.failed_count}`
-                          : 'Push notification skipped for this post.'}
-                      </p>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => setPublishConfirmation(null)}
-                      className="p-1 text-slate-400 hover:text-slate-700 dark:hover:text-white shrink-0"
-                      aria-label="Dismiss publish confirmation"
-                    >
-                      <X className="w-3.5 h-3.5" />
-                    </button>
-                  </div>
-                )}
-
-                {/* Admin Drafts Strip */}
-                {showDrafts && draftMessages.length > 0 && (
-                  <div className="rounded-xl border border-amber-200 dark:border-amber-900/50 bg-amber-50/70 dark:bg-amber-950/20 p-2.5 space-y-2 max-h-44 overflow-y-auto">
-                    <div className="flex items-center justify-between text-[11px] font-bold text-amber-800 dark:text-amber-300">
-                      <span>Private Admin Drafts ({draftMessages.length}) — not visible publicly</span>
-                      <button
-                        type="button"
-                        onClick={() => setShowDrafts(false)}
-                        className="underline font-semibold"
-                      >
-                        Hide
-                      </button>
-                    </div>
-                    {draftMessages.map((draft) => (
-                      <div
-                        key={draft.id}
-                        className="rounded-lg bg-white dark:bg-slate-900 border border-amber-200/70 dark:border-slate-800 px-3 py-2 flex items-center justify-between gap-2 text-xs"
-                      >
-                        <div className="min-w-0">
-                          <span className="text-[10px] font-bold uppercase text-amber-600 dark:text-amber-400 mr-1.5">
-                            [Draft · {MESSAGE_TYPE_LABELS[draft.message_type]}]
-                          </span>
-                          <span className="text-slate-700 dark:text-slate-200 truncate block">
-                            {draft.content || draft.media_name || draft.image_name || 'Media attachment'}
-                          </span>
-                        </div>
-                        <div className="flex items-center gap-1.5 shrink-0">
-                          <button
-                            type="button"
-                            disabled={publishingDraftId === draft.id}
-                            onClick={() => handlePublishDraft(draft)}
-                            className="rounded-md bg-[#15803D] px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-[#166534] disabled:opacity-60"
-                          >
-                            {publishingDraftId === draft.id ? 'Publishing...' : 'Publish & Notify'}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleDeleteMessage(draft.id)}
-                            className="p-1 text-slate-400 hover:text-red-600"
-                            aria-label="Delete draft"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                {/* Compact Composer Controls Strip */}
-                <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
-                  <div className="flex flex-wrap items-center gap-1.5">
-                    <select
-                      value={composerType}
-                      onChange={(e) => setComposerType(e.target.value as SignalChatMessageType)}
-                      aria-label="Message type"
-                      className="rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 px-2.5 py-1 text-[11px] font-semibold text-slate-700 dark:text-slate-200"
-                    >
-                      <option value="signal">Trading Signal</option>
-                      <option value="setup">Buy / Sell Setup</option>
-                      <option value="analysis">Chart Analysis</option>
-                      <option value="update">Market Update</option>
-                      <option value="news">Economic News Alert</option>
-                      <option value="announcement">Announcement</option>
-                    </select>
-
-                    <button
-                      type="button"
-                      onClick={() =>
-                        setComposerPriority((p) => (p === 'urgent' ? 'normal' : 'urgent'))
-                      }
-                      className={`inline-flex items-center gap-1 rounded-lg border px-2 py-1 text-[11px] font-semibold transition-colors ${
-                        composerPriority === 'urgent'
-                          ? 'border-rose-500 bg-rose-50 text-[#881337] dark:bg-rose-950/40 dark:text-rose-300'
-                          : 'border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300'
-                      }`}
-                    >
-                      <Zap className="w-3 h-3" />
-                      <span>{composerPriority === 'urgent' ? 'Urgent' : 'Normal'}</span>
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() => setComposerPinned((v) => !v)}
-                      className={`inline-flex items-center gap-1 rounded-lg border px-2 py-1 text-[11px] font-semibold transition-colors ${
-                        composerPinned
-                          ? 'border-[#881337] bg-rose-50 text-[#881337] dark:bg-rose-950/30 dark:text-rose-300'
-                          : 'border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300'
-                      }`}
-                    >
-                      <Pin className="w-3 h-3" />
-                      <span>{composerPinned ? 'Pinned' : 'Pin'}</span>
-                    </button>
-
-                    {draftMessages.length > 0 && (
-                      <button
-                        type="button"
-                        onClick={() => setShowDrafts((s) => !s)}
-                        className="inline-flex items-center gap-1 rounded-lg border border-amber-300 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/30 px-2 py-1 text-[11px] font-semibold text-amber-800 dark:text-amber-300"
-                      >
-                        <span>Drafts ({draftMessages.length})</span>
-                      </button>
-                    )}
-                  </div>
-
-                  <label className="inline-flex items-center gap-1.5 text-[11px] text-slate-600 dark:text-slate-300 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={composerPush}
-                      onChange={(e) => setComposerPush(e.target.checked)}
-                      className="accent-[#881337] w-3.5 h-3.5"
-                    />
-                    <span>Send Push Notification</span>
-                  </label>
-                </div>
-
-                {/* Media Preview Strip */}
-                {(attachmentPreview || attachmentUrl) && (
-                  <div className="flex items-center justify-between gap-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 p-2">
-                    <div className="flex items-center gap-2.5 min-w-0">
-                      {attachmentMediaType === 'video' ? (
-                        <div className="w-11 h-11 rounded-lg bg-slate-900 text-white flex items-center justify-center border border-slate-700 shrink-0">
-                          <Film className="w-5 h-5" />
-                        </div>
-                      ) : (
-                        <img
-                          src={attachmentPreview || attachmentUrl || ''}
-                          alt="Attachment preview"
-                          className="w-11 h-11 rounded-lg object-cover border border-slate-200 dark:border-slate-700 shrink-0"
-                        />
-                      )}
-                      <div className="min-w-0">
-                        <p className="text-xs font-medium text-slate-800 dark:text-slate-200 truncate">
-                          {attachmentName || (attachmentMediaType === 'video' ? 'Video attachment' : 'Chart screenshot')}
-                        </p>
-                        <p className="text-[11px] text-slate-500">
-                          {uploadingImage ? 'Uploading...' : 'Ready to publish'}
-                        </p>
-                      </div>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={handleCancelAttachment}
-                      className="p-2 rounded-lg text-slate-500 hover:text-red-600 shrink-0"
-                      aria-label="Remove attachment"
-                    >
-                      <X className="w-4 h-4" />
-                    </button>
-                  </div>
-                )}
-
-                {composerError && (
-                  <p className="text-xs font-medium text-red-600 dark:text-red-400">
-                    {composerError}
-                  </p>
-                )}
-
-                {/* Input Bar */}
-                <div className="flex items-end gap-2">
-                  <input
-                    ref={fileInputRef}
-                    type="file"
-                    accept="image/*,video/mp4,video/webm"
-                    className="hidden"
-                    onChange={(e) => handleSelectImage(e.target.files?.[0])}
-                  />
-
-                  <button
-                    type="button"
-                    onClick={() => fileInputRef.current?.click()}
-                    disabled={uploadingImage || sendingMessage || savingDraft}
-                    title="Attach chart image, screenshot, or video (MP4/WebM)"
-                    aria-label="Attach image or video"
-                    className="min-h-[44px] min-w-[44px] flex items-center justify-center rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-200 hover:text-[#881337] disabled:opacity-50 shrink-0 transition-colors"
-                  >
-                    {uploadingImage ? (
-                      <Loader2 className="w-5 h-5 animate-spin" />
-                    ) : (
-                      <ImagePlus className="w-5 h-5" />
-                    )}
-                  </button>
-
-                  <textarea
-                    ref={composerInputRef}
-                    rows={1}
-                    value={composerText}
-                    onChange={(e) => setComposerText(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' && !e.shiftKey && window.innerWidth >= 768) {
-                        e.preventDefault();
-                        handleSendMessage(undefined, false);
-                      }
-                    }}
-                    placeholder="Broadcast message, signal, or market update..."
-                    className="flex-1 min-h-[44px] max-h-28 resize-y rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 px-3.5 py-2.5 text-base sm:text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-[#881337]"
-                  />
-
-                  <button
-                    type="button"
-                    disabled={
-                      sendingMessage || savingDraft || uploadingImage || (!composerText.trim() && !attachmentUrl)
-                    }
-                    onClick={() => handleSendMessage(undefined, true)}
-                    title="Save privately as draft without publishing"
-                    className="min-h-[44px] px-2.5 sm:px-3 rounded-xl border border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-200 font-semibold text-xs hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50 shrink-0 transition-colors"
-                  >
-                    {savingDraft ? 'Saving...' : 'Draft'}
-                  </button>
-
-                  <button
-                    type="submit"
-                    disabled={
-                      sendingMessage || savingDraft || uploadingImage || (!composerText.trim() && !attachmentUrl)
-                    }
-                    aria-label="Publish live message"
-                    className="min-h-[44px] min-w-[44px] sm:px-4 rounded-xl bg-[#881337] text-white font-semibold text-xs sm:text-sm inline-flex items-center justify-center gap-1.5 hover:bg-[#6B0F2B] disabled:opacity-50 shrink-0 transition-colors"
-                  >
-                    {sendingMessage ? (
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                    ) : (
-                      <Send className="w-4 h-4" />
-                    )}
-                    <span className="hidden sm:inline">Publish</span>
-                  </button>
-                </div>
-              </div>
-            </form>
-          )}
         </>
       )}
 
@@ -2104,20 +1351,6 @@ export const SignalsPage: React.FC = () => {
                   <span>Alerts {unreadCount > 0 ? `(${unreadCount})` : ''}</span>
                 </button>
               )}
-
-              {isAdmin && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setShowChannelInfo(false);
-                    navigate('/admin');
-                  }}
-                  className="inline-flex items-center justify-center gap-1.5 rounded-xl bg-[#881337] text-white py-2.5 font-semibold hover:bg-[#6B0F2B]"
-                >
-                  <Shield className="w-3.5 h-3.5" />
-                  <span>Admin Desk</span>
-                </button>
-              )}
             </div>
           </div>
         </div>
@@ -2208,85 +1441,6 @@ export const SignalsPage: React.FC = () => {
                   );
                 })}
               </div>
-
-              {isAdmin && (
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() => handleRestoreToActive(selectedCompleted)}
-                    className="inline-flex items-center gap-1 rounded-lg border border-slate-300 dark:border-slate-700 px-3 py-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800"
-                  >
-                    <RotateCcw className="w-3.5 h-3.5" />
-                    <span>Restore to Chat</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => handleDeleteMessage(selectedCompleted.id)}
-                    className="inline-flex items-center gap-1 rounded-lg bg-red-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-red-700"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                    <span>Delete</span>
-                  </button>
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Archive Confirmation Modal */}
-      {completingMsg && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 p-4"
-          onClick={() => setCompletingMsg(null)}
-        >
-          <div
-            className="w-full max-w-md rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5 space-y-4 shadow-xl"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-center justify-between">
-              <h3 className="text-base font-bold text-slate-900 dark:text-white">
-                Move Setup to Completed Updates
-              </h3>
-              <button
-                type="button"
-                onClick={() => setCompletingMsg(null)}
-                className="p-1.5 text-slate-400 hover:text-slate-800 dark:hover:text-white"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-            <p className="text-xs text-slate-500 dark:text-slate-400">
-              Moves this update out of the live chat stream into the Completed Updates archive.
-            </p>
-            <div>
-              <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
-                Outcome / Summary Note (optional)
-              </label>
-              <input
-                type="text"
-                value={completeSummary}
-                onChange={(e) => setCompleteSummary(e.target.value)}
-                placeholder="e.g. TP1 & TP2 reached (+85 pips), position closed."
-                className="w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3.5 py-2 text-base sm:text-sm text-slate-900 dark:text-white"
-              />
-            </div>
-            <div className="flex justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => setCompletingMsg(null)}
-                className="rounded-lg border border-slate-300 dark:border-slate-700 px-3.5 py-2 text-xs font-medium text-slate-700 dark:text-slate-300"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                disabled={submittingComplete}
-                onClick={handleMarkCompleted}
-                className="rounded-lg bg-[#15803D] px-4 py-2 text-xs font-semibold text-white hover:bg-[#166534] disabled:opacity-60"
-              >
-                {submittingComplete ? 'Moving...' : 'Move to Completed'}
-              </button>
             </div>
           </div>
         </div>

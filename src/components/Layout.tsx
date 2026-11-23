@@ -10,7 +10,6 @@ import {
   MessageSquare,
   Moon,
   Radio,
-  Shield,
   Sun,
   TrendingUp,
   User as UserIcon,
@@ -48,6 +47,7 @@ export const Layout: React.FC<LayoutProps> = ({ children }) => {
     { path: '/calendar', label: 'Calendar', icon: Calendar },
     { path: '/academy', label: 'Academy', icon: BookOpen },
     { path: '/community', label: 'Community', icon: MessageSquare },
+    { path: '/profile', label: 'Profile', icon: UserIcon },
   ];
 
   const mobileBottomTabs = [
@@ -150,8 +150,8 @@ export const Layout: React.FC<LayoutProps> = ({ children }) => {
               <button type="button" onClick={() => navigate('/legal')} className="hover:text-[#881337] dark:hover:text-white">
                 Privacy Policy
               </button>
-              <button type="button" onClick={() => navigate('/login')} className="hover:text-[#881337] dark:hover:text-white">
-                Member Sign In
+              <button type="button" onClick={() => navigate('/profile')} className="hover:text-[#881337] dark:hover:text-white">
+                Profile &amp; Contact
               </button>
               <button type="button" onClick={toggleTheme} className="hover:text-[#881337] dark:hover:text-white">
                 {theme === 'dark' ? 'Light Mode' : 'Dark Mode'}
@@ -286,29 +286,10 @@ export const Layout: React.FC<LayoutProps> = ({ children }) => {
               )}
             </button>
           )}
-
-          {user?.role === 'admin' && (
-            <button
-              type="button"
-              onClick={() => navigate('/admin')}
-              className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors ${
-                route === '/admin'
-                  ? 'bg-emerald-700/10 text-emerald-800 dark:text-emerald-400 font-semibold'
-                  : 'text-emerald-800 dark:text-emerald-400/90 hover:bg-emerald-50 dark:hover:bg-emerald-500/10'
-              }`}
-            >
-              <Shield className="w-4 h-4 shrink-0" />
-              <span>Admin Desk</span>
-            </button>
-          )}
         </nav>
 
-        <div className="p-3 border-t border-slate-200 dark:border-slate-800/80 space-y-2.5">
-          <div className="flex justify-center">
-            <PWAInstallButton variant="compact" label="INSTALL APP" />
-          </div>
-
-          {user ? (
+        {user && (
+          <div className="p-3 border-t border-slate-200 dark:border-slate-800/80">
             <div className="flex items-center justify-between gap-2 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-transparent p-2.5">
               <button
                 type="button"
@@ -323,7 +304,7 @@ export const Layout: React.FC<LayoutProps> = ({ children }) => {
                     {user.name}
                   </p>
                   <p className="text-[11px] text-slate-500 dark:text-slate-400 truncate">
-                    {user.role === 'admin' ? 'Administrator' : 'Trader Account'}
+                    Premium Member
                   </p>
                 </div>
               </button>
@@ -336,25 +317,8 @@ export const Layout: React.FC<LayoutProps> = ({ children }) => {
                 <LogOut className="w-4 h-4" />
               </button>
             </div>
-          ) : (
-            <div className="grid grid-cols-2 gap-2">
-              <button
-                type="button"
-                onClick={() => navigate('/login')}
-                className="rounded-lg border border-slate-300 dark:border-slate-700 py-2 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
-              >
-                Sign In
-              </button>
-              <button
-                type="button"
-                onClick={() => navigate('/profile')}
-                className="rounded-lg bg-[#881337] py-2 text-xs font-semibold text-white hover:bg-[#6B0F2B]"
-              >
-                Membership
-              </button>
-            </div>
-          )}
-        </div>
+          </div>
+        )}
       </aside>
 
       {/* Main Content Area */}
@@ -375,24 +339,6 @@ export const Layout: React.FC<LayoutProps> = ({ children }) => {
 
           <div className="flex items-center gap-3">
             <PWAInstallButton variant="header" label="INSTALL APP" />
-            {!user && (
-              <>
-                <button
-                  type="button"
-                  onClick={() => navigate('/login')}
-                  className="rounded-lg border border-slate-300 dark:border-slate-700 px-3.5 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors"
-                >
-                  Sign In
-                </button>
-                <button
-                  type="button"
-                  onClick={() => navigate('/profile')}
-                  className="rounded-lg bg-[#881337] px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-[#6B0F2B] transition-colors"
-                >
-                  Membership
-                </button>
-              </>
-            )}
           </div>
         </header>
 
@@ -409,16 +355,6 @@ export const Layout: React.FC<LayoutProps> = ({ children }) => {
 
             <div className="flex items-center gap-1.5 shrink-0">
               <PWAInstallButton variant="header" label="INSTALL APP" />
-              {user?.role === 'admin' && (
-                <button
-                  type="button"
-                  onClick={() => navigate('/admin')}
-                  className="min-h-[40px] min-w-[40px] flex items-center justify-center text-emerald-700 dark:text-emerald-400"
-                  aria-label="Admin Desk"
-                >
-                  <Shield className="w-5 h-5" />
-                </button>
-              )}
               {user && (
                 <button
                   type="button"

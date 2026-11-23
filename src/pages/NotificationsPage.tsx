@@ -297,14 +297,14 @@ export const NotificationsPage: React.FC = () => {
         <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-8 text-center">
           <h2 className="text-base font-bold text-slate-900 dark:text-white">In-App Notification History</h2>
           <p className="mt-1 text-xs text-slate-500">
-            Push alerts work above without signing in. Sign in to also view your synced unread history across devices.
+            Real-time push notifications work above without an account. Approved Premium Members can sign in via Profile to view synced unread history.
           </p>
           <button
             type="button"
-            onClick={() => navigate('/login')}
+            onClick={() => navigate('/profile')}
             className="mt-4 rounded-lg bg-[#881337] px-5 py-2 text-xs font-semibold text-white hover:bg-[#6B0F2B]"
           >
-            Sign In
+            Open Profile
           </button>
         </div>
       ) : (

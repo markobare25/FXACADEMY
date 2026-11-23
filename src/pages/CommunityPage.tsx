@@ -39,7 +39,7 @@ export const CommunityPage: React.FC = () => {
   const handleCreatePost = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!user) {
-      navigate('/login');
+      navigate('/profile');
       return;
     }
     try {
@@ -57,7 +57,7 @@ export const CommunityPage: React.FC = () => {
 
   const handleComment = async (postId: string) => {
     if (!user) {
-      navigate('/login');
+      navigate('/profile');
       return;
     }
     const text = (commentInputs[postId] || '').trim();
@@ -72,7 +72,7 @@ export const CommunityPage: React.FC = () => {
 
   const handleLike = async (postId: string) => {
     if (!user) {
-      navigate('/login');
+      navigate('/profile');
       return;
     }
     await apiFetch(`/api/community/posts/${postId}/like`, { method: 'POST' });
@@ -160,14 +160,16 @@ export const CommunityPage: React.FC = () => {
             </div>
           </form>
         ) : (
-          <div className="mt-3 flex items-center justify-between gap-4">
-            <p className="text-xs text-slate-500">Sign in to participate in community threads.</p>
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-4">
+            <p className="text-xs text-slate-500">
+              Approved Premium Members can sign in via Profile to post and reply in community threads.
+            </p>
             <button
               type="button"
-              onClick={() => navigate('/login')}
+              onClick={() => navigate('/profile')}
               className="rounded-lg bg-[#881337] px-4 py-2 text-xs font-semibold text-white hover:bg-[#6B0F2B]"
             >
-              Sign In
+              Premium Member Sign In
             </button>
           </div>
         )}

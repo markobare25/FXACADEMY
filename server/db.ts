@@ -534,12 +534,65 @@ export function initDatabase(): void {
 
     CREATE TABLE IF NOT EXISTS contact_messages (
       id TEXT PRIMARY KEY,
+      reference_code TEXT,
       name TEXT NOT NULL,
       email TEXT NOT NULL,
+      phone TEXT,
       subject TEXT NOT NULL,
       message TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'new',
+      admin_reply TEXT,
+      replied_at TEXT,
       created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS membership_applications (
+      id TEXT PRIMARY KEY,
+      reference_code TEXT NOT NULL UNIQUE,
+      full_name TEXT NOT NULL,
+      email TEXT NOT NULL,
+      phone TEXT NOT NULL,
+      country TEXT NOT NULL,
+      preferred_contact TEXT NOT NULL CHECK (preferred_contact IN ('Email', 'WhatsApp', 'Phone Call')),
+      message TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
+      admin_notes TEXT,
+      reviewed_by TEXT,
+      reviewed_at TEXT,
+      member_user_id TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS support_conversations (
+      id TEXT PRIMARY KEY,
+      reference_code TEXT NOT NULL UNIQUE,
+      visitor_name TEXT NOT NULL,
+      visitor_email TEXT,
+      visitor_phone TEXT,
+      visitor_id TEXT,
+      access_token_hash TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'resolved')),
+      unread_admin INTEGER NOT NULL DEFAULT 0,
+      unread_visitor INTEGER NOT NULL DEFAULT 0,
+      last_message_preview TEXT,
+      last_message_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS support_messages (
+      id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL,
+      sender_type TEXT NOT NULL CHECK (sender_type IN ('visitor', 'admin')),
+      sender_name TEXT NOT NULL,
+      content TEXT NOT NULL DEFAULT '',
+      attachment_url TEXT,
+      attachment_name TEXT,
+      read_by_admin INTEGER NOT NULL DEFAULT 0,
+      read_by_visitor INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (conversation_id) REFERENCES support_conversations(id) ON DELETE CASCADE
     );
 
     CREATE TABLE IF NOT EXISTS platform_settings (
@@ -633,6 +686,10 @@ export function initDatabase(): void {
   ensureColumn('push_job_deliveries', 'transport', "TEXT NOT NULL DEFAULT 'web_push'");
   ensureColumn('push_job_deliveries', 'device_received_at', 'TEXT');
   ensureColumn('push_job_deliveries', 'opened_at', 'TEXT');
+  ensureColumn('contact_messages', 'reference_code', 'TEXT');
+  ensureColumn('contact_messages', 'phone', 'TEXT');
+  ensureColumn('contact_messages', 'admin_reply', 'TEXT');
+  ensureColumn('contact_messages', 'replied_at', 'TEXT');
 
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_user_sessions_refresh
@@ -643,6 +700,12 @@ export function initDatabase(): void {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_signal_messages_source
       ON signal_messages(source_type, source_id)
       WHERE source_type IS NOT NULL AND source_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_membership_apps_status
+      ON membership_applications(status, created_at);
+    CREATE INDEX IF NOT EXISTS idx_support_convs_last
+      ON support_conversations(status, last_message_at);
+    CREATE INDEX IF NOT EXISTS idx_support_msgs_conv
+      ON support_messages(conversation_id, created_at);
   `);
 
   // Migrate legacy signal_message_reactions table (2 reactions + user_id PK) to 5-reaction public actor_key schema

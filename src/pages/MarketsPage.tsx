@@ -64,7 +64,7 @@ export const MarketsPage: React.FC = () => {
 
   const toggleWatchlist = async (symbol: string) => {
     if (!user) {
-      navigate('/login');
+      navigate('/profile');
       return;
     }
     const exists = user.watchlist.includes(symbol);

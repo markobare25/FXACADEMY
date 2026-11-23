@@ -40,24 +40,26 @@ export const DashboardPage: React.FC = () => {
   if (!user) {
     return (
       <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-8 text-center">
-        <h1 className="text-xl font-bold text-slate-900 dark:text-white">Sign in to access your Member Dashboard</h1>
+        <h1 className="text-xl font-bold text-slate-900 dark:text-white">
+          Premium Member Dashboard
+        </h1>
         <p className="mt-2 text-sm text-slate-500 dark:text-slate-400">
-          Track watchlists, resume Academy lessons, and access approved premium briefings.
+          Approved Premium Members can sign in on the Profile page to access synced watchlists and member briefings, or apply for membership.
         </p>
-        <div className="mt-5 flex items-center justify-center gap-3">
-          <button
-            type="button"
-            onClick={() => navigate('/login')}
-            className="rounded-lg bg-[#881337] px-5 py-2.5 text-sm font-semibold text-white hover:bg-[#6B0F2B]"
-          >
-            Sign In
-          </button>
+        <div className="mt-5 flex flex-wrap items-center justify-center gap-3">
           <button
             type="button"
             onClick={() => navigate('/profile')}
+            className="rounded-lg bg-[#881337] px-5 py-2.5 text-sm font-semibold text-white hover:bg-[#6B0F2B]"
+          >
+            Premium Member Sign In &amp; Apply
+          </button>
+          <button
+            type="button"
+            onClick={() => navigate('/signals')}
             className="rounded-lg border border-slate-300 dark:border-slate-700 px-5 py-2.5 text-sm font-medium text-slate-800 dark:text-slate-200"
           >
-            Apply for Membership
+            Open Public Signals
           </button>
         </div>
       </div>

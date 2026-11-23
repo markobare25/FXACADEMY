@@ -13,7 +13,8 @@ import {
 } from 'lucide-react';
 import { ACADEMY_CATEGORIES } from '../../pages/AcademyPage';
 import { ALL_VISUAL_KEYS, AcademyVisuals } from '../academy/AcademyVisuals';
-import { apiFetch, formatLocalDateTime, uploadMediaFile } from '../../lib/api';
+import { formatLocalDateTime } from '../../lib/api';
+import { adminApiFetch, adminUploadMediaFile } from '../../lib/adminApi';
 import type {
   AcademyAuditLog,
   AcademyContentReport,
@@ -119,8 +120,8 @@ export const AdminAcademyManager: React.FC<AdminAcademyManagerProps> = ({
   const loadAdminAcademy = useCallback(async () => {
     try {
       const [cRes, aRes] = await Promise.all([
-        apiFetch<{ courses: Course[] }>('/api/academy/courses?includeAll=true'),
-        apiFetch<{ logs: AcademyAuditLog[]; reports: AcademyContentReport[] }>('/api/admin/academy/audit'),
+        adminApiFetch<{ courses: Course[] }>('/api/academy/courses?includeAll=true'),
+        adminApiFetch<{ logs: AcademyAuditLog[]; reports: AcademyContentReport[] }>('/api/admin/academy/audit'),
       ]);
       const sorted = (cRes.courses || [])
         .slice()
@@ -163,7 +164,7 @@ export const AdminAcademyManager: React.FC<AdminAcademyManagerProps> = ({
   const handleUpload = async (file: File | undefined, cb: (url: string) => void) => {
     if (!file) return;
     try {
-      const res = await uploadMediaFile(file);
+      const res = await adminUploadMediaFile(file);
       cb(res.url);
       onNotify(`Uploaded ${res.original_name}`);
     } catch (err) {
@@ -210,13 +211,13 @@ export const AdminAcademyManager: React.FC<AdminAcademyManagerProps> = ({
         cover_image_url: courseForm.cover_image_url || null,
       };
       if (editingCourseId) {
-        await apiFetch(`/api/academy/courses/${editingCourseId}`, {
+        await adminApiFetch(`/api/academy/courses/${editingCourseId}`, {
           method: 'PATCH',
           body: JSON.stringify(payload),
         });
         onNotify('Course updated.');
       } else {
-        await apiFetch('/api/academy/courses', {
+        await adminApiFetch('/api/academy/courses', {
           method: 'POST',
           body: JSON.stringify(payload),
         });
@@ -366,13 +367,13 @@ export const AdminAcademyManager: React.FC<AdminAcademyManagerProps> = ({
       };
 
       if (editingLessonId) {
-        await apiFetch(`/api/academy/lessons/${editingLessonId}`, {
+        await adminApiFetch(`/api/academy/lessons/${editingLessonId}`, {
           method: 'PATCH',
           body: JSON.stringify(payload),
         });
         onNotify('Lesson updated & versioned.');
       } else {
-        await apiFetch('/api/academy/lessons', {
+        await adminApiFetch('/api/academy/lessons', {
           method: 'POST',
           body: JSON.stringify(payload),
         });
@@ -393,7 +394,7 @@ export const AdminAcademyManager: React.FC<AdminAcademyManagerProps> = ({
     const [moved] = reordered.splice(idx, 1);
     reordered.splice(swapIdx, 0, moved);
     try {
-      await apiFetch('/api/academy/lessons/reorder', {
+      await adminApiFetch('/api/academy/lessons/reorder', {
         method: 'POST',
         body: JSON.stringify({
           course_id: activeCourse.id,
@@ -409,7 +410,7 @@ export const AdminAcademyManager: React.FC<AdminAcademyManagerProps> = ({
 
   const handleQuickLessonStatus = async (lesson: Lesson, status: ContentPublishStatus) => {
     try {
-      await apiFetch(`/api/academy/lessons/${lesson.id}`, {
+      await adminApiFetch(`/api/academy/lessons/${lesson.id}`, {
         method: 'PATCH',
         body: JSON.stringify({ status, change_note: `Status changed to ${status}` }),
       });
@@ -421,7 +422,7 @@ export const AdminAcademyManager: React.FC<AdminAcademyManagerProps> = ({
   };
 
   const handleDeleteLesson = async (id: string) => {
-    await apiFetch(`/api/academy/lessons/${id}`, { method: 'DELETE' });
+    await adminApiFetch(`/api/academy/lessons/${id}`, { method: 'DELETE' });
     onNotify('Lesson deleted.');
     if (editingLessonId === id) resetLessonEditor();
     await Promise.all([loadAdminAcademy(), onGlobalRefresh()]);
@@ -434,7 +435,7 @@ export const AdminAcademyManager: React.FC<AdminAcademyManagerProps> = ({
     }
     setGeneratingImg(true);
     try {
-      const res = await apiFetch<{ url: string }>('/api/admin/academy/generate-illustration', {
+      const res = await adminApiFetch<{ url: string }>('/api/admin/academy/generate-illustration', {
         method: 'POST',
         body: JSON.stringify({
           topic: lessonForm.title,
@@ -453,7 +454,7 @@ export const AdminAcademyManager: React.FC<AdminAcademyManagerProps> = ({
 
   const handleViewVersions = async (lesson: Lesson) => {
     try {
-      const res = await apiFetch<{ versions: LessonVersion[] }>(
+      const res = await adminApiFetch<{ versions: LessonVersion[] }>(
         `/api/academy/lessons/${lesson.id}/versions`
       );
       setVersionsLessonTitle(lesson.title);
@@ -464,7 +465,7 @@ export const AdminAcademyManager: React.FC<AdminAcademyManagerProps> = ({
   };
 
   const handleResolveReport = async (id: string, status: 'resolved' | 'dismissed') => {
-    await apiFetch(`/api/admin/academy/reports/${id}`, {
+    await adminApiFetch(`/api/admin/academy/reports/${id}`, {
       method: 'PATCH',
       body: JSON.stringify({ status }),
     });

@@ -97,10 +97,10 @@ export const LoginPage: React.FC = () => {
           <div className="flex flex-col gap-2.5 pt-2">
             <button
               type="button"
-              onClick={() => navigate(user.role === 'admin' ? '/admin' : '/dashboard')}
+              onClick={() => navigate('/dashboard')}
               className="w-full rounded-lg bg-[#881337] py-2.5 text-sm font-semibold text-white hover:bg-[#6B0F2B] min-h-[44px]"
             >
-              {user.role === 'admin' ? 'Open Admin Desk' : 'Open Member Dashboard'}
+              Open Member Dashboard
             </button>
             <button
               type="button"
@@ -135,11 +135,11 @@ export const LoginPage: React.FC = () => {
     setLoading(true);
     setError(null);
     try {
-      const loggedUser = await login(cleanIdentifier, password, rememberMe);
-      if (redirectTarget && (redirectTarget !== '/admin' || loggedUser.role === 'admin')) {
+      await login(cleanIdentifier, password, rememberMe);
+      if (redirectTarget && redirectTarget !== '/admin') {
         navigate(redirectTarget);
       } else {
-        navigate(loggedUser.role === 'admin' ? '/admin' : '/dashboard');
+        navigate('/dashboard');
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unable to sign in. Please check your credentials.');
@@ -152,8 +152,8 @@ export const LoginPage: React.FC = () => {
     <div className="mx-auto max-w-md py-8 sm:py-12 px-1">
       <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-6 sm:p-8 shadow-xs">
         <AuthBrandHeader
-          title="Sign In to MeridianFX"
-          subtitle="Secure sign in for MeridianFX administrators and approved premium members."
+          title="Premium Member Sign In"
+          subtitle="Sign in with credentials issued by MeridianFX administration."
         />
 
         {resetSuccess && (
@@ -373,10 +373,10 @@ export const VerifyEmailPage: React.FC = () => {
             </div>
             <button
               type="button"
-              onClick={() => navigate(user ? '/dashboard' : '/login')}
+              onClick={() => navigate(user ? '/dashboard' : '/profile')}
               className="w-full rounded-lg bg-[#881337] py-2.5 text-sm font-semibold text-white hover:bg-[#6B0F2B] min-h-[44px]"
             >
-              {user ? 'Continue to Dashboard' : 'Sign In'}
+              {user ? 'Continue to Dashboard' : 'Go to Profile'}
             </button>
           </div>
         ) : (
@@ -493,10 +493,10 @@ export const ForgotPasswordPage: React.FC = () => {
           </button>
           <button
             type="button"
-            onClick={() => navigate('/login')}
+            onClick={() => navigate('/profile')}
             className="w-full rounded-lg border border-slate-300 dark:border-slate-700 py-2.5 text-sm font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 min-h-[44px]"
           >
-            Back to Sign In
+            Back to Profile
           </button>
         </div>
       </div>
@@ -580,10 +580,10 @@ export const ResetPasswordPage: React.FC = () => {
             </div>
             <button
               type="button"
-              onClick={() => navigate('/login?reset=success')}
+              onClick={() => navigate('/profile')}
               className="w-full rounded-lg bg-[#881337] py-2.5 text-sm font-semibold text-white hover:bg-[#6B0F2B] min-h-[44px]"
             >
-              Sign In with New Password
+              Sign In via Profile
             </button>
           </div>
         ) : (

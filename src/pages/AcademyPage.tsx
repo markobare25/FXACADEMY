@@ -479,26 +479,6 @@ export const AcademyPage: React.FC = () => {
       {/* TAB 5: MY PROGRESS, COMPLETION RECORDS & BOOKMARKS */}
       {sectionTab === 'progress' && (
         <div className="space-y-6">
-          {!user && (
-            <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-6 flex flex-wrap items-center justify-between gap-4">
-              <div>
-                <h2 className="text-base font-bold text-slate-900 dark:text-white">
-                  Sync Your Progress Across Devices
-                </h2>
-                <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                  Sign in to persist lesson completions, quiz scores, bookmarks, and completion records across mobile, tablet, and desktop.
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={() => navigate('/login')}
-                className="rounded-lg bg-[#881337] px-4 py-2 text-xs font-semibold text-white min-h-[40px]"
-              >
-                Sign In to MeridianFX
-              </button>
-            </div>
-          )}
-
           {/* Flagged Review Lessons */}
           {overallProgress.needsReviewLessons.length > 0 && (
             <div className="rounded-xl border border-amber-500/40 bg-amber-50/60 dark:bg-amber-950/20 p-5 space-y-3">

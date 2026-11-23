@@ -493,3 +493,81 @@ export interface PublicStats {
   total_users: number;
   community_posts: number;
 }
+
+export interface AdminOverviewStats extends PublicStats {
+  new_registrations_7d: number;
+  push_subscribers: number;
+  total_applications: number;
+  pending_applications: number;
+  approved_applications: number;
+  active_premium_members: number;
+  unread_customer_messages: number;
+  total_enquiries: number;
+}
+
+export type MembershipApplicationStatus = 'pending' | 'approved' | 'rejected';
+export type PreferredContactMethod = 'Email' | 'WhatsApp' | 'Phone Call';
+
+export interface MembershipApplication {
+  id: string;
+  reference_code: string;
+  full_name: string;
+  email: string;
+  phone: string;
+  country: string;
+  preferred_contact: PreferredContactMethod;
+  message: string;
+  status: MembershipApplicationStatus;
+  admin_notes?: string | null;
+  reviewed_by?: string | null;
+  reviewed_at?: string | null;
+  member_user_id?: string | null;
+  member_username?: string | null;
+  member_status?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SupportConversation {
+  id: string;
+  reference_code: string;
+  visitor_name: string;
+  visitor_email?: string | null;
+  visitor_phone?: string | null;
+  visitor_id?: string | null;
+  status: 'open' | 'resolved';
+  unread_admin: number;
+  unread_visitor: number;
+  last_message_preview: string;
+  last_message_at: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SupportMessage {
+  id: string;
+  conversation_id: string;
+  sender_type: 'visitor' | 'admin';
+  sender_name: string;
+  content: string;
+  attachment_url?: string | null;
+  attachment_name?: string | null;
+  read_by_admin: boolean;
+  read_by_visitor: boolean;
+  created_at: string;
+}
+
+export interface ContactSubmission {
+  id: string;
+  reference_code?: string | null;
+  name: string;
+  email: string;
+  phone?: string | null;
+  subject: string;
+  message: string;
+  status: 'new' | 'reviewed' | 'replied' | string;
+  admin_reply?: string | null;
+  replied_at?: string | null;
+  created_at: string;
+}
+

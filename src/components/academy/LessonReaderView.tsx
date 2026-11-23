@@ -191,7 +191,7 @@ export const LessonReaderView: React.FC<LessonReaderViewProps> = ({
         localStorage.setItem(GUEST_PROGRESS_KEY, JSON.stringify(nextGuest));
         return;
       }
-      navigate('/login');
+      navigate('/profile');
       return;
     }
 
