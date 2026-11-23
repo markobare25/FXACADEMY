@@ -69,6 +69,20 @@ function isWithin24HoursOrPinned(msg: SignalChatMessage): boolean {
   return Date.now() - createdMs < SIGNAL_TTL_MS;
 }
 
+function sortChannelChronological(list: SignalChatMessage[]): SignalChatMessage[] {
+  return [...list].sort((a, b) => {
+    if (Boolean(a.is_welcome) !== Boolean(b.is_welcome)) {
+      return a.is_welcome ? -1 : 1;
+    }
+    const ta = Date.parse(a.created_at);
+    const tb = Date.parse(b.created_at);
+    if (Number.isFinite(ta) && Number.isFinite(tb) && ta !== tb) {
+      return ta - tb;
+    }
+    return a.created_at.localeCompare(b.created_at);
+  });
+}
+
 function formatCompactCount(count: number): string {
   if (!Number.isFinite(count) || count <= 0) return '0';
   if (count >= 1_000_000) {
@@ -341,12 +355,33 @@ export const SignalsPage: React.FC = () => {
           viewer_key?: string | null;
         }>(`/api/signals/messages?${qs.toString()}`, { cache: 'no-store' });
         if (res.viewer_key) viewerKeyRef.current = res.viewer_key;
-        setActiveMessages(res.messages.filter(isWithin24HoursOrPinned));
+
+        const nextMessages = sortChannelChronological(
+          res.messages.filter(isWithin24HoursOrPinned)
+        );
+        const nextNonWelcome = nextMessages.filter((m) => !m.is_welcome);
+        const nextLatestAt =
+          nextNonWelcome.length > 0 ? nextNonWelcome[nextNonWelcome.length - 1].created_at : null;
+        const hasNewArrival = Boolean(
+          nextLatestAt &&
+            latestCreatedAtRef.current &&
+            nextLatestAt > latestCreatedAtRef.current
+        );
+
+        setActiveMessages(nextMessages);
         setPinnedMessages(res.pinned);
         setActiveHasMore(res.has_more);
         setCompletedCount(res.counts.completed);
+
         if (!keepScrollPosition) {
           requestAnimationFrame(() => scrollToBottom(false));
+          window.setTimeout(() => scrollToBottom(false), 60);
+        } else if (hasNewArrival) {
+          if (isNearBottomRef.current) {
+            requestAnimationFrame(() => scrollToBottom(true));
+          } else {
+            setHasUnseenBelow(true);
+          }
         }
       } catch {
         // handled cleanly via empty/offline state
@@ -390,12 +425,7 @@ export const SignalsPage: React.FC = () => {
           for (const incoming of validIncoming) {
             map.set(incoming.id, incoming);
           }
-          return Array.from(map.values()).sort((a, b) => {
-            if (Boolean(a.is_welcome) !== Boolean(b.is_welcome)) {
-              return a.is_welcome ? -1 : 1;
-            }
-            return a.created_at.localeCompare(b.created_at);
-          });
+          return sortChannelChronological(Array.from(map.values()));
         });
         if (isNearBottomRef.current) {
           requestAnimationFrame(() => scrollToBottom(true));
@@ -476,7 +506,9 @@ export const SignalsPage: React.FC = () => {
           }
           if (incoming.status === 'active') {
             setActiveMessages((prev) =>
-              prev.some((m) => m.id === incoming.id) ? prev : [...prev, incoming]
+              prev.some((m) => m.id === incoming.id)
+                ? prev
+                : sortChannelChronological([...prev, incoming])
             );
             if (incoming.pinned) {
               setPinnedMessages((prev) =>
@@ -615,15 +647,29 @@ export const SignalsPage: React.FC = () => {
     const pollTimer = window.setInterval(() => {
       if (document.visibilityState !== 'visible') return;
       if (view === 'chat') {
-        fetchActiveMessages(true);
+        void fetchActiveMessages(true);
       }
-    }, 6000);
+    }, 5000);
+
+    const handleFocusOrVisible = () => {
+      if (document.visibilityState === 'hidden') return;
+      if (view === 'chat') {
+        void fetchActiveMessages(true);
+      } else if (view === 'completed') {
+        void fetchCompletedMessages(completedSearch);
+      }
+    };
+
+    window.addEventListener('focus', handleFocusOrVisible);
+    document.addEventListener('visibilitychange', handleFocusOrVisible);
 
     return () => {
       if (source) source.close();
       clearInterval(pollTimer);
+      window.removeEventListener('focus', handleFocusOrVisible);
+      document.removeEventListener('visibilitychange', handleFocusOrVisible);
     };
-  }, [authLoading, applySignalChannelEvent, fetchActiveMessages, view]);
+  }, [authLoading, applySignalChannelEvent, fetchActiveMessages, fetchCompletedMessages, completedSearch, view]);
 
   // Periodically prune expired non-pinned messages (>24h) on the client
   useEffect(() => {
@@ -655,11 +701,9 @@ export const SignalsPage: React.FC = () => {
         has_more: boolean;
       }>(`/api/signals/messages?${qs.toString()}`, { cache: 'no-store' });
       setActiveMessages((prev) => {
-        const welcomeRows = prev.filter((m) => m.is_welcome);
-        const regularRows = prev.filter((m) => !m.is_welcome);
         const existingIds = new Set(prev.map((m) => m.id));
         const older = res.messages.filter((m) => !existingIds.has(m.id) && isWithin24HoursOrPinned(m));
-        return [...welcomeRows, ...older, ...regularRows];
+        return sortChannelChronological([...older, ...prev]);
       });
       setActiveHasMore(res.has_more);
 

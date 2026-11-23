@@ -167,6 +167,7 @@ export const AdminPage: React.FC = () => {
   } | null>(null);
 
   // Structured Signal Form State
+  const [savingSignal, setSavingSignal] = useState(false);
   const [editingSignalId, setEditingSignalId] = useState<string | null>(null);
   const [sigForm, setSigForm] = useState({
     pair: 'EURUSD',
@@ -891,6 +892,8 @@ export const AdminPage: React.FC = () => {
   // --- Structured Signal Handlers ---
   const handleSubmitSignal = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (savingSignal) return;
+    setSavingSignal(true);
     try {
       if (editingSignalId) {
         const res = await adminApiFetch<{
@@ -947,6 +950,8 @@ export const AdminPage: React.FC = () => {
       await Promise.all([refreshAll(), loadAdminData()]);
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Failed to save signal.');
+    } finally {
+      setSavingSignal(false);
     }
   };
 
@@ -1772,9 +1777,16 @@ export const AdminPage: React.FC = () => {
 
                   <button
                     type="submit"
-                    className="w-full rounded-lg bg-[#881337] py-2.5 text-sm font-semibold text-white hover:bg-[#6B0F2B] min-h-[44px]"
+                    disabled={savingSignal}
+                    className="w-full rounded-lg bg-[#881337] py-2.5 text-sm font-semibold text-white hover:bg-[#6B0F2B] disabled:opacity-60 min-h-[44px]"
                   >
-                    {editingSignalId ? 'Save Signal Changes' : 'Publish Structured Signal'}
+                    {savingSignal
+                      ? editingSignalId
+                        ? 'Saving Changes...'
+                        : 'Publishing Signal...'
+                      : editingSignalId
+                        ? 'Save Signal Changes'
+                        : 'Publish Structured Signal'}
                   </button>
                 </form>
 

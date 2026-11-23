@@ -5,6 +5,7 @@ import {
   Edit3,
   Film,
   ImagePlus,
+  Loader2,
   Pin,
   PinOff,
   Radio,
@@ -18,6 +19,7 @@ import {
 } from 'lucide-react';
 import { adminApiFetch, adminUploadMediaFile } from '../../lib/adminApi';
 import { formatLocalDateTime } from '../../lib/api';
+import { usePlatform } from '../../context/PlatformContext';
 import type {
   PushJobSummary,
   SignalChatMessage,
@@ -53,6 +55,7 @@ export const AdminSignalsBroadcastStudio: React.FC<AdminSignalsBroadcastStudioPr
   onOpenPublicSignals,
   liveTick = 0,
 }) => {
+  const { refreshAll } = usePlatform();
   const [channelTab, setChannelTab] = useState<'active' | 'draft' | 'completed'>('active');
   const [messages, setMessages] = useState<SignalChatMessage[]>([]);
   const [counts, setCounts] = useState({ active: 0, completed: 0, draft: 0 });
@@ -72,6 +75,7 @@ export const AdminSignalsBroadcastStudio: React.FC<AdminSignalsBroadcastStudioPr
   const [mediaName, setMediaName] = useState<string | null>(null);
   const [uploadingMedia, setUploadingMedia] = useState(false);
   const [publishing, setPublishing] = useState(false);
+  const [publishingDraftId, setPublishingDraftId] = useState<string | null>(null);
 
   // Edit & Complete Modal / Inline State
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -182,6 +186,7 @@ export const AdminSignalsBroadcastStudio: React.FC<AdminSignalsBroadcastStudioPr
           pushJob: res.push_job || null,
         });
         setChannelTab('active');
+        await refreshAll();
       }
       await loadMessages();
     } catch (err) {
@@ -192,6 +197,7 @@ export const AdminSignalsBroadcastStudio: React.FC<AdminSignalsBroadcastStudioPr
   };
 
   const handlePublishDraft = async (msg: SignalChatMessage) => {
+    setPublishingDraftId(msg.id);
     try {
       const res = await adminApiFetch<{
         message: SignalChatMessage;
@@ -207,9 +213,11 @@ export const AdminSignalsBroadcastStudio: React.FC<AdminSignalsBroadcastStudioPr
         pushJob: res.push_job || null,
       });
       setChannelTab('active');
-      await loadMessages();
+      await Promise.all([loadMessages(), refreshAll()]);
     } catch (err) {
       onError(err instanceof Error ? err.message : 'Failed to publish draft.');
+    } finally {
+      setPublishingDraftId(null);
     }
   };
 
@@ -451,7 +459,11 @@ export const AdminSignalsBroadcastStudio: React.FC<AdminSignalsBroadcastStudioPr
               onClick={() => handlePublish('active')}
               className="inline-flex items-center justify-center gap-1.5 rounded-xl bg-[#881337] px-4 py-2.5 text-xs font-bold uppercase tracking-wide text-white hover:bg-[#6B0F2B] disabled:opacity-60"
             >
-              <Send className="w-3.5 h-3.5" />
+              {publishing ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Send className="w-3.5 h-3.5" />
+              )}
               <span>{publishing ? 'Publishing...' : 'PUBLISH'}</span>
             </button>
           </div>
@@ -578,11 +590,16 @@ export const AdminSignalsBroadcastStudio: React.FC<AdminSignalsBroadcastStudioPr
                         {channelTab === 'draft' && (
                           <button
                             type="button"
+                            disabled={publishingDraftId === m.id}
                             onClick={() => handlePublishDraft(m)}
-                            className="inline-flex items-center gap-1 rounded-md bg-[#15803D] px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-[#166534]"
+                            className="inline-flex items-center gap-1 rounded-md bg-[#15803D] px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-[#166534] disabled:opacity-60"
                           >
-                            <Send className="w-3 h-3" />
-                            <span>Publish Live</span>
+                            {publishingDraftId === m.id ? (
+                              <Loader2 className="w-3 h-3 animate-spin" />
+                            ) : (
+                              <Send className="w-3 h-3" />
+                            )}
+                            <span>{publishingDraftId === m.id ? 'Publishing...' : 'Publish Live'}</span>
                           </button>
                         )}
                         {channelTab === 'active' && (

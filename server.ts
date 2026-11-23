@@ -23,6 +23,7 @@ import {
   incrementTotalPublishedSignals,
   initDatabase,
   logSystemEvent,
+  setTotalPublishedSignals,
   verifyAdminFallbackPassword,
   verifyPassword,
 } from './server/db.ts';
@@ -74,6 +75,7 @@ import {
   type PushTargetGroup,
 } from './server/push.ts';
 import {
+  assertPersistentDatabaseReady,
   deleteRemoteSignal,
   deleteRemoteSignalMessage,
   ensureRemoteHydrated,
@@ -1145,7 +1147,6 @@ app.delete('/api/users/account', requireAuth, (req: AuthRequest, res: Response) 
 });
 
 // ---------- Signals Community Chat (Active Live Stream & Completed Archive) ----------
-const recentSignalChatDedup = new Map<string, number>();
 const reactionBurstBuckets = new Map<string, number[]>();
 const REACTION_TYPES: readonly SignalReactionType[] = ['love', 'like', 'fire', 'hundred'];
 const UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -1332,6 +1333,7 @@ function publishMirrorToSignalChannel(params: {
   mediaName?: string | null;
   pinned?: boolean;
   createdAt?: string;
+  skipRemoteSync?: boolean;
 }) {
   const existing = db
     .prepare('SELECT * FROM signal_messages WHERE source_type = ? AND source_id = ?')
@@ -1396,8 +1398,10 @@ function publishMirrorToSignalChannel(params: {
   if (!row) return null;
 
   const hydrated = hydrateSignalMessages([row], null)[0];
-  broadcastSignalChatEvent('signals_chat:created', hydrated);
-  void syncSignalMessageToRemote(String(row.id));
+  if (!params.skipRemoteSync) {
+    broadcastSignalChatEvent('signals_chat:created', hydrated);
+    void syncSignalMessageToRemote(String(row.id));
+  }
   return { message: hydrated, created: String(row.id) === id };
 }
 
@@ -1571,6 +1575,12 @@ app.get('/api/signals/messages', optionalAuth, async (req: AuthRequest, res: Res
     if (welcomeRow && !ordered.some((r) => String(r.id) === String(welcomeRow.id))) {
       ordered = [welcomeRow, ...ordered];
     }
+    ordered.sort((a, b) => {
+      const aWelcome = Boolean(a.is_welcome);
+      const bWelcome = Boolean(b.is_welcome);
+      if (aWelcome !== bWelcome) return aWelcome ? -1 : 1;
+      return String(a.created_at || '').localeCompare(String(b.created_at || ''));
+    });
   }
 
   const pinnedRows =
@@ -1736,6 +1746,16 @@ app.post('/api/signals/messages', requireRole('admin'), async (req: AuthRequest,
     res.status(403).json({ error: 'Only the designated administrator can publish signal channel messages.' });
     return;
   }
+
+  try {
+    assertPersistentDatabaseReady();
+  } catch (err) {
+    res.status(500).json({
+      error: err instanceof Error ? err.message : 'Database persistence is not configured.',
+    });
+    return;
+  }
+
   const parsed = signalMessageCreateSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid signal chat message.' });
@@ -1749,23 +1769,31 @@ app.post('/api/signals/messages', requireRole('admin'), async (req: AuthRequest,
     ? d.media_type || (/\.(mp4|webm)(\?|$)/i.test(resolvedMediaUrl) ? 'video' : 'image')
     : null;
   const resolvedMediaName = d.media_name || d.image_name || null;
+  const initialStatus = d.status === 'draft' ? 'draft' : 'active';
 
-  const dedupKey = d.client_request_id
-    ? `req:${req.user!.id}:${d.client_request_id}`
-    : `msg:${req.user!.id}:${d.status}:${trimmedContent}:${resolvedMediaUrl || ''}`;
-  const lastSentAt = recentSignalChatDedup.get(dedupKey);
-  if (lastSentAt && Date.now() - lastSentAt < 5000) {
+  // Database-backed duplicate guard (5-second window) without in-memory arrays/maps
+  const dedupCutoffIso = new Date(Date.now() - 5000).toISOString();
+  const recentDup = db
+    .prepare(
+      `SELECT id FROM signal_messages
+       WHERE author_id = ?
+         AND status = ?
+         AND content = ?
+         AND COALESCE(media_url, '') = ?
+         AND created_at > ?
+       LIMIT 1`
+    )
+    .get(req.user!.id, initialStatus, trimmedContent, resolvedMediaUrl || '', dedupCutoffIso) as
+    | { id: string }
+    | undefined;
+  if (recentDup) {
     res.status(409).json({ error: 'Duplicate message submission ignored.' });
     return;
-  }
-  recentSignalChatDedup.set(dedupKey, Date.now());
-  for (const [k, ts] of recentSignalChatDedup.entries()) {
-    if (Date.now() - ts > 15_000) recentSignalChatDedup.delete(k);
   }
 
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
-  const initialStatus = d.status === 'draft' ? 'draft' : 'active';
+  const authorName = 'MeridianFX Desk';
   const seeds =
     initialStatus === 'active'
       ? generateSeededReactions()
@@ -1779,49 +1807,64 @@ app.post('/api/signals/messages', requireRole('admin'), async (req: AuthRequest,
     await refreshSignalsAndStatsFromRemote();
   }
 
-  db.prepare(
-    `INSERT INTO signal_messages (
-      id, author_id, author_name, content, image_url, image_name,
-      media_url, media_type, media_name, message_type, priority, status, pinned,
-      seed_love, seed_like, seed_fire, seed_hundred,
-      love_count, like_count, fire_count, hundred_count, seed_views, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    id,
-    req.user!.id,
-    req.user!.name,
-    trimmedContent,
-    resolvedMediaType === 'video' ? null : resolvedMediaUrl,
-    resolvedMediaType === 'video' ? null : resolvedMediaName,
-    resolvedMediaUrl,
-    resolvedMediaType,
-    resolvedMediaName,
-    d.message_type,
-    d.priority,
-    initialStatus,
-    initialStatus === 'active' && d.pinned ? 1 : 0,
-    seeds.love,
-    seeds.like,
-    seeds.fire,
-    seeds.hundred,
-    seeds.love,
-    seeds.like,
-    seeds.fire,
-    seeds.hundred,
-    views,
-    now
-  );
-
+  const prevCounter = getTotalPublishedSignals();
   let totalPublishedSignals: number | undefined;
-  if (initialStatus === 'active') {
-    totalPublishedSignals = incrementTotalPublishedSignals();
-    await Promise.all([
-      syncSignalMessageToRemote(id),
-      syncTotalPublishedSignalsToRemote(totalPublishedSignals),
-    ]);
-    broadcastWs('stats:updated', { total_published_signals: totalPublishedSignals });
-  } else {
-    await syncSignalMessageToRemote(id);
+  let counterIncremented = false;
+
+  try {
+    db.prepare(
+      `INSERT INTO signal_messages (
+        id, author_id, author_name, content, image_url, image_name,
+        media_url, media_type, media_name, message_type, priority, status, pinned,
+        seed_love, seed_like, seed_fire, seed_hundred,
+        love_count, like_count, fire_count, hundred_count, seed_views, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      id,
+      req.user!.id,
+      authorName,
+      trimmedContent,
+      resolvedMediaType === 'video' ? null : resolvedMediaUrl,
+      resolvedMediaType === 'video' ? null : resolvedMediaName,
+      resolvedMediaUrl,
+      resolvedMediaType,
+      resolvedMediaName,
+      d.message_type,
+      d.priority,
+      initialStatus,
+      initialStatus === 'active' && d.pinned ? 1 : 0,
+      seeds.love,
+      seeds.like,
+      seeds.fire,
+      seeds.hundred,
+      seeds.love,
+      seeds.like,
+      seeds.fire,
+      seeds.hundred,
+      views,
+      now
+    );
+
+    if (initialStatus === 'active') {
+      totalPublishedSignals = incrementTotalPublishedSignals();
+      counterIncremented = true;
+      await Promise.all([
+        syncSignalMessageToRemote(id, { strict: true }),
+        syncTotalPublishedSignalsToRemote(totalPublishedSignals, { strict: true }),
+      ]);
+      broadcastWs('stats:updated', { total_published_signals: totalPublishedSignals });
+    } else {
+      await syncSignalMessageToRemote(id, { strict: true });
+    }
+  } catch (err) {
+    db.prepare('DELETE FROM signal_messages WHERE id = ?').run(id);
+    if (counterIncremented) {
+      setTotalPublishedSignals(prevCounter);
+    }
+    res.status(500).json({
+      error: err instanceof Error ? err.message : 'Failed to save signal message to database.',
+    });
+    return;
   }
 
   const row = db.prepare('SELECT * FROM signal_messages WHERE id = ?').get(id) as Record<string, unknown>;
@@ -1835,7 +1878,7 @@ app.post('/api/signals/messages', requireRole('admin'), async (req: AuthRequest,
       d.message_type,
       trimmedContent,
       resolvedMediaType,
-      req.user!.name
+      authorName
     );
     if (d.send_push !== false) {
       const dispatchRes = await dispatchNotification({
@@ -1891,6 +1934,16 @@ app.patch('/api/signals/messages/:id', requireRole('admin'), async (req: AuthReq
     res.status(403).json({ error: 'Only the designated administrator can modify signal channel messages.' });
     return;
   }
+
+  try {
+    assertPersistentDatabaseReady();
+  } catch (err) {
+    res.status(500).json({
+      error: err instanceof Error ? err.message : 'Database persistence is not configured.',
+    });
+    return;
+  }
+
   const existing = db.prepare('SELECT * FROM signal_messages WHERE id = ?').get(req.params.id) as
     | Record<string, unknown>
     | undefined;
@@ -1999,67 +2052,119 @@ app.patch('/api/signals/messages/:id', requireRole('admin'), async (req: AuthReq
     }
   }
 
-  db.prepare(
-    `UPDATE signal_messages SET
-      content = ?,
-      image_url = ?,
-      image_name = ?,
-      media_url = ?,
-      media_type = ?,
-      media_name = ?,
-      message_type = ?,
-      priority = ?,
-      pinned = ?,
-      status = ?,
-      edited_at = ?,
-      completed_at = ?,
-      completed_summary = ?,
-      seed_love = ?,
-      seed_like = ?,
-      seed_fire = ?,
-      seed_hundred = ?,
-      love_count = ?,
-      like_count = ?,
-      fire_count = ?,
-      hundred_count = ?,
-      seed_views = ?,
-      created_at = ?
-     WHERE id = ?`
-  ).run(
-    nextContent,
-    nextMediaType === 'video' ? null : nextMediaUrl || null,
-    nextMediaType === 'video' ? null : nextMediaName || null,
-    nextMediaUrl || null,
-    nextMediaType,
-    nextMediaName || null,
-    nextType,
-    nextPriority,
-    nextPinned,
-    nextStatus,
-    nextEditedAt,
-    nextCompletedAt,
-    d.completed_summary !== undefined ? d.completed_summary : existing.completed_summary,
-    nextSeeds.love,
-    nextSeeds.like,
-    nextSeeds.fire,
-    nextSeeds.hundred,
-    actorTotals.love,
-    actorTotals.like,
-    actorTotals.fire,
-    actorTotals.hundred,
-    nextSeedViews,
-    nextCreatedAt,
-    req.params.id
-  );
-
-  await syncSignalMessageToRemote(String(req.params.id));
-
-  let totalPublishedSignals: number | undefined;
   if (publishingFromDraft) {
     await refreshSignalsAndStatsFromRemote();
-    totalPublishedSignals = incrementTotalPublishedSignals();
-    await syncTotalPublishedSignalsToRemote(totalPublishedSignals);
-    broadcastWs('stats:updated', { total_published_signals: totalPublishedSignals });
+  }
+  const prevCounter = getTotalPublishedSignals();
+  let totalPublishedSignals: number | undefined;
+  let counterIncremented = false;
+
+  try {
+    db.prepare(
+      `UPDATE signal_messages SET
+        content = ?,
+        image_url = ?,
+        image_name = ?,
+        media_url = ?,
+        media_type = ?,
+        media_name = ?,
+        message_type = ?,
+        priority = ?,
+        pinned = ?,
+        status = ?,
+        edited_at = ?,
+        completed_at = ?,
+        completed_summary = ?,
+        seed_love = ?,
+        seed_like = ?,
+        seed_fire = ?,
+        seed_hundred = ?,
+        love_count = ?,
+        like_count = ?,
+        fire_count = ?,
+        hundred_count = ?,
+        seed_views = ?,
+        created_at = ?
+       WHERE id = ?`
+    ).run(
+      nextContent,
+      nextMediaType === 'video' ? null : nextMediaUrl || null,
+      nextMediaType === 'video' ? null : nextMediaName || null,
+      nextMediaUrl || null,
+      nextMediaType,
+      nextMediaName || null,
+      nextType,
+      nextPriority,
+      nextPinned,
+      nextStatus,
+      nextEditedAt,
+      nextCompletedAt,
+      d.completed_summary !== undefined ? d.completed_summary : existing.completed_summary,
+      nextSeeds.love,
+      nextSeeds.like,
+      nextSeeds.fire,
+      nextSeeds.hundred,
+      actorTotals.love,
+      actorTotals.like,
+      actorTotals.fire,
+      actorTotals.hundred,
+      nextSeedViews,
+      nextCreatedAt,
+      req.params.id
+    );
+
+    if (publishingFromDraft) {
+      totalPublishedSignals = incrementTotalPublishedSignals();
+      counterIncremented = true;
+      await Promise.all([
+        syncSignalMessageToRemote(String(req.params.id), { strict: true }),
+        syncTotalPublishedSignalsToRemote(totalPublishedSignals, { strict: true }),
+      ]);
+      broadcastWs('stats:updated', { total_published_signals: totalPublishedSignals });
+    } else {
+      await syncSignalMessageToRemote(String(req.params.id), { strict: true });
+    }
+  } catch (err) {
+    db.prepare(
+      `UPDATE signal_messages SET
+        content = ?, image_url = ?, image_name = ?, media_url = ?, media_type = ?, media_name = ?,
+        message_type = ?, priority = ?, pinned = ?, status = ?, edited_at = ?, completed_at = ?,
+        completed_summary = ?, seed_love = ?, seed_like = ?, seed_fire = ?, seed_hundred = ?,
+        love_count = ?, like_count = ?, fire_count = ?, hundred_count = ?, seed_views = ?, created_at = ?
+       WHERE id = ?`
+    ).run(
+      existing.content,
+      existing.image_url,
+      existing.image_name,
+      existing.media_url,
+      existing.media_type,
+      existing.media_name,
+      existing.message_type,
+      existing.priority,
+      existing.pinned,
+      existing.status,
+      existing.edited_at,
+      existing.completed_at,
+      existing.completed_summary,
+      existing.seed_love,
+      existing.seed_like,
+      existing.seed_fire,
+      existing.seed_hundred,
+      existing.love_count,
+      existing.like_count,
+      existing.fire_count,
+      existing.hundred_count,
+      existing.seed_views,
+      existing.created_at,
+      req.params.id
+    );
+    if (counterIncremented) {
+      setTotalPublishedSignals(prevCounter);
+    }
+    res.status(500).json({
+      error: err instanceof Error ? err.message : 'Failed to update signal message in database.',
+    });
+    return;
   }
 
   const updatedRow = db.prepare('SELECT * FROM signal_messages WHERE id = ?').get(req.params.id) as Record<
@@ -2076,7 +2181,7 @@ app.patch('/api/signals/messages/:id', requireRole('admin'), async (req: AuthReq
         nextType,
         nextContent,
         nextMediaType,
-        String(existing.author_name || req.user!.name)
+        String(existing.author_name || 'MeridianFX Desk')
       );
       const dispatchRes = await dispatchNotification({
         title: buildSignalChannelPushTitle(nextType, nextPriority, nextContent),
@@ -2108,12 +2213,34 @@ app.delete('/api/signals/messages/:id', requireRole('admin'), async (req: AuthRe
     res.status(403).json({ error: 'Only the designated administrator can delete signal channel messages.' });
     return;
   }
-  const info = db.prepare('DELETE FROM signal_messages WHERE id = ?').run(req.params.id);
-  if (info.changes === 0) {
+
+  try {
+    assertPersistentDatabaseReady();
+  } catch (err) {
+    res.status(500).json({
+      error: err instanceof Error ? err.message : 'Database persistence is not configured.',
+    });
+    return;
+  }
+
+  const existing = db.prepare('SELECT id FROM signal_messages WHERE id = ?').get(req.params.id) as
+    | { id: string }
+    | undefined;
+  if (!existing) {
     res.status(404).json({ error: 'Message not found.' });
     return;
   }
-  await deleteRemoteSignalMessage(String(req.params.id));
+
+  try {
+    await deleteRemoteSignalMessage(String(req.params.id), { strict: true });
+    db.prepare('DELETE FROM signal_messages WHERE id = ?').run(req.params.id);
+  } catch (err) {
+    res.status(500).json({
+      error: err instanceof Error ? err.message : 'Failed to delete signal message from database.',
+    });
+    return;
+  }
+
   broadcastSignalChatEvent('signals_chat:deleted', { id: req.params.id });
   res.json({ ok: true });
 });
@@ -2328,6 +2455,15 @@ const signalSchema = z.object({
 });
 
 app.post('/api/signals', requireRole('admin'), async (req: AuthRequest, res: Response) => {
+  try {
+    assertPersistentDatabaseReady();
+  } catch (err) {
+    res.status(500).json({
+      error: err instanceof Error ? err.message : 'Database persistence is not configured.',
+    });
+    return;
+  }
+
   const parsed = signalSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid signal data.' });
@@ -2341,87 +2477,111 @@ app.post('/api/signals', requireRole('admin'), async (req: AuthRequest, res: Res
   const signalUpdateId = crypto.randomUUID();
   const now = new Date().toISOString();
   const isPremium = Boolean(d.is_premium);
+  const prevCounter = getTotalPublishedSignals();
+  let totalPublishedSignals = prevCounter;
+  let counterIncremented = false;
+  let mirrored: ReturnType<typeof publishMirrorToSignalChannel> = null;
 
-  db.prepare(
-    `INSERT INTO signals (
-      id, pair, direction, entry_price, stop_loss, tp1, tp2, tp3, tp4,
-      risk_reward, timeframe, status, classification, analysis, chart_image_url,
-      admin_remarks, is_premium, created_by, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    id,
-    d.pair.toUpperCase(),
-    d.direction,
-    d.entry_price,
-    d.stop_loss,
-    d.tp1,
-    d.tp2 || null,
-    d.tp3 || null,
-    d.tp4 || null,
-    d.risk_reward,
-    d.timeframe,
-    d.status,
-    d.classification,
-    d.analysis,
-    d.chart_image_url || null,
-    d.admin_remarks || null,
-    isPremium ? 1 : 0,
-    req.user!.id,
-    now,
-    now
-  );
+  try {
+    db.prepare(
+      `INSERT INTO signals (
+        id, pair, direction, entry_price, stop_loss, tp1, tp2, tp3, tp4,
+        risk_reward, timeframe, status, classification, analysis, chart_image_url,
+        admin_remarks, is_premium, created_by, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      id,
+      d.pair.toUpperCase(),
+      d.direction,
+      d.entry_price,
+      d.stop_loss,
+      d.tp1,
+      d.tp2 || null,
+      d.tp3 || null,
+      d.tp4 || null,
+      d.risk_reward,
+      d.timeframe,
+      d.status,
+      d.classification,
+      d.analysis,
+      d.chart_image_url || null,
+      d.admin_remarks || null,
+      isPremium ? 1 : 0,
+      req.user!.id,
+      now,
+      now
+    );
 
-  db.prepare(
-    `INSERT INTO signal_updates (id, signal_id, note, status_snapshot, created_by, created_at)
-     VALUES (?, ?, ?, ?, ?, ?)`
-  ).run(
-    signalUpdateId,
-    id,
-    `Signal published (${d.classification}): ${d.direction} ${d.pair.toUpperCase()} @ ${d.entry_price}`,
-    d.status,
-    req.user!.name,
-    now
-  );
+    db.prepare(
+      `INSERT INTO signal_updates (id, signal_id, note, status_snapshot, created_by, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).run(
+      signalUpdateId,
+      id,
+      `Signal published (${d.classification}): ${d.direction} ${d.pair.toUpperCase()} @ ${d.entry_price}`,
+      d.status,
+      req.user!.name,
+      now
+    );
 
-  const totalPublishedSignals = incrementTotalPublishedSignals();
+    totalPublishedSignals = incrementTotalPublishedSignals();
+    counterIncremented = true;
+
+    const tpList = [d.tp1, d.tp2, d.tp3, d.tp4].filter(Boolean).join(' · ');
+    const mirrorText = [
+      `${d.direction} ${d.pair.toUpperCase()} (${d.timeframe} · ${d.classification})`,
+      `Entry: ${d.entry_price} | SL: ${d.stop_loss} | TP: ${tpList} | R:R ${d.risk_reward}`,
+      d.analysis,
+      d.admin_remarks ? `Note: ${d.admin_remarks}` : '',
+    ]
+      .filter(Boolean)
+      .join('\n\n');
+
+    mirrored = !isPremium
+      ? publishMirrorToSignalChannel({
+          sourceType: 'signal',
+          sourceId: id,
+          authorId: req.user!.id,
+          authorName: 'MeridianFX Desk',
+          messageType: 'signal',
+          content: mirrorText,
+          imageUrl: d.chart_image_url || null,
+          imageName: d.chart_image_url ? `${d.pair.toUpperCase()} chart` : null,
+          createdAt: now,
+          skipRemoteSync: true,
+        })
+      : null;
+
+    await Promise.all([
+      syncSignalToRemote(id, { strict: true }),
+      syncSignalUpdateToRemote(signalUpdateId, { strict: true }),
+      syncTotalPublishedSignalsToRemote(totalPublishedSignals, { strict: true }),
+      ...(mirrored?.message?.id ? [syncSignalMessageToRemote(mirrored.message.id, { strict: true })] : []),
+    ]);
+  } catch (err) {
+    db.prepare('DELETE FROM signal_updates WHERE id = ?').run(signalUpdateId);
+    db.prepare('DELETE FROM signals WHERE id = ?').run(id);
+    if (mirrored?.created && mirrored.message?.id) {
+      db.prepare('DELETE FROM signal_messages WHERE id = ?').run(mirrored.message.id);
+    }
+    if (counterIncremented) {
+      setTotalPublishedSignals(prevCounter);
+    }
+    res.status(500).json({
+      error: err instanceof Error ? err.message : 'Failed to save trading signal to database.',
+    });
+    return;
+  }
 
   const row = db.prepare('SELECT * FROM signals WHERE id = ?').get(id) as Record<string, unknown>;
   const hydrated = hydrateSignals([row])[0];
   if (!isPremium) {
     broadcastWs('signal:created', hydrated);
   }
+  if (mirrored?.created && mirrored.message) {
+    broadcastSignalChatEvent('signals_chat:created', mirrored.message);
+  }
   broadcastWs('stats:updated', { total_published_signals: totalPublishedSignals });
-
-  const tpList = [d.tp1, d.tp2, d.tp3, d.tp4].filter(Boolean).join(' · ');
-  const mirrorText = [
-    `${d.direction} ${d.pair.toUpperCase()} (${d.timeframe} · ${d.classification})`,
-    `Entry: ${d.entry_price} | SL: ${d.stop_loss} | TP: ${tpList} | R:R ${d.risk_reward}`,
-    d.analysis,
-    d.admin_remarks ? `Note: ${d.admin_remarks}` : '',
-  ]
-    .filter(Boolean)
-    .join('\n\n');
-
-  const mirrored = !isPremium
-    ? publishMirrorToSignalChannel({
-        sourceType: 'signal',
-        sourceId: id,
-        authorId: req.user!.id,
-        authorName: req.user!.name,
-        messageType: 'signal',
-        content: mirrorText,
-        imageUrl: d.chart_image_url || null,
-        imageName: d.chart_image_url ? `${d.pair.toUpperCase()} chart` : null,
-        createdAt: now,
-      })
-    : null;
-
-  await Promise.all([
-    syncSignalToRemote(id),
-    syncSignalUpdateToRemote(signalUpdateId),
-    syncTotalPublishedSignalsToRemote(totalPublishedSignals),
-    ...(mirrored?.message?.id ? [syncSignalMessageToRemote(mirrored.message.id)] : []),
-  ]);
 
   const targetUrl = isPremium
     ? '/dashboard'
@@ -2463,6 +2623,15 @@ app.post('/api/signals', requireRole('admin'), async (req: AuthRequest, res: Res
 });
 
 app.patch('/api/signals/:id', requireRole('admin'), async (req: AuthRequest, res: Response) => {
+  try {
+    assertPersistentDatabaseReady();
+  } catch (err) {
+    res.status(500).json({
+      error: err instanceof Error ? err.message : 'Database persistence is not configured.',
+    });
+    return;
+  }
+
   const existing = db.prepare('SELECT * FROM signals WHERE id = ?').get(req.params.id) as
     | Record<string, unknown>
     | undefined;
@@ -2483,37 +2652,6 @@ app.patch('/api/signals/:id', requireRole('admin'), async (req: AuthRequest, res
   const nextPair = (d.pair ?? String(existing.pair)).toUpperCase();
   const nextIsPremium = d.is_premium !== undefined ? Boolean(d.is_premium) : Boolean(existing.is_premium);
 
-  db.prepare(
-    `UPDATE signals SET
-      pair = ?, direction = ?, entry_price = ?, stop_loss = ?,
-      tp1 = ?, tp2 = ?, tp3 = ?, tp4 = ?, risk_reward = ?, timeframe = ?,
-      status = ?, classification = ?, analysis = ?, chart_image_url = ?,
-      admin_remarks = ?, is_premium = ?, updated_at = ?
-     WHERE id = ?`
-  ).run(
-    nextPair,
-    d.direction ?? existing.direction,
-    d.entry_price ?? existing.entry_price,
-    d.stop_loss ?? existing.stop_loss,
-    d.tp1 ?? existing.tp1,
-    d.tp2 !== undefined ? d.tp2 : existing.tp2,
-    d.tp3 !== undefined ? d.tp3 : existing.tp3,
-    d.tp4 !== undefined ? d.tp4 : existing.tp4,
-    d.risk_reward ?? existing.risk_reward,
-    d.timeframe ?? existing.timeframe,
-    nextStatus,
-    d.classification ?? existing.classification,
-    d.analysis ?? existing.analysis,
-    d.chart_image_url !== undefined ? d.chart_image_url : existing.chart_image_url,
-    d.admin_remarks !== undefined ? d.admin_remarks : existing.admin_remarks,
-    nextIsPremium ? 1 : 0,
-    now,
-    req.params.id
-  );
-
-  let pushJob = null;
-  let mirroredMsg = null;
-
   const statusChanged = Boolean(d.status && d.status !== existing.status);
   const levelsOrNotesChanged = Boolean(
     (d.stop_loss && d.stop_loss !== existing.stop_loss) ||
@@ -2521,34 +2659,117 @@ app.patch('/api/signals/:id', requireRole('admin'), async (req: AuthRequest, res
       (d.tp1 && d.tp1 !== existing.tp1) ||
       (d.admin_remarks && d.admin_remarks !== existing.admin_remarks)
   );
-
-  if (statusChanged || (d.send_push === true && levelsOrNotesChanged)) {
-    const signalUpdateId = crypto.randomUUID();
-    const noteText = statusChanged
+  const shouldCreateUpdate = statusChanged || (d.send_push === true && levelsOrNotesChanged);
+  const signalUpdateId = shouldCreateUpdate ? crypto.randomUUID() : null;
+  const noteText = shouldCreateUpdate
+    ? statusChanged
       ? `Status updated to ${nextStatus}.${d.admin_remarks ? ` ${d.admin_remarks}` : ''}`
-      : `Trade parameters updated (Entry ${d.entry_price ?? existing.entry_price} · SL ${d.stop_loss ?? existing.stop_loss} · TP1 ${d.tp1 ?? existing.tp1}).${d.admin_remarks ? ` ${d.admin_remarks}` : ''}`;
-    db.prepare(
-      `INSERT INTO signal_updates (id, signal_id, note, status_snapshot, created_by, created_at)
-       VALUES (?, ?, ?, ?, ?, ?)`
-    ).run(signalUpdateId, req.params.id, noteText, nextStatus, req.user!.name, now);
+      : `Trade parameters updated (Entry ${d.entry_price ?? existing.entry_price} · SL ${d.stop_loss ?? existing.stop_loss} · TP1 ${d.tp1 ?? existing.tp1}).${d.admin_remarks ? ` ${d.admin_remarks}` : ''}`
+    : '';
 
-    const mirrored = !nextIsPremium
-      ? publishMirrorToSignalChannel({
-          sourceType: 'signal_update',
-          sourceId: signalUpdateId,
-          authorId: req.user!.id,
-          authorName: req.user!.name,
-          messageType: 'update',
-          content: `${nextPair} Signal Update (${nextStatus}): ${noteText}`,
-          createdAt: now,
-        })
-      : null;
-    mirroredMsg = mirrored?.message || null;
+  let mirrored: ReturnType<typeof publishMirrorToSignalChannel> = null;
+  let mirroredMsg = null;
+
+  try {
+    db.prepare(
+      `UPDATE signals SET
+        pair = ?, direction = ?, entry_price = ?, stop_loss = ?,
+        tp1 = ?, tp2 = ?, tp3 = ?, tp4 = ?, risk_reward = ?, timeframe = ?,
+        status = ?, classification = ?, analysis = ?, chart_image_url = ?,
+        admin_remarks = ?, is_premium = ?, updated_at = ?
+       WHERE id = ?`
+    ).run(
+      nextPair,
+      d.direction ?? existing.direction,
+      d.entry_price ?? existing.entry_price,
+      d.stop_loss ?? existing.stop_loss,
+      d.tp1 ?? existing.tp1,
+      d.tp2 !== undefined ? d.tp2 : existing.tp2,
+      d.tp3 !== undefined ? d.tp3 : existing.tp3,
+      d.tp4 !== undefined ? d.tp4 : existing.tp4,
+      d.risk_reward ?? existing.risk_reward,
+      d.timeframe ?? existing.timeframe,
+      nextStatus,
+      d.classification ?? existing.classification,
+      d.analysis ?? existing.analysis,
+      d.chart_image_url !== undefined ? d.chart_image_url : existing.chart_image_url,
+      d.admin_remarks !== undefined ? d.admin_remarks : existing.admin_remarks,
+      nextIsPremium ? 1 : 0,
+      now,
+      req.params.id
+    );
+
+    if (shouldCreateUpdate && signalUpdateId) {
+      db.prepare(
+        `INSERT INTO signal_updates (id, signal_id, note, status_snapshot, created_by, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ).run(signalUpdateId, req.params.id, noteText, nextStatus, req.user!.name, now);
+
+      mirrored = !nextIsPremium
+        ? publishMirrorToSignalChannel({
+            sourceType: 'signal_update',
+            sourceId: signalUpdateId,
+            authorId: req.user!.id,
+            authorName: 'MeridianFX Desk',
+            messageType: 'update',
+            content: `${nextPair} Signal Update (${nextStatus}): ${noteText}`,
+            createdAt: now,
+            skipRemoteSync: true,
+          })
+        : null;
+      mirroredMsg = mirrored?.message || null;
+    }
 
     await Promise.all([
-      syncSignalUpdateToRemote(signalUpdateId),
-      ...(mirrored?.message?.id ? [syncSignalMessageToRemote(mirrored.message.id)] : []),
+      syncSignalToRemote(String(req.params.id), { strict: true }),
+      ...(signalUpdateId ? [syncSignalUpdateToRemote(signalUpdateId, { strict: true })] : []),
+      ...(mirrored?.message?.id ? [syncSignalMessageToRemote(mirrored.message.id, { strict: true })] : []),
     ]);
+  } catch (err) {
+    db.prepare(
+      `UPDATE signals SET
+        pair = ?, direction = ?, entry_price = ?, stop_loss = ?,
+        tp1 = ?, tp2 = ?, tp3 = ?, tp4 = ?, risk_reward = ?, timeframe = ?,
+        status = ?, classification = ?, analysis = ?, chart_image_url = ?,
+        admin_remarks = ?, is_premium = ?, updated_at = ?
+       WHERE id = ?`
+    ).run(
+      existing.pair,
+      existing.direction,
+      existing.entry_price,
+      existing.stop_loss,
+      existing.tp1,
+      existing.tp2,
+      existing.tp3,
+      existing.tp4,
+      existing.risk_reward,
+      existing.timeframe,
+      existing.status,
+      existing.classification,
+      existing.analysis,
+      existing.chart_image_url,
+      existing.admin_remarks,
+      existing.is_premium,
+      existing.updated_at,
+      req.params.id
+    );
+    if (signalUpdateId) {
+      db.prepare('DELETE FROM signal_updates WHERE id = ?').run(signalUpdateId);
+    }
+    if (mirrored?.created && mirrored.message?.id) {
+      db.prepare('DELETE FROM signal_messages WHERE id = ?').run(mirrored.message.id);
+    }
+    res.status(500).json({
+      error: err instanceof Error ? err.message : 'Failed to update trading signal in database.',
+    });
+    return;
+  }
+
+  let pushJob = null;
+  if (shouldCreateUpdate && signalUpdateId) {
+    if (mirrored?.created && mirrored.message) {
+      broadcastSignalChatEvent('signals_chat:created', mirrored.message);
+    }
 
     if (d.send_push !== false) {
       const updateBody =
@@ -2583,8 +2804,6 @@ app.patch('/api/signals/:id', requireRole('admin'), async (req: AuthRequest, res
     }
   }
 
-  await syncSignalToRemote(String(req.params.id));
-
   const updatedRow = db.prepare('SELECT * FROM signals WHERE id = ?').get(req.params.id) as Record<
     string,
     unknown
@@ -2598,6 +2817,15 @@ app.patch('/api/signals/:id', requireRole('admin'), async (req: AuthRequest, res
 });
 
 app.post('/api/signals/:id/updates', requireRole('admin'), async (req: AuthRequest, res: Response) => {
+  try {
+    assertPersistentDatabaseReady();
+  } catch (err) {
+    res.status(500).json({
+      error: err instanceof Error ? err.message : 'Database persistence is not configured.',
+    });
+    return;
+  }
+
   const existing = db.prepare('SELECT * FROM signals WHERE id = ?').get(req.params.id) as
     | Record<string, unknown>
     | undefined;
@@ -2621,17 +2849,54 @@ app.post('/api/signals/:id/updates', requireRole('admin'), async (req: AuthReque
   const nextStatus = parsed.data.status || String(existing.status);
   const isPremium = Boolean(existing.is_premium);
   const signalUpdateId = crypto.randomUUID();
+  let mirrored: ReturnType<typeof publishMirrorToSignalChannel> = null;
 
-  db.prepare('UPDATE signals SET status = ?, admin_remarks = ?, updated_at = ? WHERE id = ?').run(
-    nextStatus,
-    parsed.data.note,
-    now,
-    req.params.id
-  );
-  db.prepare(
-    `INSERT INTO signal_updates (id, signal_id, note, status_snapshot, created_by, created_at)
-     VALUES (?, ?, ?, ?, ?, ?)`
-  ).run(signalUpdateId, req.params.id, parsed.data.note, nextStatus, req.user!.name, now);
+  try {
+    db.prepare('UPDATE signals SET status = ?, admin_remarks = ?, updated_at = ? WHERE id = ?').run(
+      nextStatus,
+      parsed.data.note,
+      now,
+      req.params.id
+    );
+    db.prepare(
+      `INSERT INTO signal_updates (id, signal_id, note, status_snapshot, created_by, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).run(signalUpdateId, req.params.id, parsed.data.note, nextStatus, req.user!.name, now);
+
+    mirrored = !isPremium
+      ? publishMirrorToSignalChannel({
+          sourceType: 'signal_update',
+          sourceId: signalUpdateId,
+          authorId: req.user!.id,
+          authorName: 'MeridianFX Desk',
+          messageType: 'update',
+          content: `${String(existing.pair)} Update (${nextStatus}): ${parsed.data.note}`,
+          createdAt: now,
+          skipRemoteSync: true,
+        })
+      : null;
+
+    await Promise.all([
+      syncSignalToRemote(String(req.params.id), { strict: true }),
+      syncSignalUpdateToRemote(signalUpdateId, { strict: true }),
+      ...(mirrored?.message?.id ? [syncSignalMessageToRemote(mirrored.message.id, { strict: true })] : []),
+    ]);
+  } catch (err) {
+    db.prepare('UPDATE signals SET status = ?, admin_remarks = ?, updated_at = ? WHERE id = ?').run(
+      existing.status,
+      existing.admin_remarks,
+      existing.updated_at,
+      req.params.id
+    );
+    db.prepare('DELETE FROM signal_updates WHERE id = ?').run(signalUpdateId);
+    if (mirrored?.created && mirrored.message?.id) {
+      db.prepare('DELETE FROM signal_messages WHERE id = ?').run(mirrored.message.id);
+    }
+    res.status(500).json({
+      error: err instanceof Error ? err.message : 'Failed to save signal update to database.',
+    });
+    return;
+  }
 
   const updatedRow = db.prepare('SELECT * FROM signals WHERE id = ?').get(req.params.id) as Record<
     string,
@@ -2641,24 +2906,9 @@ app.post('/api/signals/:id/updates', requireRole('admin'), async (req: AuthReque
   if (!isPremium) {
     broadcastWs('signal:updated', hydrated);
   }
-
-  const mirrored = !isPremium
-    ? publishMirrorToSignalChannel({
-        sourceType: 'signal_update',
-        sourceId: signalUpdateId,
-        authorId: req.user!.id,
-        authorName: req.user!.name,
-        messageType: 'update',
-        content: `${String(existing.pair)} Update (${nextStatus}): ${parsed.data.note}`,
-        createdAt: now,
-      })
-    : null;
-
-  await Promise.all([
-    syncSignalToRemote(String(req.params.id)),
-    syncSignalUpdateToRemote(signalUpdateId),
-    ...(mirrored?.message?.id ? [syncSignalMessageToRemote(mirrored.message.id)] : []),
-  ]);
+  if (mirrored?.created && mirrored.message) {
+    broadcastSignalChatEvent('signals_chat:created', mirrored.message);
+  }
 
   let pushJob = null;
   if (parsed.data.send_push !== false) {
@@ -2696,12 +2946,33 @@ app.post('/api/signals/:id/updates', requireRole('admin'), async (req: AuthReque
 });
 
 app.delete('/api/signals/:id', requireRole('admin'), async (req: Request, res: Response) => {
-  const info = db.prepare('DELETE FROM signals WHERE id = ?').run(req.params.id);
-  if (info.changes === 0) {
+  try {
+    assertPersistentDatabaseReady();
+  } catch (err) {
+    res.status(500).json({
+      error: err instanceof Error ? err.message : 'Database persistence is not configured.',
+    });
+    return;
+  }
+
+  const existing = db.prepare('SELECT id FROM signals WHERE id = ?').get(req.params.id) as
+    | { id: string }
+    | undefined;
+  if (!existing) {
     res.status(404).json({ error: 'Signal not found.' });
     return;
   }
-  await deleteRemoteSignal(String(req.params.id));
+
+  try {
+    await deleteRemoteSignal(String(req.params.id), { strict: true });
+    db.prepare('DELETE FROM signals WHERE id = ?').run(req.params.id);
+  } catch (err) {
+    res.status(500).json({
+      error: err instanceof Error ? err.message : 'Failed to delete trading signal from database.',
+    });
+    return;
+  }
+
   broadcastWs('signal:deleted', { id: req.params.id });
   res.json({ ok: true });
 });

@@ -1043,6 +1043,13 @@ export function syncLocalTotalPublishedSignalsIfHigher(remoteValue: number): num
   return tx();
 }
 
+export function setTotalPublishedSignals(value: number): void {
+  const normalized = Math.max(DEFAULT_TOTAL_PUBLISHED_SIGNALS, Math.floor(value));
+  db.prepare(
+    "INSERT OR REPLACE INTO platform_settings (key, value) VALUES ('total_published_signals', ?)"
+  ).run(String(normalized));
+}
+
 function seedInitialData(): void {
   const now = new Date().toISOString();
 
@@ -1387,11 +1394,12 @@ function seedInitialData(): void {
   // Ensure a single canonical pinned Welcome Message exists for MeridianFX Signals
   const existingWelcome = db
     .prepare(
-      'SELECT id, seed_love, seed_like, seed_fire, seed_hundred, seed_views FROM signal_messages WHERE is_welcome = 1 OR source_type = \'welcome\' LIMIT 1'
+      'SELECT id, content, seed_love, seed_like, seed_fire, seed_hundred, seed_views FROM signal_messages WHERE is_welcome = 1 OR source_type = \'welcome\' LIMIT 1'
     )
     .get() as
     | {
         id: string;
+        content?: string;
         seed_love: number;
         seed_like: number;
         seed_fire: number;
@@ -1402,14 +1410,14 @@ function seedInitialData(): void {
 
   const welcomeSeeds = getWelcomeSeedReactions();
   const welcomeViews = WELCOME_SEED_VIEWS;
+  const welcomeText = [
+    'Welcome to MeridianFX Signals!',
+    'You are now connected to the official MeridianFX broadcast channel. Real-time Forex, Gold, and Crypto trade setups, chart markups, and desk alerts posted by our analysts appear here the moment they are published.',
+    '• Use the Mute / Unmute bar below anytime to control background lock-screen notifications\n• All setups are shared strictly for educational and informational analysis.',
+  ].join('\n\n');
 
   if (!existingWelcome) {
     const welcomeId = '00000000-0000-4000-8000-000000000001';
-    const welcomeText = [
-      'Welcome to MeridianFX Signals!',
-      'You are now connected to the official MeridianFX broadcast channel. Real-time Forex, Gold, and Crypto trade setups, chart markups, and desk alerts posted by our analysts appear here the moment they are published.',
-      '• Tap ❤️ 🤙 💥 💯 to react on any alert\n• Use the Mute / Unmute bar below anytime to control background lock-screen notifications\n• All setups are shared strictly for educational and informational analysis.',
-    ].join('\n\n');
 
     db.prepare(
       `INSERT OR IGNORE INTO signal_messages (
@@ -1437,11 +1445,17 @@ function seedInitialData(): void {
       now
     );
   } else {
+    const existingContent = String(existingWelcome.content || '');
+    const cleanedContent = existingContent
+      .replace(/•\s*Tap .*? to react on any alert\n?/gi, '')
+      .trim();
+
     db.prepare(
       `UPDATE signal_messages
        SET is_welcome = 1,
            pinned = 1,
            status = 'active',
+           content = ?,
            seed_love = ?,
            seed_like = ?,
            seed_fire = ?,
@@ -1453,6 +1467,7 @@ function seedInitialData(): void {
            hundred_count = ? + (SELECT COUNT(*) FROM signal_message_reactions r WHERE r.message_id = signal_messages.id AND r.reaction = 'hundred')
        WHERE id = ?`
     ).run(
+      cleanedContent || welcomeText,
       welcomeSeeds.love,
       welcomeSeeds.like,
       welcomeSeeds.fire,
