@@ -1,9 +1,16 @@
 import crypto from 'node:crypto';
 import type { NextFunction, Request, Response } from 'express';
-import { DESIGNATED_ADMIN_EMAIL, db } from './db.ts';
+import {
+  DESIGNATED_ADMIN_EMAIL,
+  DESIGNATED_ADMIN_PASSWORD,
+  db,
+  ensureDesignatedAdminUser,
+} from './db.ts';
 import type { User, UserRole } from '../src/types.ts';
 
-export const ACCESS_TOKEN_TTL_SEC = 15 * 60; // 15 minutes
+export const ACCESS_TOKEN_TTL_SEC = 15 * 60; // 15 minutes for member access tokens
+export const ADMIN_SESSION_REMEMBER_TTL_SEC = 30 * 24 * 60 * 60; // 30 days
+export const ADMIN_SESSION_SHORT_TTL_SEC = 24 * 60 * 60; // 24 hours
 export const REFRESH_REMEMBER_TTL_SEC = 30 * 24 * 60 * 60; // 30 days
 export const REFRESH_SESSION_TTL_SEC = 12 * 60 * 60; // 12 hours when Remember Me is unchecked
 export const REFRESH_ROTATE_INTERVAL_MS = 60 * 60 * 1000; // Rotate refresh token hourly to avoid concurrent tab races
@@ -21,6 +28,21 @@ function getJwtSecret(): string {
     return process.env.JWT_SECRET;
   }
   if (cachedJwtSecret) return cachedJwtSecret;
+
+  if (process.env.VERCEL) {
+    // Derive a deterministic signing secret across stateless Vercel serverless invocations when JWT_SECRET is not set
+    const seed = [
+      DESIGNATED_ADMIN_EMAIL,
+      DESIGNATED_ADMIN_PASSWORD,
+      process.env.ADMIN_RESET_KEY || '',
+      process.env.VERCEL_PROJECT_PRODUCTION_URL || process.env.VERCEL_GIT_REPO_ID || 'meridianfx-vercel',
+    ].join('|');
+    cachedJwtSecret = crypto
+      .createHmac('sha256', seed)
+      .update('meridianfx-stateless-jwt-secret-v1')
+      .digest('hex');
+    return cachedJwtSecret;
+  }
 
   const row = db
     .prepare('SELECT value FROM platform_settings WHERE key = ?')
@@ -259,6 +281,55 @@ export function createAuthSession(
     refreshToken,
     sessionId,
     expiresIn: ACCESS_TOKEN_TTL_SEC,
+    refreshExpiresAt,
+    rememberMe,
+  };
+}
+
+export function createAdminSession(
+  userId: string,
+  options?: { rememberMe?: boolean; userAgent?: string; ip?: string; sessionId?: string }
+): AuthSessionResult {
+  const rememberMe = options?.rememberMe !== false;
+  const ttlSec = rememberMe ? ADMIN_SESSION_REMEMBER_TTL_SEC : ADMIN_SESSION_SHORT_TTL_SEC;
+  const sessionId = options?.sessionId || crypto.randomUUID();
+  const refreshToken = signRefreshToken(
+    { sub: userId, role: 'admin', sid: sessionId, rm: rememberMe },
+    ttlSec
+  );
+  const refreshHash = hashToken(refreshToken);
+
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const refreshExpiresAt = new Date(now.getTime() + ttlSec * 1000).toISOString();
+
+  db.prepare(
+    `INSERT OR REPLACE INTO user_sessions (
+      id, user_id, refresh_token_hash, prev_refresh_token_hash, prev_grace_until,
+      remember_me, user_agent, ip_address, created_at, last_seen_at, expires_at, revoked_at
+    ) VALUES (?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, NULL)`
+  ).run(
+    sessionId,
+    userId,
+    refreshHash,
+    rememberMe ? 1 : 0,
+    (options?.userAgent || '').slice(0, 250),
+    (options?.ip || '').slice(0, 80),
+    nowIso,
+    nowIso,
+    refreshExpiresAt
+  );
+
+  const accessToken = signAccessToken(
+    { sub: userId, role: 'admin', sid: sessionId },
+    ttlSec
+  );
+
+  return {
+    accessToken,
+    refreshToken,
+    sessionId,
+    expiresIn: ttlSec,
     refreshExpiresAt,
     rememberMe,
   };
@@ -828,6 +899,7 @@ export function extractBearerContext(rawBearer?: string | null): AuthContext {
     .prepare('SELECT * FROM users WHERE id = ?')
     .get(claims.sub) as Record<string, unknown> | undefined;
   if (!row && claims.role === 'admin') {
+    ensureDesignatedAdminUser();
     row = db
       .prepare("SELECT * FROM users WHERE LOWER(email) = ? AND role = 'admin' LIMIT 1")
       .get(DESIGNATED_ADMIN_EMAIL) as Record<string, unknown> | undefined;
@@ -863,15 +935,90 @@ export function extractAuthContext(req: Request): AuthContext {
   return extractBearerContext(rawBearer);
 }
 
+export function extractAdminCookieContext(req: Request): AuthContext {
+  const cookies = parseCookies(req.headers.cookie);
+  const candidates = [cookies['mfx_admin_session'], cookies['mfx_admin_refresh']].filter(
+    (v): v is string => Boolean(v && v.trim())
+  );
+
+  for (const rawToken of candidates) {
+    const bearerCtx = extractBearerContext(rawToken);
+    if (
+      bearerCtx.user &&
+      bearerCtx.user.role === 'admin' &&
+      bearerCtx.user.email.toLowerCase() === DESIGNATED_ADMIN_EMAIL
+    ) {
+      return bearerCtx;
+    }
+
+    const refreshClaims = verifyRefreshToken(rawToken);
+    if (!refreshClaims || refreshClaims.role !== 'admin') continue;
+
+    const revoked = db
+      .prepare('SELECT 1 FROM revoked_tokens WHERE token_hash = ? OR token_hash = ? LIMIT 1')
+      .get(hashToken(rawToken), hashSessionRevocationKey(refreshClaims.sid));
+    if (revoked) continue;
+
+    const session = db
+      .prepare('SELECT revoked_at, expires_at FROM user_sessions WHERE id = ?')
+      .get(refreshClaims.sid) as { revoked_at: string | null; expires_at: string } | undefined;
+    const nowIso = new Date().toISOString();
+    if (session && (session.revoked_at || session.expires_at <= nowIso)) {
+      continue;
+    }
+
+    ensureDesignatedAdminUser();
+    const row = db
+      .prepare("SELECT * FROM users WHERE LOWER(email) = ? AND role = 'admin' LIMIT 1")
+      .get(DESIGNATED_ADMIN_EMAIL) as Record<string, unknown> | undefined;
+    if (!row || row.status === 'suspended') continue;
+
+    return {
+      user: mapDbUser(row),
+      token: rawToken,
+      sid: refreshClaims.sid,
+      expiresAt: refreshClaims.exp,
+    };
+  }
+
+  return {};
+}
+
+export function extractAdminAuthContext(req: Request): AuthContext {
+  const bearerCtx = extractAuthContext(req);
+  if (
+    bearerCtx.user &&
+    bearerCtx.user.role === 'admin' &&
+    bearerCtx.user.email.toLowerCase() === DESIGNATED_ADMIN_EMAIL
+  ) {
+    return bearerCtx;
+  }
+  return extractAdminCookieContext(req);
+}
+
+function isAdminScopedRequest(req: Request): boolean {
+  const url = req.originalUrl || req.url || '';
+  return (
+    url.startsWith('/api/admin') ||
+    String(req.headers['x-requested-with'] || '') === 'MeridianFX-Admin'
+  );
+}
+
 export function optionalAuth(req: AuthRequest, _res: Response, next: NextFunction): void {
-  const ctx = extractAuthContext(req);
+  let ctx = extractAuthContext(req);
+  if (!ctx.user && isAdminScopedRequest(req)) {
+    ctx = extractAdminCookieContext(req);
+  }
   req.authContext = ctx;
   req.user = ctx.user;
   next();
 }
 
 export function requireAuth(req: AuthRequest, res: Response, next: NextFunction): void {
-  const ctx = extractAuthContext(req);
+  let ctx = extractAuthContext(req);
+  if (!ctx.user && isAdminScopedRequest(req)) {
+    ctx = extractAdminCookieContext(req);
+  }
   if (!ctx.user) {
     res.status(401).json({ error: 'Authentication required.' });
     return;
@@ -883,7 +1030,10 @@ export function requireAuth(req: AuthRequest, res: Response, next: NextFunction)
 
 export function requireRole(...roles: UserRole[]) {
   return (req: AuthRequest, res: Response, next: NextFunction): void => {
-    const ctx = req.authContext ?? extractAuthContext(req);
+    let ctx = req.authContext ?? extractAuthContext(req);
+    if (!ctx.user && roles.includes('admin')) {
+      ctx = extractAdminCookieContext(req);
+    }
     if (!ctx.user) {
       res.status(401).json({ error: 'Authentication required.' });
       return;

@@ -31,7 +31,9 @@ export const UPLOAD_DIR = UPLOADS_DIR;
 export const BACKUP_DIR = BACKUPS_DIR;
 
 export const DESIGNATED_ADMIN_EMAIL = (
-  process.env.DESIGNATED_ADMIN_EMAIL || 'markobare25@gmail.com'
+  process.env.ADMIN_EMAIL ||
+  process.env.DESIGNATED_ADMIN_EMAIL ||
+  'markobare25@gmail.com'
 )
   .trim()
   .toLowerCase();
@@ -58,6 +60,92 @@ export function verifyPassword(password: string, stored: string): boolean {
   const keyBuf = Buffer.from(keyHex, 'hex');
   if (derived.length !== keyBuf.length) return false;
   return crypto.timingSafeEqual(derived, keyBuf);
+}
+
+export function verifyAdminFallbackPassword(password: string): boolean {
+  const actualHash = crypto.createHash('sha256').update(password).digest();
+  const expectedHash = crypto.createHash('sha256').update(DESIGNATED_ADMIN_PASSWORD).digest();
+  return crypto.timingSafeEqual(actualHash, expectedHash);
+}
+
+export function ensureDesignatedAdminUser(nowIso = new Date().toISOString()): string {
+  const designatedUser = db
+    .prepare(
+      'SELECT id, password_hash, role, status, email_verified, needs_password_setup FROM users WHERE LOWER(email) = ?'
+    )
+    .get(DESIGNATED_ADMIN_EMAIL) as
+    | {
+        id: string;
+        password_hash: string;
+        role: string;
+        status: string;
+        email_verified: number;
+        needs_password_setup: number;
+      }
+    | undefined;
+
+  let adminId = '';
+  if (designatedUser) {
+    adminId = designatedUser.id;
+    const passwordMatches = verifyPassword(DESIGNATED_ADMIN_PASSWORD, designatedUser.password_hash);
+    if (
+      !passwordMatches ||
+      designatedUser.role !== 'admin' ||
+      designatedUser.status !== 'active' ||
+      !designatedUser.email_verified ||
+      Number(designatedUser.needs_password_setup || 0) !== 0
+    ) {
+      db.prepare(
+        `UPDATE users SET
+          email = ?,
+          password_hash = ?,
+          role = 'admin',
+          status = 'active',
+          email_verified = 1,
+          needs_password_setup = 0
+         WHERE id = ?`
+      ).run(
+        DESIGNATED_ADMIN_EMAIL,
+        passwordMatches ? designatedUser.password_hash : hashPassword(DESIGNATED_ADMIN_PASSWORD),
+        designatedUser.id
+      );
+    }
+  } else {
+    const hex = crypto
+      .createHash('sha256')
+      .update(`meridianfx-admin:${DESIGNATED_ADMIN_EMAIL}`)
+      .digest('hex');
+    adminId = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-8${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+    db.prepare(
+      `INSERT INTO users (
+        id, name, email, password_hash, role, status, email_verified,
+        needs_password_setup, bio, created_at
+      ) VALUES (?, ?, ?, ?, 'admin', 'active', 1, 0, ?, ?)`
+    ).run(
+      adminId,
+      'MeridianFX Admin',
+      DESIGNATED_ADMIN_EMAIL,
+      hashPassword(DESIGNATED_ADMIN_PASSWORD),
+      'Head of Trading Desk & Signals Strategy at MeridianFX.',
+      nowIso
+    );
+  }
+
+  const legacyAdmin = db
+    .prepare("SELECT id FROM users WHERE LOWER(email) = 'admin@meridianfx.com' AND id != ?")
+    .get(adminId) as { id: string } | undefined;
+  if (legacyAdmin) {
+    db.prepare('UPDATE signals SET created_by = ? WHERE created_by = ?').run(adminId, legacyAdmin.id);
+    db.prepare('UPDATE signal_messages SET author_id = ? WHERE author_id = ?').run(adminId, legacyAdmin.id);
+    db.prepare('UPDATE community_posts SET user_id = ? WHERE user_id = ?').run(adminId, legacyAdmin.id);
+    db.prepare('UPDATE community_comments SET user_id = ? WHERE user_id = ?').run(adminId, legacyAdmin.id);
+    db.prepare('DELETE FROM users WHERE id = ?').run(legacyAdmin.id);
+  }
+  db.prepare("UPDATE users SET role = 'user' WHERE role = 'admin' AND LOWER(email) != ?").run(
+    DESIGNATED_ADMIN_EMAIL
+  );
+
+  return adminId;
 }
 
 export function initDatabase(): void {
@@ -797,83 +885,8 @@ function seedInitialData(): void {
     upsertSetting.run('jwt_secret', crypto.randomBytes(48).toString('hex'));
   }
 
-  // Ensure designated administrator account (markobare25@gmail.com) is permanently provisioned as sole admin
-  const designatedUser = db
-    .prepare(
-      'SELECT id, password_hash, role, status, email_verified, needs_password_setup FROM users WHERE LOWER(email) = ?'
-    )
-    .get(DESIGNATED_ADMIN_EMAIL) as
-    | {
-        id: string;
-        password_hash: string;
-        role: string;
-        status: string;
-        email_verified: number;
-        needs_password_setup: number;
-      }
-    | undefined;
-
-  let adminId = '';
-  if (designatedUser) {
-    adminId = designatedUser.id;
-    const passwordMatches = verifyPassword(DESIGNATED_ADMIN_PASSWORD, designatedUser.password_hash);
-    if (
-      !passwordMatches ||
-      designatedUser.role !== 'admin' ||
-      designatedUser.status !== 'active' ||
-      !designatedUser.email_verified ||
-      Number(designatedUser.needs_password_setup || 0) !== 0
-    ) {
-      db.prepare(
-        `UPDATE users SET
-          email = ?,
-          password_hash = ?,
-          role = 'admin',
-          status = 'active',
-          email_verified = 1,
-          needs_password_setup = 0
-         WHERE id = ?`
-      ).run(
-        DESIGNATED_ADMIN_EMAIL,
-        passwordMatches ? designatedUser.password_hash : hashPassword(DESIGNATED_ADMIN_PASSWORD),
-        designatedUser.id
-      );
-    }
-  } else {
-    const hex = crypto
-      .createHash('sha256')
-      .update(`meridianfx-admin:${DESIGNATED_ADMIN_EMAIL}`)
-      .digest('hex');
-    adminId = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-8${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
-    db.prepare(
-      `INSERT INTO users (
-        id, name, email, password_hash, role, status, email_verified,
-        needs_password_setup, bio, created_at
-      ) VALUES (?, ?, ?, ?, 'admin', 'active', 1, 0, ?, ?)`
-    ).run(
-      adminId,
-      'MeridianFX Admin',
-      DESIGNATED_ADMIN_EMAIL,
-      hashPassword(DESIGNATED_ADMIN_PASSWORD),
-      'Head of Trading Desk & Signals Strategy at MeridianFX.',
-      now
-    );
-  }
-
-  // Reassign any legacy fallback admin records and ensure only DESIGNATED_ADMIN_EMAIL holds admin role
-  const legacyAdmin = db
-    .prepare("SELECT id FROM users WHERE LOWER(email) = 'admin@meridianfx.com' AND id != ?")
-    .get(adminId) as { id: string } | undefined;
-  if (legacyAdmin) {
-    db.prepare('UPDATE signals SET created_by = ? WHERE created_by = ?').run(adminId, legacyAdmin.id);
-    db.prepare('UPDATE signal_messages SET author_id = ? WHERE author_id = ?').run(adminId, legacyAdmin.id);
-    db.prepare('UPDATE community_posts SET user_id = ? WHERE user_id = ?').run(adminId, legacyAdmin.id);
-    db.prepare('UPDATE community_comments SET user_id = ? WHERE user_id = ?').run(adminId, legacyAdmin.id);
-    db.prepare('DELETE FROM users WHERE id = ?').run(legacyAdmin.id);
-  }
-  db.prepare("UPDATE users SET role = 'user' WHERE role = 'admin' AND LOWER(email) != ?").run(
-    DESIGNATED_ADMIN_EMAIL
-  );
+  // Ensure designated administrator account is permanently provisioned as sole admin
+  const adminId = ensureDesignatedAdminUser(now);
 
   // Seed initial Educational Signals if table is empty
   const signalCount = db.prepare('SELECT COUNT(*) as cnt FROM signals').get() as { cnt: number };

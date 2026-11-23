@@ -117,6 +117,8 @@ export const AdminPage: React.FC = () => {
   const [adminAuthLoading, setAdminAuthLoading] = useState(true);
   const [bootNetworkIssue, setBootNetworkIssue] = useState(false);
   const adminUserRef = useRef<User | null>(null);
+  const adminAuthLoadingRef = useRef(true);
+  const hasAuthenticatedSessionRef = useRef(false);
   const explicitSigningOutRef = useRef(false);
   const [loginIdentifier, setLoginIdentifier] = useState('');
   const [loginPassword, setLoginPassword] = useState('');
@@ -128,6 +130,10 @@ export const AdminPage: React.FC = () => {
   useEffect(() => {
     adminUserRef.current = adminUser;
   }, [adminUser]);
+
+  useEffect(() => {
+    adminAuthLoadingRef.current = adminAuthLoading;
+  }, [adminAuthLoading]);
 
   // Dashboard State
   const [tab, setTab] = useState<AdminTab>('overview');
@@ -253,6 +259,7 @@ export const AdminPage: React.FC = () => {
   const restoreAdminSession = useCallback(async (isInitialBoot = false) => {
     const startEpoch = getAdminAuthEpoch();
     if (isInitialBoot) {
+      adminAuthLoadingRef.current = true;
       setAdminAuthLoading(true);
     }
     try {
@@ -264,12 +271,14 @@ export const AdminPage: React.FC = () => {
         setBootNetworkIssue(false);
         setLoginError(null);
         if (outcome.user.role === 'admin') {
+          hasAuthenticatedSessionRef.current = true;
           setAdminUser((prev) =>
             prev && prev.id === outcome.user.id && prev.role === outcome.user.role
               ? prev
               : outcome.user
           );
         } else {
+          hasAuthenticatedSessionRef.current = false;
           setAdminUser(null);
         }
       } else if (outcome.status === 'network_error') {
@@ -278,10 +287,12 @@ export const AdminPage: React.FC = () => {
         }
       } else {
         setBootNetworkIssue(false);
+        hasAuthenticatedSessionRef.current = false;
         setAdminUser(null);
       }
     } finally {
       if (isInitialBoot && getAdminAuthEpoch() === startEpoch) {
+        adminAuthLoadingRef.current = false;
         setAdminAuthLoading(false);
       }
     }
@@ -293,7 +304,15 @@ export const AdminPage: React.FC = () => {
     void restoreAdminSession(true);
 
     const handleExpired = () => {
-      if (!active || explicitSigningOutRef.current) return;
+      if (
+        !active ||
+        explicitSigningOutRef.current ||
+        adminAuthLoadingRef.current ||
+        !hasAuthenticatedSessionRef.current
+      ) {
+        return;
+      }
+      hasAuthenticatedSessionRef.current = false;
       setAdminUser(null);
       setOverview(null);
       setRegistrations(null);
@@ -304,6 +323,7 @@ export const AdminPage: React.FC = () => {
     const unsubscribeSync = subscribeAdminAuthSync((eventType) => {
       if (!active) return;
       if (eventType === 'logout') {
+        hasAuthenticatedSessionRef.current = false;
         setAdminUser(null);
         setOverview(null);
         setRegistrations(null);
@@ -382,18 +402,29 @@ export const AdminPage: React.FC = () => {
         timerId = null;
       }
       const remainingMs = getAdminAccessTokenRemainingMs();
-      const targetDelay =
+      // Clamp timeout to <= 6 hours to prevent 32-bit setTimeout integer overflow on 30-day tokens
+      const maxTimeoutMs = 6 * 60 * 60 * 1000;
+      const computedDelay =
         typeof delayMs === 'number'
           ? Math.max(10_000, delayMs)
-          : Math.max(20_000, remainingMs - 120_000);
+          : remainingMs > 0
+            ? Math.max(60_000, remainingMs - 120_000)
+            : maxTimeoutMs;
+      const targetDelay = Math.min(computedDelay, maxTimeoutMs);
 
       timerId = window.setTimeout(async () => {
         if (cancelled) return;
+        const currentRemaining = getAdminAccessTokenRemainingMs();
+        if (currentRemaining > 180_000) {
+          scheduleRenewal();
+          return;
+        }
         const epochBefore = getAdminAuthEpoch();
         const res = await refreshAdminSessionDetailed();
         if (cancelled || getAdminAuthEpoch() !== epochBefore) return;
 
         if (res.status === 'ok') {
+          hasAuthenticatedSessionRef.current = true;
           setAdminUser((prev) =>
             prev && prev.id === res.user.id && prev.role === res.user.role ? prev : res.user
           );
@@ -401,7 +432,8 @@ export const AdminPage: React.FC = () => {
         } else if (res.status === 'network_error') {
           // Keep current session alive and retry shortly when network settles
           scheduleRenewal(30_000);
-        } else {
+        } else if (hasAuthenticatedSessionRef.current && !explicitSigningOutRef.current) {
+          hasAuthenticatedSessionRef.current = false;
           setAdminUser(null);
           setOverview(null);
           setRegistrations(null);
@@ -411,18 +443,24 @@ export const AdminPage: React.FC = () => {
     };
 
     const refreshIfNeededOnResume = async () => {
-      if (cancelled) return;
+      if (cancelled || !hasAuthenticatedSessionRef.current) return;
       if (document.visibilityState === 'hidden') return;
       if (!getAdminAccessToken() || getAdminAccessTokenRemainingMs() < 180_000) {
         const epochBefore = getAdminAuthEpoch();
         const res = await refreshAdminSessionDetailed();
         if (cancelled || getAdminAuthEpoch() !== epochBefore) return;
         if (res.status === 'ok') {
+          hasAuthenticatedSessionRef.current = true;
           setAdminUser((prev) =>
             prev && prev.id === res.user.id && prev.role === res.user.role ? prev : res.user
           );
           scheduleRenewal();
-        } else if (res.status === 'unauthorized') {
+        } else if (
+          res.status === 'unauthorized' &&
+          hasAuthenticatedSessionRef.current &&
+          !explicitSigningOutRef.current
+        ) {
+          hasAuthenticatedSessionRef.current = false;
           setAdminUser(null);
           setOverview(null);
           setRegistrations(null);
@@ -570,11 +608,17 @@ export const AdminPage: React.FC = () => {
     explicitSigningOutRef.current = false;
     try {
       const res = await loginAdmin(loginIdentifier.trim(), loginPassword, rememberMe);
-      setAdminUser(res.user);
+      if (!res.access_token && !getAdminAccessToken()) {
+        throw new Error('Administrator session token could not be verified.');
+      }
+      hasAuthenticatedSessionRef.current = true;
+      adminAuthLoadingRef.current = false;
+      setAdminAuthLoading(false);
       setLoginPassword('');
       setLoginError(null);
-      setAdminAuthLoading(false);
+      setAdminUser(res.user);
     } catch (err) {
+      hasAuthenticatedSessionRef.current = false;
       setLoginError(
         err instanceof Error ? err.message : 'Unable to sign in to administrator console.'
       );
@@ -585,6 +629,7 @@ export const AdminPage: React.FC = () => {
 
   const handleAdminSignOut = async () => {
     explicitSigningOutRef.current = true;
+    hasAuthenticatedSessionRef.current = false;
     try {
       await logoutAdmin();
     } finally {
@@ -775,7 +820,7 @@ export const AdminPage: React.FC = () => {
         </div>
 
         <p className="text-center text-[11px] text-slate-400">
-          Isolated Administrator Desk · Protected by HTTP-Only Scoped Refresh Cookie
+          Isolated Administrator Desk · Protected by HTTP-Only Session Cookie & Bearer Token
         </p>
       </div>
     );
@@ -803,15 +848,16 @@ export const AdminPage: React.FC = () => {
         const refreshed = await refreshAdminSession();
         token = refreshed?.token || null;
       }
-      if (!token) throw new Error('Administrator session required to download backups.');
+
+      const headers: Record<string, string> = {
+        'X-Requested-With': 'MeridianFX-Admin',
+      };
+      if (token) headers.Authorization = `Bearer ${token}`;
 
       let res = await fetch(`/api/admin/backups/${encodeURIComponent(filename)}`, {
         credentials: 'include',
         cache: 'no-store',
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'X-Requested-With': 'MeridianFX-Admin',
-        },
+        headers,
       });
       if (res.status === 401) {
         const refreshed = await refreshAdminSessionDetailed();

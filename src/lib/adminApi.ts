@@ -1,5 +1,8 @@
 import type { User } from '../types';
 
+const ADMIN_TOKEN_STORAGE_KEY = 'mfx_admin_token';
+const ADMIN_TOKEN_EXP_STORAGE_KEY = 'mfx_admin_token_exp';
+
 let adminAccessToken: string | null = null;
 let adminAccessExpiresAt = 0;
 let adminAuthEpoch = 0;
@@ -16,6 +19,32 @@ export type AdminBootstrapOutcome =
   | { status: 'authenticated'; user: User; expiresInMs: number }
   | { status: 'unauthenticated' }
   | { status: 'network_error' };
+
+function isValidJwtFormat(token: string | null | undefined): token is string {
+  return Boolean(
+    token && token !== 'null' && token !== 'undefined' && token.split('.').length === 3
+  );
+}
+
+function hydrateFromStorage(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const storedToken = window.localStorage.getItem(ADMIN_TOKEN_STORAGE_KEY);
+    const storedExpRaw = window.localStorage.getItem(ADMIN_TOKEN_EXP_STORAGE_KEY);
+    const storedExp = storedExpRaw ? Number(storedExpRaw) : 0;
+    if (isValidJwtFormat(storedToken) && Number.isFinite(storedExp) && storedExp > Date.now()) {
+      adminAccessToken = storedToken;
+      adminAccessExpiresAt = storedExp;
+    } else if (storedToken || storedExpRaw) {
+      window.localStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+      window.localStorage.removeItem(ADMIN_TOKEN_EXP_STORAGE_KEY);
+    }
+  } catch {
+    // ignore storage access errors
+  }
+}
+
+hydrateFromStorage();
 
 function postAdminSyncMessage(type: 'login' | 'logout'): void {
   if (typeof BroadcastChannel === 'undefined') return;
@@ -37,6 +66,12 @@ export function subscribeAdminAuthSync(
     ch.onmessage = (evt) => {
       const msg = evt.data as { type?: string } | undefined;
       if (msg?.type === 'login' || msg?.type === 'logout') {
+        if (msg.type === 'login') {
+          hydrateFromStorage();
+        } else {
+          adminAccessToken = null;
+          adminAccessExpiresAt = 0;
+        }
         onEvent(msg.type);
       }
     };
@@ -57,33 +92,46 @@ export function getAdminAuthEpoch(): number {
 }
 
 export function getAdminAccessToken(): string | null {
-  if (adminAccessToken && adminAccessToken.split('.').length === 3) {
+  if (!isValidJwtFormat(adminAccessToken) || (adminAccessExpiresAt > 0 && adminAccessExpiresAt <= Date.now())) {
+    hydrateFromStorage();
+  }
+  if (isValidJwtFormat(adminAccessToken) && (adminAccessExpiresAt === 0 || adminAccessExpiresAt > Date.now())) {
     return adminAccessToken;
   }
   return null;
 }
 
 export function getAdminAccessTokenRemainingMs(): number {
-  if (!adminAccessToken || !adminAccessExpiresAt) return 0;
+  const token = getAdminAccessToken();
+  if (!token || !adminAccessExpiresAt) return 0;
   return Math.max(0, adminAccessExpiresAt - Date.now());
 }
 
-export function setAdminAccessToken(token: string | null, expiresInSec = 900): void {
-  const valid = Boolean(
-    token && token !== 'null' && token !== 'undefined' && token.split('.').length === 3
-  );
-  if (valid && token) {
+export function setAdminAccessToken(token: string | null, expiresInSec = 86400): void {
+  if (isValidJwtFormat(token)) {
+    const expiresAt = Date.now() + Math.max(30, expiresInSec) * 1000;
     adminAccessToken = token;
-    adminAccessExpiresAt = Date.now() + Math.max(30, expiresInSec) * 1000;
+    adminAccessExpiresAt = expiresAt;
+    try {
+      window.localStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, token);
+      window.localStorage.setItem(ADMIN_TOKEN_EXP_STORAGE_KEY, String(expiresAt));
+    } catch {
+      // ignore storage quota/privacy errors
+    }
   } else {
-    adminAccessToken = null;
-    adminAccessExpiresAt = 0;
+    clearAdminAccessToken();
   }
 }
 
 export function clearAdminAccessToken(): void {
   adminAccessToken = null;
   adminAccessExpiresAt = 0;
+  try {
+    window.localStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+    window.localStorage.removeItem(ADMIN_TOKEN_EXP_STORAGE_KEY);
+  } catch {
+    // ignore storage errors
+  }
 }
 
 export async function refreshAdminSessionDetailed(): Promise<AdminRefreshOutcome> {
@@ -94,20 +142,26 @@ export async function refreshAdminSessionDetailed(): Promise<AdminRefreshOutcome
 
   const promise = (async (): Promise<AdminRefreshOutcome> => {
     try {
+      const currentToken = getAdminAccessToken();
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'X-Requested-With': 'MeridianFX-Admin',
+      };
+      if (currentToken) {
+        headers.Authorization = `Bearer ${currentToken}`;
+      }
+
       const res = await fetch('/api/admin/auth/refresh', {
         method: 'POST',
         credentials: 'include',
         cache: 'no-store',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Requested-With': 'MeridianFX-Admin',
-        },
+        headers,
         body: '{}',
       });
 
       if (adminAuthEpoch !== startEpoch) {
-        const currentToken = getAdminAccessToken();
-        if (currentToken) {
+        const latestToken = getAdminAccessToken();
+        if (latestToken) {
           return { status: 'network_error' };
         }
         return { status: 'unauthorized' };
@@ -124,18 +178,20 @@ export async function refreshAdminSessionDetailed(): Promise<AdminRefreshOutcome
 
       const data = (await res.json()) as {
         user?: User;
+        token?: string;
         access_token?: string;
         expires_in?: number;
         remember_me?: boolean;
       };
 
-      if (data.access_token && data.user && data.user.role === 'admin') {
-        const expiresIn = typeof data.expires_in === 'number' ? data.expires_in : 900;
-        setAdminAccessToken(data.access_token, expiresIn);
+      const nextToken = data.access_token || data.token;
+      if (nextToken && data.user && data.user.role === 'admin') {
+        const expiresIn = typeof data.expires_in === 'number' ? data.expires_in : 86400;
+        setAdminAccessToken(nextToken, expiresIn);
         return {
           status: 'ok',
           user: data.user,
-          token: data.access_token,
+          token: nextToken,
           expiresIn,
           rememberMe: data.remember_me !== false,
         };
@@ -168,37 +224,52 @@ export async function bootstrapAdminSessionDetailed(): Promise<AdminBootstrapOut
   const startEpoch = adminAuthEpoch;
   const current = getAdminAccessToken();
 
-  if (current && getAdminAccessTokenRemainingMs() > 15_000) {
-    try {
-      const res = await fetch('/api/admin/auth/me', {
-        credentials: 'include',
-        cache: 'no-store',
-        headers: {
-          Authorization: `Bearer ${current}`,
-          'X-Requested-With': 'MeridianFX-Admin',
-        },
-      });
-      if (adminAuthEpoch !== startEpoch) {
-        return { status: 'network_error' };
-      }
-      if (res.ok) {
-        const data = (await res.json()) as { user?: User | null };
-        if (data.user && data.user.role === 'admin') {
-          return {
-            status: 'authenticated',
-            user: data.user,
-            expiresInMs: getAdminAccessTokenRemainingMs(),
-          };
-        }
-      }
-      if (res.status !== 401 && res.status !== 403 && !res.ok) {
-        return { status: 'network_error' };
-      }
-    } catch {
+  try {
+    const headers: Record<string, string> = {
+      'X-Requested-With': 'MeridianFX-Admin',
+    };
+    if (current) {
+      headers.Authorization = `Bearer ${current}`;
+    }
+
+    const res = await fetch('/api/admin/auth/me', {
+      credentials: 'include',
+      cache: 'no-store',
+      headers,
+    });
+
+    if (adminAuthEpoch !== startEpoch) {
       return { status: 'network_error' };
     }
+
+    if (res.ok) {
+      const data = (await res.json()) as {
+        user?: User | null;
+        token?: string;
+        access_token?: string;
+        expires_in?: number;
+      };
+      if (data.user && data.user.role === 'admin') {
+        const returnedToken = data.access_token || data.token;
+        if (returnedToken) {
+          setAdminAccessToken(returnedToken, data.expires_in || 86400);
+        }
+        return {
+          status: 'authenticated',
+          user: data.user,
+          expiresInMs: getAdminAccessTokenRemainingMs() || (data.expires_in ? data.expires_in * 1000 : 86400_000),
+        };
+      }
+    }
+
+    if (res.status !== 401 && res.status !== 403 && !res.ok) {
+      return { status: 'network_error' };
+    }
+  } catch {
+    return { status: 'network_error' };
   }
 
+  // Fallback to refresh endpoint (handles legacy mfx_admin_refresh cookie upgrade)
   const refreshed = await refreshAdminSessionDetailed();
   if (refreshed.status === 'ok') {
     return {
@@ -210,6 +281,7 @@ export async function bootstrapAdminSessionDetailed(): Promise<AdminBootstrapOut
   if (refreshed.status === 'network_error') {
     return { status: 'network_error' };
   }
+  clearAdminAccessToken();
   return { status: 'unauthenticated' };
 }
 
@@ -255,14 +327,23 @@ export async function loginAdmin(
 
   const typed = data as {
     user: User;
-    access_token: string;
-    expires_in: number;
+    token?: string;
+    access_token?: string;
+    expires_in?: number;
   };
+  const sessionToken = typed.access_token || typed.token || '';
+  const expiresIn = typeof typed.expires_in === 'number' ? typed.expires_in : rememberMe ? 2592000 : 86400;
+
   adminAuthEpoch += 1;
   adminRefreshInFlight = null;
-  setAdminAccessToken(typed.access_token, typed.expires_in || 900);
+  setAdminAccessToken(sessionToken, expiresIn);
   postAdminSyncMessage('login');
-  return typed;
+
+  return {
+    user: typed.user,
+    access_token: sessionToken,
+    expires_in: expiresIn,
+  };
 }
 
 export async function logoutAdmin(): Promise<void> {
@@ -315,7 +396,8 @@ export async function adminApiFetch<T = unknown>(
     url.startsWith('/api/admin/auth/refresh') ||
     url.startsWith('/api/admin/auth/logout');
 
-  if (!skipAutoRefresh && (!getAdminAccessToken() || getAdminAccessTokenRemainingMs() < 60_000)) {
+  const existingToken = getAdminAccessToken();
+  if (!skipAutoRefresh && existingToken && getAdminAccessTokenRemainingMs() < 60_000) {
     const preRefresh = await refreshAdminSessionDetailed();
     if (preRefresh.status === 'unauthorized') {
       if (adminAuthEpoch === callEpoch) {
@@ -323,11 +405,6 @@ export async function adminApiFetch<T = unknown>(
         window.dispatchEvent(new CustomEvent('mfx:admin-auth-expired'));
       }
       throw new Error('Administrator session expired. Please sign in again.');
-    }
-    if (preRefresh.status === 'network_error' && !getAdminAccessToken()) {
-      throw new Error(
-        'Network connection unavailable. Your administrator session is preserved and will resume once connected.'
-      );
     }
   }
 

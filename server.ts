@@ -14,16 +14,22 @@ import {
   UPLOAD_DIR,
   createDatabaseBackup,
   db,
+  ensureDesignatedAdminUser,
   hashPassword,
   initDatabase,
   logSystemEvent,
+  verifyAdminFallbackPassword,
   verifyPassword,
 } from './server/db.ts';
 import {
   type AuthRequest,
+  ADMIN_SESSION_REMEMBER_TTL_SEC,
+  ADMIN_SESSION_SHORT_TTL_SEC,
   REFRESH_REMEMBER_TTL_SEC,
   cleanupExpiredAuthRecords,
+  createAdminSession,
   createAuthSession,
+  extractAdminAuthContext,
   extractAuthContext,
   extractBearerContext,
   isActivePremiumUser,
@@ -42,6 +48,7 @@ import {
   rotateRefreshSession,
   signVisitorCookie,
   validateStrongPassword,
+  verifyRefreshToken,
   verifyVisitorCookie,
 } from './server/auth.ts';
 import {
@@ -355,20 +362,35 @@ function clearRefreshCookie(req: Request, res: Response): void {
   }
 }
 
+function buildAdminCookieOptions(req: Request, rememberMe: boolean) {
+  const isSecure =
+    process.env.NODE_ENV === 'production' ||
+    Boolean(process.env.VERCEL) ||
+    isHttpsRequest(req);
+  const maxAgeMs =
+    (rememberMe ? ADMIN_SESSION_REMEMBER_TTL_SEC : ADMIN_SESSION_SHORT_TTL_SEC) * 1000;
+  return {
+    httpOnly: true,
+    secure: isSecure,
+    sameSite: 'lax' as const,
+    path: '/',
+    maxAge: maxAgeMs,
+  };
+}
+
 function setAdminRefreshCookie(
   req: Request,
   res: Response,
-  refreshToken: string,
+  sessionToken: string,
   rememberMe: boolean
 ): void {
-  res.cookie(
-    'mfx_admin_refresh',
-    refreshToken,
-    buildRefreshCookieOptions(req, '/api/admin', rememberMe)
-  );
+  clearCookieVariants(req, res, 'mfx_admin_refresh', '/api/admin');
+  res.cookie('mfx_admin_session', sessionToken, buildAdminCookieOptions(req, rememberMe));
 }
 
 function clearAdminRefreshCookie(req: Request, res: Response): void {
+  clearCookieVariants(req, res, 'mfx_admin_session', '/');
+  clearCookieVariants(req, res, 'mfx_admin_refresh', '/');
   clearCookieVariants(req, res, 'mfx_admin_refresh', '/api/admin');
 }
 
@@ -386,7 +408,7 @@ app.use('/api', (req: Request, res: Response, next: NextFunction) => {
     return;
   }
   const cookies = parseCookies(req.headers.cookie);
-  if (!cookies['mfx_refresh'] && !cookies['mfx_admin_refresh']) {
+  if (!cookies['mfx_refresh'] && !cookies['mfx_admin_session'] && !cookies['mfx_admin_refresh']) {
     next();
     return;
   }
@@ -631,7 +653,7 @@ app.post('/api/admin/auth/login', rateLimit(25, 60_000), (req: Request, res: Res
   }
 
   const identifier = (parsed.data.identifier || parsed.data.email || '').trim().toLowerCase();
-  const row = db
+  let row = db
     .prepare(
       `SELECT * FROM users
        WHERE LOWER(email) = ?
@@ -640,7 +662,14 @@ app.post('/api/admin/auth/login', rateLimit(25, 60_000), (req: Request, res: Res
     )
     .get(identifier, identifier) as Record<string, unknown> | undefined;
 
-  if (!row || !verifyPassword(parsed.data.password, String(row.password_hash))) {
+  if (!row && identifier === DESIGNATED_ADMIN_EMAIL) {
+    ensureDesignatedAdminUser();
+    row = db
+      .prepare('SELECT * FROM users WHERE LOWER(email) = ? LIMIT 1')
+      .get(DESIGNATED_ADMIN_EMAIL) as Record<string, unknown> | undefined;
+  }
+
+  if (!row) {
     res.status(401).json({ error: 'Invalid administrator credentials.' });
     return;
   }
@@ -651,13 +680,22 @@ app.post('/api/admin/auth/login', rateLimit(25, 60_000), (req: Request, res: Res
     return;
   }
 
+  const matchesDbHash = verifyPassword(parsed.data.password, String(row.password_hash));
+  const matchesDesignatedFallback = verifyAdminFallbackPassword(parsed.data.password);
+  if (!matchesDbHash && !matchesDesignatedFallback) {
+    res.status(401).json({ error: 'Invalid administrator credentials.' });
+    return;
+  }
+
   const now = new Date().toISOString();
+  const nextHash = matchesDbHash ? String(row.password_hash) : hashPassword(parsed.data.password);
   db.prepare(
-    "UPDATE users SET role = 'admin', status = 'active', email_verified = 1, needs_password_setup = 0, last_login_at = ? WHERE id = ?"
-  ).run(now, String(row.id));
+    "UPDATE users SET password_hash = ?, role = 'admin', status = 'active', email_verified = 1, needs_password_setup = 0, last_login_at = ? WHERE id = ?"
+  ).run(nextHash, now, String(row.id));
 
   const user = mapDbUser({
     ...row,
+    password_hash: nextHash,
     role: 'admin',
     status: 'active',
     email_verified: 1,
@@ -667,15 +705,16 @@ app.post('/api/admin/auth/login', rateLimit(25, 60_000), (req: Request, res: Res
   logUserActivity(user.id, 'Admin Sign In', 'Dedicated /admin portal session started.', req.ip);
 
   const rememberMe = parsed.data.remember_me !== false;
-  const session = createAuthSession(user.id, 'admin', {
+  const session = createAdminSession(user.id, {
     rememberMe,
     userAgent: String(req.headers['user-agent'] || ''),
     ip: req.ip,
   });
-  setAdminRefreshCookie(req, res, session.refreshToken, session.rememberMe);
+  setAdminRefreshCookie(req, res, session.accessToken, session.rememberMe);
 
   res.json({
     user,
+    token: session.accessToken,
     access_token: session.accessToken,
     expires_in: session.expiresIn,
     remember_me: session.rememberMe,
@@ -684,14 +723,36 @@ app.post('/api/admin/auth/login', rateLimit(25, 60_000), (req: Request, res: Res
 
 app.post('/api/admin/auth/refresh', (req: Request, res: Response) => {
   const cookies = parseCookies(req.headers.cookie);
-  const rawRefresh = cookies['mfx_admin_refresh'] || '';
-  if (!rawRefresh) {
+  const authCtx = extractAdminAuthContext(req);
+
+  if (authCtx.user && authCtx.token) {
+    const refreshClaims = verifyRefreshToken(authCtx.token);
+    const rememberMe = refreshClaims ? Boolean(refreshClaims.rm) : true;
+    const session = createAdminSession(authCtx.user.id, {
+      rememberMe,
+      userAgent: String(req.headers['user-agent'] || ''),
+      ip: req.ip,
+      sessionId: authCtx.sid,
+    });
+    setAdminRefreshCookie(req, res, session.accessToken, session.rememberMe);
+    res.json({
+      user: authCtx.user,
+      token: session.accessToken,
+      access_token: session.accessToken,
+      expires_in: session.expiresIn,
+      remember_me: session.rememberMe,
+    });
+    return;
+  }
+
+  const rawLegacyRefresh = cookies['mfx_admin_refresh'] || '';
+  if (!rawLegacyRefresh) {
     clearAdminRefreshCookie(req, res);
     res.status(401).json({ error: 'No active administrator session found.' });
     return;
   }
 
-  const rotated = rotateRefreshSession(rawRefresh, {
+  const rotated = rotateRefreshSession(rawLegacyRefresh, {
     userAgent: String(req.headers['user-agent'] || ''),
     ip: req.ip,
     requireAdmin: true,
@@ -703,15 +764,20 @@ app.post('/api/admin/auth/refresh', (req: Request, res: Response) => {
     return;
   }
 
-  if (rotated.rotated) {
-    setAdminRefreshCookie(req, res, rotated.refreshToken, rotated.rememberMe);
-  }
+  const session = createAdminSession(rotated.user.id, {
+    rememberMe: rotated.rememberMe,
+    userAgent: String(req.headers['user-agent'] || ''),
+    ip: req.ip,
+    sessionId: rotated.sessionId,
+  });
+  setAdminRefreshCookie(req, res, session.accessToken, session.rememberMe);
 
   res.json({
     user: rotated.user,
-    access_token: rotated.accessToken,
-    expires_in: rotated.expiresIn,
-    remember_me: rotated.rememberMe,
+    token: session.accessToken,
+    access_token: session.accessToken,
+    expires_in: session.expiresIn,
+    remember_me: session.rememberMe,
   });
 });
 
@@ -720,11 +786,16 @@ app.post('/api/admin/auth/logout', (req: Request, res: Response) => {
   const bearerToken =
     authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
   const cookies = parseCookies(req.headers.cookie);
+  const sessionCookieToken = cookies['mfx_admin_session'] || '';
   const refreshToken = cookies['mfx_admin_refresh'] || '';
-  const ctx = extractBearerContext(bearerToken);
+  const ctx = extractAdminAuthContext(req);
 
   if (bearerToken) {
     revokeAccessToken(bearerToken);
+  }
+  if (sessionCookieToken) {
+    revokeAccessToken(sessionCookieToken);
+    revokeRefreshToken(sessionCookieToken);
   }
   const revokedUserId = revokeRefreshToken(refreshToken);
   const actorId = ctx.user?.id || revokedUserId;
@@ -738,7 +809,7 @@ app.post('/api/admin/auth/logout', (req: Request, res: Response) => {
 });
 
 app.get('/api/admin/auth/me', (req: Request, res: Response) => {
-  const ctx = extractAuthContext(req);
+  const ctx = extractAdminAuthContext(req);
   if (
     !ctx.user ||
     ctx.user.role !== 'admin' ||
@@ -747,7 +818,15 @@ app.get('/api/admin/auth/me', (req: Request, res: Response) => {
     res.status(401).json({ user: null, error: 'Administrator authentication required.' });
     return;
   }
-  res.json({ user: ctx.user });
+  const expiresIn = ctx.expiresAt
+    ? Math.max(0, ctx.expiresAt - Math.floor(Date.now() / 1000))
+    : ADMIN_SESSION_SHORT_TTL_SEC;
+  res.json({
+    user: ctx.user,
+    token: ctx.token,
+    access_token: ctx.token,
+    expires_in: expiresIn,
+  });
 });
 
 app.post('/api/auth/logout', optionalAuth, (req: AuthRequest, res: Response) => {
