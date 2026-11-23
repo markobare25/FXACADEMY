@@ -42,6 +42,8 @@ registerRoute(
     url.pathname.startsWith('/api/admin/') ||
     url.pathname === '/api/signals/stream' ||
     url.pathname.startsWith('/api/signals/messages') ||
+    url.pathname === '/api/updates/news' ||
+    url.pathname === '/api/updates/calendar' ||
     url.searchParams.get('includeAll') === 'true',
   new NetworkOnly()
 );

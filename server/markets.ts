@@ -1,4 +1,5 @@
-import type { EconomicEvent, MarketCandle, MarketInstrument } from '../src/types.ts';
+import crypto from 'node:crypto';
+import type { EconomicEvent, LiveNewsArticle, MarketCandle, MarketInstrument } from '../src/types.ts';
 import { logSystemEvent } from './db.ts';
 
 interface InstrumentDef {
@@ -42,17 +43,23 @@ interface CacheEntry<T> {
 
 const quotesCache: { entry: CacheEntry<MarketInstrument[]> | null } = { entry: null };
 const candlesCache = new Map<string, CacheEntry<{ candles: MarketCandle[]; status: 'live' | 'delayed' | 'unavailable'; source: string }>>();
-const calendarCache: { entry: CacheEntry<{ status: 'live' | 'unavailable'; source: string; events: EconomicEvent[]; message?: string }> | null } = { entry: null };
+const calendarCache: { entry: CacheEntry<{ status: 'live' | 'unavailable'; source: string; fetched_at: string; events: EconomicEvent[]; message?: string }> | null } = { entry: null };
+const newsCache: { entry: CacheEntry<{ status: 'live' | 'unavailable'; fetched_at: string; sources: string[]; articles: LiveNewsArticle[]; message?: string }> | null } = { entry: null };
 
-async function fetchWithTimeout(url: string, timeoutMs = 5000): Promise<globalThis.Response> {
+async function fetchWithTimeout(
+  url: string,
+  timeoutMs = 5000,
+  extraHeaders: Record<string, string> = {}
+): Promise<globalThis.Response> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await fetch(url, {
       signal: controller.signal,
       headers: {
-        'User-Agent': 'MeridianFX-Platform/1.0',
-        Accept: 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        Accept: 'application/json, application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8',
+        ...extraHeaders,
       },
     });
   } finally {
@@ -362,22 +369,517 @@ export async function getMarketCandles(
   return { candles: [], status: 'unavailable', source: 'Market chart feed unavailable' };
 }
 
-export async function getEconomicCalendar(): Promise<{
+function decodeHtmlEntities(input: string): string {
+  return input
+    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&rsquo;/g, '’')
+    .replace(/&lsquo;/g, '‘')
+    .replace(/&rdquo;/g, '”')
+    .replace(/&ldquo;/g, '“')
+    .replace(/&mdash;/g, '—')
+    .replace(/&ndash;/g, '–')
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => {
+      const code = Number.parseInt(hex, 16);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : '';
+    })
+    .replace(/&#(\d+);/g, (_, dec) => {
+      const code = Number.parseInt(dec, 10);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : '';
+    });
+}
+
+function htmlToCleanText(raw: string, preserveParagraphs = false): string {
+  if (!raw) return '';
+  let text = decodeHtmlEntities(raw);
+  // Decode double-encoded HTML entities (common in RSS description payloads)
+  text = decodeHtmlEntities(text);
+  if (preserveParagraphs) {
+    text = text
+      .replace(/<\/(p|div|li|h[1-6]|blockquote)>/gi, '\n\n')
+      .replace(/<br\s*\/?>/gi, '\n')
+      .replace(/<li[^>]*>/gi, '• ');
+  }
+  text = text.replace(/<[^>]+>/g, ' ');
+  if (preserveParagraphs) {
+    return text
+      .split('\n')
+      .map((line) => line.replace(/[ \t]+/g, ' ').trim())
+      .join('\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+  return text.replace(/\s+/g, ' ').trim();
+}
+
+function extractXmlTag(block: string, tagNames: string[]): string {
+  for (const tag of tagNames) {
+    const escaped = tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(`<${escaped}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${escaped}>`, 'i');
+    const match = block.match(regex);
+    if (match?.[1]) {
+      return match[1].trim();
+    }
+  }
+  return '';
+}
+
+function extractXmlAttr(block: string, tagNames: string[], attrName: string): string {
+  for (const tag of tagNames) {
+    const escaped = tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(`<${escaped}\\s+[^>]*${attrName}=["']([^"']+)["'][^>]*>`, 'i');
+    const match = block.match(regex);
+    if (match?.[1]) {
+      return match[1].trim();
+    }
+  }
+  return '';
+}
+
+function detectAssetTags(text: string): string[] {
+  const tags: string[] = [];
+  const rules: Array<{ tag: string; re: RegExp }> = [
+    { tag: 'XAU/USD', re: /\b(xau\/?usd|gold|bullion|precious metal|xau)\b/i },
+    { tag: 'EUR/USD', re: /\b(eur\/?usd|eur\/?[a-z]{3}|eurozone|ecb|euro\b|lagarde)\b/i },
+    { tag: 'GBP/USD', re: /\b(gbp\/?usd|gbp\/?[a-z]{3}|sterling|pound|boe|bank of england|uk economy|uk cpi)\b/i },
+    { tag: 'USD/JPY', re: /\b(usd\/?jpy|[a-z]{3}\/?jpy|yen|boj|bank of japan|japanese)\b/i },
+    { tag: 'Oil', re: /\b(wti|brent|crude oil|oil prices|opec|barrel)\b/i },
+    { tag: 'Crypto', re: /\b(btc|bitcoin|eth|ethereum|crypto|solana|xrp|digital asset)\b/i },
+  ];
+  for (const rule of rules) {
+    if (rule.re.test(text)) tags.push(rule.tag);
+  }
+  if (tags.length === 0) {
+    tags.push('Macro');
+  }
+  return tags.slice(0, 3);
+}
+
+interface NewsFeedSourceConfig {
+  url: string;
+  source: string;
+  category: 'News' | 'Analysis' | 'Macro';
+  isGoogleFxStreet?: boolean;
+}
+
+const NEWS_PRIMARY_FEEDS: NewsFeedSourceConfig[] = [
+  { url: 'https://www.fxstreet.com/rss/news', source: 'FXStreet', category: 'News' },
+  { url: 'https://www.fxstreet.com/rss/analysis', source: 'FXStreet', category: 'Analysis' },
+];
+
+const NEWS_FALLBACK_FEEDS: NewsFeedSourceConfig[] = [
+  {
+    url: 'https://news.google.com/rss/search?q=site:fxstreet.com+(forex+OR+gold+OR+XAU+OR+EUR+OR+GBP+OR+USD+OR+JPY+OR+Bitcoin+OR+Oil)&hl=en-US&gl=US&ceid=US:en',
+    source: 'FXStreet',
+    category: 'News',
+    isGoogleFxStreet: true,
+  },
+  { url: 'https://www.forexlive.com/feed/news', source: 'ForexLive', category: 'News' },
+  { url: 'https://www.actionforex.com/feed/', source: 'ActionForex', category: 'Analysis' },
+  { url: 'https://www.investing.com/rss/news_1.rss', source: 'Investing.com', category: 'News' },
+  {
+    url: 'https://feeds.finance.yahoo.com/rss/2.0/headline?s=EURUSD=X,GC=F,GBPUSD=X,USDJPY=X,CL=F,BTC-USD&region=US&lang=en-US',
+    source: 'Yahoo Finance',
+    category: 'Macro',
+  },
+];
+
+function parseRssFeed(xml: string, cfg: NewsFeedSourceConfig): LiveNewsArticle[] {
+  const trimmed = xml.trim();
+  if (!trimmed || (!trimmed.includes('<rss') && !trimmed.includes('<feed'))) {
+    return [];
+  }
+
+  const itemMatches = [
+    ...trimmed.matchAll(/<item\b[^>]*>([\s\S]*?)<\/item>/gi),
+    ...trimmed.matchAll(/<entry\b[^>]*>([\s\S]*?)<\/entry>/gi),
+  ];
+
+  const articles: LiveNewsArticle[] = [];
+  for (const match of itemMatches.slice(0, 20)) {
+    const block = match[1];
+    let title = htmlToCleanText(extractXmlTag(block, ['title']));
+    if (!title) continue;
+
+    if (cfg.isGoogleFxStreet) {
+      title = title.replace(/\s*[-–|]\s*FXStreet\s*$/i, '').trim();
+    }
+
+    let link = htmlToCleanText(extractXmlTag(block, ['link', 'guid']));
+    if (!link) {
+      link = extractXmlAttr(block, ['link'], 'href');
+    }
+    if (!link || !/^https?:\/\//i.test(link)) {
+      link = 'https://www.fxstreet.com/news';
+    }
+
+    const rawPubDate = htmlToCleanText(extractXmlTag(block, ['pubDate', 'published', 'updated', 'dc:date']));
+    const parsedTime = rawPubDate ? Date.parse(rawPubDate) : NaN;
+    const publishedAt = Number.isFinite(parsedTime) ? new Date(parsedTime).toISOString() : new Date().toISOString();
+
+    const rawContent =
+      extractXmlTag(block, ['content:encoded', 'content']) || extractXmlTag(block, ['description', 'summary']);
+    const cleanedParagraphs = htmlToCleanText(rawContent, true);
+    const cleanedFlat = htmlToCleanText(rawContent, false);
+
+    const imgFromTag =
+      extractXmlAttr(block, ['media:content', 'media:thumbnail', 'enclosure'], 'url') ||
+      (rawContent.match(/<img[^>]+src=["'](https?:\/\/[^"']+)["']/i)?.[1] ?? '');
+    const imageUrl =
+      imgFromTag && /^https?:\/\//i.test(imgFromTag) && !imgFromTag.includes('il-logo-colorful')
+        ? imgFromTag
+        : null;
+
+    const tags = detectAssetTags(`${title} ${cleanedFlat}`);
+    const authorRaw = htmlToCleanText(extractXmlTag(block, ['dc:creator', 'author']));
+    const author =
+      authorRaw && authorRaw.toLowerCase() !== cfg.source.toLowerCase()
+        ? authorRaw.slice(0, 80)
+        : null;
+
+    // Google News RSS descriptions often repeat just the headline + publisher name.
+    const looksLikeTitleEcho =
+      !cleanedFlat ||
+      cleanedFlat.length < 48 ||
+      cleanedFlat.toLowerCase().startsWith(title.slice(0, 28).toLowerCase());
+
+    const summary = looksLikeTitleEcho
+      ? `${cfg.source} real-time market dispatch covering ${tags.join(' & ')} momentum, session drivers, and key technical levels.`
+      : cleanedFlat.length > 220
+        ? `${cleanedFlat.slice(0, 217).trim()}...`
+        : cleanedFlat;
+
+    const fullSummary = looksLikeTitleEcho
+      ? `${title}.\n\nSource: ${cfg.source} live forex news desk (${tags.join(', ')}). Open the full external dispatch below for chart embeds and live desk commentary.`
+      : cleanedParagraphs.slice(0, 2400);
+
+    const idHash = crypto
+      .createHash('sha1')
+      .update(`${cfg.source}:${title.toLowerCase()}:${publishedAt.slice(0, 13)}`)
+      .digest('hex')
+      .slice(0, 16);
+
+    articles.push({
+      id: `news-${idHash}`,
+      title,
+      summary,
+      full_summary: fullSummary,
+      source: cfg.source,
+      author,
+      published_at: publishedAt,
+      url: link,
+      image_url: imageUrl,
+      tags,
+      category: cfg.category,
+    });
+  }
+  return articles;
+}
+
+export async function getLiveForexNews(forceRefresh = false): Promise<{
+  status: 'live' | 'unavailable';
+  fetched_at: string;
+  sources: string[];
+  articles: LiveNewsArticle[];
+  message?: string;
+}> {
+  if (!forceRefresh && newsCache.entry && newsCache.entry.expiresAt > Date.now()) {
+    return newsCache.entry.data;
+  }
+
+  const fetchSource = async (cfg: NewsFeedSourceConfig): Promise<LiveNewsArticle[]> => {
+    try {
+      const res = await fetchWithTimeout(cfg.url, 4500);
+      if (!res.ok) return [];
+      const text = await res.text();
+      return parseRssFeed(text, cfg);
+    } catch {
+      return [];
+    }
+  };
+
+  // Try FXStreet RSS feeds first alongside fallback aggregation if FXStreet is Cloudflare-gated or rate-limited
+  const primaryResults = await Promise.all(NEWS_PRIMARY_FEEDS.map(fetchSource));
+  const primaryArticles = primaryResults.flat();
+
+  // Always aggregate fallback feeds when FXStreet RSS is gated/empty, or blend for 24/7 pair coverage
+  const fallbackResults = await Promise.all(NEWS_FALLBACK_FEEDS.map(fetchSource));
+  const combined = [...primaryArticles, ...fallbackResults.flat()];
+
+  if (combined.length === 0) {
+    if (newsCache.entry?.data.articles.length) {
+      return newsCache.entry.data;
+    }
+    return {
+      status: 'unavailable',
+      fetched_at: new Date().toISOString(),
+      sources: [],
+      articles: [],
+      message: 'Live Forex news feeds are temporarily unreachable. Retrying automatically.',
+    };
+  }
+
+  // Deduplicate by normalized headline, preferring FXStreet or richer summaries
+  const dedup = new Map<string, LiveNewsArticle>();
+  for (const item of combined) {
+    const key = item.title
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, ' ')
+      .trim()
+      .slice(0, 72);
+    const existing = dedup.get(key);
+    if (!existing) {
+      dedup.set(key, item);
+    } else {
+      const itemScore = (item.source === 'FXStreet' ? 2 : 0) + (item.full_summary.length > existing.full_summary.length ? 1 : 0);
+      const existingScore = (existing.source === 'FXStreet' ? 2 : 0) + (existing.full_summary.length > item.full_summary.length ? 1 : 0);
+      if (itemScore > existingScore) {
+        dedup.set(key, item);
+      }
+    }
+  }
+
+  const articles = Array.from(dedup.values())
+    .sort((a, b) => new Date(b.published_at).getTime() - new Date(a.published_at).getTime())
+    .slice(0, 45);
+
+  const sources = Array.from(new Set(articles.map((a) => a.source)));
+  const payload = {
+    status: 'live' as const,
+    fetched_at: new Date().toISOString(),
+    sources,
+    articles,
+  };
+
+  newsCache.entry = {
+    data: payload,
+    expiresAt: Date.now() + 55_000,
+  };
+  return payload;
+}
+
+function parseNumericMetric(raw: string | number | null | undefined): number | null {
+  if (raw === null || raw === undefined) return null;
+  if (typeof raw === 'number') return Number.isFinite(raw) ? raw : null;
+  const cleaned = String(raw).trim().replace(/,/g, '');
+  if (!cleaned || cleaned === '—' || cleaned === '-') return null;
+  const match = cleaned.match(/^(-?\d+(?:\.\d+)?)\s*([KMBT%])?/i);
+  if (!match) return null;
+  let val = Number.parseFloat(match[1]);
+  if (!Number.isFinite(val)) return null;
+  const suffix = (match[2] || '').toUpperCase();
+  if (suffix === 'K') val *= 1e3;
+  else if (suffix === 'M') val *= 1e6;
+  else if (suffix === 'B') val *= 1e9;
+  else if (suffix === 'T') val *= 1e12;
+  return val;
+}
+
+function computeActualOutcome(
+  title: string,
+  actual: string,
+  forecast: string,
+  explicitBetter?: boolean | null
+): 'better' | 'worse' | 'inline' | 'pending' {
+  if (!actual || actual === '—') return 'pending';
+  if (explicitBetter === true) return 'better';
+  if (explicitBetter === false) return 'worse';
+
+  const actNum = parseNumericMetric(actual);
+  const fcstNum = parseNumericMetric(forecast);
+  if (actNum === null || fcstNum === null) return 'inline';
+  if (Math.abs(actNum - fcstNum) < 1e-9) return 'inline';
+
+  const lowerIsBetter = /\b(unemployment|jobless|claims|deficit)\b/i.test(title);
+  if (lowerIsBetter) {
+    return actNum < fcstNum ? 'better' : 'worse';
+  }
+  return actNum > fcstNum ? 'better' : 'worse';
+}
+
+function formatTvMetric(val: number | null | undefined, unit?: string | null, scale?: string | null): string {
+  if (val === null || val === undefined || !Number.isFinite(val)) return '—';
+  const unitStr = unit === '%' ? '%' : '';
+  const scaleStr = scale && unit !== '%' ? scale : '';
+  const formatted = Number.isInteger(val) ? String(val) : String(Number(val.toFixed(2)));
+  return `${formatted}${scaleStr}${unitStr}`;
+}
+
+export async function getEconomicCalendar(forceRefresh = false): Promise<{
   status: 'live' | 'unavailable';
   source: string;
+  fetched_at: string;
   events: EconomicEvent[];
   message?: string;
 }> {
-  if (calendarCache.entry && calendarCache.entry.expiresAt > Date.now()) {
+  if (!forceRefresh && calendarCache.entry && calendarCache.entry.expiresAt > Date.now()) {
     return calendarCache.entry.data;
   }
 
+  const now = new Date();
+  const startOfToday = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 1, 0, 0, 0));
+  const endOfWeek = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 7, 23, 59, 59));
+
+  // 1. Try FXStreet Economic Calendar API
+  try {
+    const fxsUrl = `https://calendar-api.fxstreet.com/en/api/v1/eventDates/${startOfToday.toISOString()}/${endOfWeek.toISOString()}`;
+    const res = await fetchWithTimeout(fxsUrl, 4500, {
+      Accept: 'application/json',
+      Origin: 'https://www.fxstreet.com',
+      Referer: 'https://www.fxstreet.com/',
+    });
+    if (res.ok) {
+      const raw = (await res.json()) as Array<{
+        id?: string;
+        name?: string;
+        countryCode?: string;
+        currencyCode?: string;
+        dateUtc?: string;
+        volatility?: string;
+        actual?: number | null;
+        consensus?: number | null;
+        previous?: number | null;
+        unit?: string | null;
+        potency?: string | null;
+        isBetterThanExpected?: boolean | null;
+      }>;
+
+      if (Array.isArray(raw) && raw.length > 0) {
+        const events: EconomicEvent[] = raw
+          .filter((item) => item.name && item.dateUtc && item.currencyCode)
+          .map((item, idx) => {
+            const vol = (item.volatility || 'LOW').toUpperCase();
+            const impact: 'Low' | 'Medium' | 'High' =
+              vol === 'HIGH' ? 'High' : vol === 'MEDIUM' ? 'Medium' : 'Low';
+            const potencyUpper = (item.potency || '').trim().toUpperCase();
+            const potencySuffix = ['K', 'M', 'B', 'T'].includes(potencyUpper) ? potencyUpper : '';
+            const unit = item.unit === '%' ? '%' : item.unit && item.unit !== 'ZERO' ? item.unit : potencySuffix;
+            const fmt = (v: number | null | undefined) =>
+              v === null || v === undefined ? '—' : `${v}${unit}`;
+            const actual = fmt(item.actual);
+            const forecast = fmt(item.consensus);
+            const previous = fmt(item.previous);
+            const currency = (item.currencyCode || item.countryCode || 'USD').toUpperCase();
+            return {
+              id: item.id || `fxs-${currency}-${idx}`,
+              title: item.name || 'Economic Release',
+              country: (item.countryCode || currency).toUpperCase(),
+              currency,
+              date_iso: item.dateUtc || now.toISOString(),
+              impact,
+              forecast,
+              previous,
+              actual,
+              actual_outcome: computeActualOutcome(
+                item.name || '',
+                actual,
+                forecast,
+                item.isBetterThanExpected
+              ),
+              source: 'FXStreet Calendar',
+            };
+          })
+          .sort((a, b) => new Date(a.date_iso).getTime() - new Date(b.date_iso).getTime());
+
+        if (events.length > 0) {
+          const payload = {
+            status: 'live' as const,
+            source: 'FXStreet Economic Calendar',
+            fetched_at: new Date().toISOString(),
+            events,
+          };
+          calendarCache.entry = { data: payload, expiresAt: Date.now() + 55_000 };
+          return payload;
+        }
+      }
+    }
+  } catch {
+    // Fall through to ForexFactory / TradingView
+  }
+
+  // 2. Try TradingView Live Macro Calendar (reliable, zero Cloudflare block, full actual/forecast/previous)
+  try {
+    const tvUrl = `https://economic-calendar.tradingview.com/events?from=${encodeURIComponent(startOfToday.toISOString())}&to=${encodeURIComponent(endOfWeek.toISOString())}&countries=US,EU,GB,JP,AU,CA,CH,NZ`;
+    const res = await fetchWithTimeout(tvUrl, 5000, {
+      Accept: 'application/json',
+      Origin: 'https://www.tradingview.com',
+      Referer: 'https://www.tradingview.com/',
+    });
+    if (res.ok) {
+      const json = (await res.json()) as {
+        status?: string;
+        result?: Array<{
+          id?: string;
+          title?: string;
+          country?: string;
+          currency?: string;
+          date?: string;
+          importance?: number;
+          actual?: number | null;
+          forecast?: number | null;
+          previous?: number | null;
+          unit?: string | null;
+          scale?: string | null;
+          comment?: string;
+        }>;
+      };
+      if (Array.isArray(json.result) && json.result.length > 0) {
+        const events: EconomicEvent[] = json.result
+          .filter((item) => item.title && item.date)
+          .map((item, idx) => {
+            const impact: 'Low' | 'Medium' | 'High' =
+              item.importance === 1 ? 'High' : item.importance === 0 ? 'Medium' : 'Low';
+            const actual = formatTvMetric(item.actual, item.unit, item.scale);
+            const forecast = formatTvMetric(item.forecast, item.unit, item.scale);
+            const previous = formatTvMetric(item.previous, item.unit, item.scale);
+            const currency = (item.currency || 'USD').toUpperCase();
+            return {
+              id: item.id || `tv-${currency}-${idx}`,
+              title: item.title || 'Economic Release',
+              country: (item.country || currency).toUpperCase(),
+              currency,
+              date_iso: item.date || now.toISOString(),
+              impact,
+              forecast,
+              previous,
+              actual,
+              actual_outcome: computeActualOutcome(item.title || '', actual, forecast),
+              source: 'TradingView Macro Feed',
+              comment: item.comment,
+            };
+          })
+          .sort((a, b) => new Date(a.date_iso).getTime() - new Date(b.date_iso).getTime());
+
+        const payload = {
+          status: 'live' as const,
+          source: 'TradingView / Macro Economic Feed',
+          fetched_at: new Date().toISOString(),
+          events,
+        };
+        calendarCache.entry = { data: payload, expiresAt: Date.now() + 55_000 };
+        return payload;
+      }
+    }
+  } catch {
+    // Fall through to FairEconomy
+  }
+
+  // 3. Fallback: ForexFactory / FairEconomy Weekly JSON
   try {
     const res = await fetchWithTimeout('https://nfs.faireconomy.media/ff_calendar_thisweek.json', 5000);
     if (!res.ok) {
       throw new Error(`HTTP ${res.status}`);
     }
-    const raw = (await res.json()) as Array<{
+    const text = await res.text();
+    if (text.trim().startsWith('<')) {
+      throw new Error('FairEconomy rate limited');
+    }
+    const raw = JSON.parse(text) as Array<{
       title?: string;
       country?: string;
       date?: string;
@@ -394,33 +896,44 @@ export async function getEconomicCalendar(): Promise<{
         const impact: 'Low' | 'Medium' | 'High' =
           impactRaw.includes('high') ? 'High' : impactRaw.includes('medium') ? 'Medium' : 'Low';
         const currency = (item.country || 'USD').toUpperCase();
+        const actual = item.actual || '—';
+        const forecast = item.forecast || '—';
+        const previous = item.previous || '—';
         return {
-          id: `${currency}-${idx}-${item.date}`,
+          id: `ff-${currency}-${idx}-${item.date}`,
           title: item.title || 'Economic Release',
           country: currency,
           currency,
-          date_iso: item.date || new Date().toISOString(),
+          date_iso: item.date || now.toISOString(),
           impact,
-          forecast: item.forecast || '—',
-          previous: item.previous || '—',
-          actual: item.actual || '—',
+          forecast,
+          previous,
+          actual,
+          actual_outcome: computeActualOutcome(item.title || '', actual, forecast),
+          source: 'ForexFactory Weekly Feed',
         };
-      });
+      })
+      .sort((a, b) => new Date(a.date_iso).getTime() - new Date(b.date_iso).getTime());
 
     const payload = {
       status: 'live' as const,
       source: 'ForexFactory Weekly Feed',
+      fetched_at: new Date().toISOString(),
       events,
     };
-    calendarCache.entry = { data: payload, expiresAt: Date.now() + 15 * 60 * 1000 };
+    calendarCache.entry = { data: payload, expiresAt: Date.now() + 55_000 };
     return payload;
   } catch (err) {
     logSystemEvent('warn', 'calendar', `Failed to fetch external calendar: ${String(err)}`);
+    if (calendarCache.entry?.data.events.length) {
+      return calendarCache.entry.data;
+    }
     return {
       status: 'unavailable',
-      source: 'ForexFactory Weekly Feed',
+      source: 'Economic Calendar Feed',
+      fetched_at: new Date().toISOString(),
       events: [],
-      message: 'Unable to reach external economic calendar feed right now. Please try again shortly.',
+      message: 'Unable to reach external economic calendar feed right now. Retrying automatically.',
     };
   }
 }

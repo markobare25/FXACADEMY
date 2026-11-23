@@ -465,6 +465,23 @@ export interface EconomicEvent {
   forecast: string;
   previous: string;
   actual: string;
+  actual_outcome?: 'better' | 'worse' | 'inline' | 'pending';
+  source?: string;
+  comment?: string;
+}
+
+export interface LiveNewsArticle {
+  id: string;
+  title: string;
+  summary: string;
+  full_summary: string;
+  source: string;
+  author?: string | null;
+  published_at: string;
+  url: string;
+  image_url?: string | null;
+  tags: string[];
+  category: 'News' | 'Analysis' | 'Macro';
 }
 
 export interface PlatformSettings {

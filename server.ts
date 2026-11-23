@@ -79,7 +79,12 @@ import {
   syncSignalMessageToRemote,
   syncSignalReactionToRemote,
 } from './server/persistentStore.ts';
-import { getEconomicCalendar, getMarketCandles, getMarketQuotes } from './server/markets.ts';
+import {
+  getEconomicCalendar,
+  getLiveForexNews,
+  getMarketCandles,
+  getMarketQuotes,
+} from './server/markets.ts';
 import type {
   NotificationPreferences,
   PlatformSettings,
@@ -2672,6 +2677,24 @@ app.get('/api/updates', optionalAuth, (req: AuthRequest, res: Response) => {
   res.json({ updates: hydrateUpdates(rows, req.user?.id) });
 });
 
+app.get('/api/updates/news', async (req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  const forceRefresh = req.query.refresh === '1' || req.query.refresh === 'true';
+  const data = await getLiveForexNews(forceRefresh);
+  res.json(data);
+});
+
+app.get('/api/updates/calendar', async (req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  const forceRefresh = req.query.refresh === '1' || req.query.refresh === 'true';
+  const data = await getEconomicCalendar(forceRefresh);
+  res.json(data);
+});
+
 const updateSchema = z.object({
   title: z.string().trim().min(3).max(200),
   content: z.string().trim().min(5).max(8000),
@@ -4016,8 +4039,10 @@ app.get('/api/markets/:symbol/candles', async (req: Request, res: Response) => {
   res.json(data);
 });
 
-app.get('/api/calendar', async (_req: Request, res: Response) => {
-  const data = await getEconomicCalendar();
+app.get('/api/calendar', async (req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  const forceRefresh = req.query.refresh === '1' || req.query.refresh === 'true';
+  const data = await getEconomicCalendar(forceRefresh);
   res.json(data);
 });
 
